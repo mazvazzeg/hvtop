@@ -1,0 +1,31 @@
+bin/
+obj/
+
+# .NET build output
+**/bin/
+**/obj/
+*.user
+*.rsuser
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Visual Studio / Rider / VS Code local state
+.vs/
+.idea/
+.vscode/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# Published binaries and symbols
+*.exe
+*.dll
+*.pdb
+*.deps.json
+*.runtimeconfig.json
+
+# Keep source assets explicit, not generated publish artifacts.
+!hvtop.Native/assets/*.ico
