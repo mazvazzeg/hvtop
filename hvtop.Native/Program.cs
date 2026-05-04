@@ -8,7 +8,7 @@ namespace hvtop.Native;
 
 internal static class Program
 {
-    public const string DisplayVersion = "0.2.0+20260427.0823";
+    public const string DisplayVersion = "0.2.0+20260504.1200";
     public const string AppName = "hvtop";
 
     public static async Task<int> Main(string[] args)
@@ -22,7 +22,7 @@ internal static class Program
             var snapshot = collector.Collect();
             Console.WriteLine($"{AppName} {DisplayVersion} smoke sample at {snapshot.At:yyyy-MM-dd HH:mm:ss}");
             foreach (var host in snapshot.Hosts)
-                Console.WriteLine($"HOST {host.Name} CPU {FormatSmoke(host.Cpu)} | {FormatSmokeMax(host.Cpu)} | ({host.CpuCapacity}) MEM {FormatSmoke(host.Mem)} | {FormatSmokeMax(host.Mem)} | ({host.MemCapacity}) IO {FormatSmoke(host.Io)} NET {FormatSmoke(host.Net)} STA {host.Status}");
+                Console.WriteLine($"HOST {host.Name} VER {host.Version} CPU {FormatSmoke(host.Cpu)} | {FormatSmokeMax(host.Cpu)} | ({host.CpuCapacity}) MEM {FormatSmoke(host.Mem)} | {FormatSmokeMax(host.Mem)} | ({host.MemCapacity}) IO {FormatSmoke(host.Io)} NET {FormatSmoke(host.Net)} STA {host.Status}");
             foreach (var disk in snapshot.Disks.Take(5))
                 Console.WriteLine($"DISK {disk.Name} SIZE {disk.Size} FRE {FormatSmoke(disk.Free)} IO {FormatSmoke(disk.Io)} IOPS {FormatSmoke(disk.Iops)} QD {FormatSmoke(disk.QueueDepth)} LAT {FormatSmoke(disk.Latency)} STA {disk.Status}");
             foreach (var net in snapshot.Networks.Take(5))
@@ -262,6 +262,7 @@ internal sealed class Collector : IDisposable
 
         var host = new HostRow(
             Environment.MachineName,
+            HostVersionDetector.Detect(),
             Metric.Percent(hostCpu),
             $"{Environment.ProcessorCount} CPU",
             Metric.Percent(hostMem),
@@ -705,6 +706,7 @@ internal sealed class DemoVmSampler
             var row = new VmRow(
                 name,
                 hostName,
+                "demo",
                 Metric.Percent(cpu),
                 $"{vcpus[i]} vCPU",
                 Metric.Percent(mem),
@@ -771,6 +773,7 @@ internal sealed class HyperVVmSampler
                 var row = new VmRow(
                     name,
                     hostName,
+                    FormatVersion(vm.Version),
                     Metric.Percent(cpuValue),
                     vcpuCount > 0 ? $"{vcpuCount} vCPU" : "n/a vCPU",
                     Metric.Percent(memPercent),
@@ -827,6 +830,9 @@ internal sealed class HyperVVmSampler
         var label = CapacityFormatter.FormatConfigCapacity(memoryCapacityBytes);
         return vm.DynamicMemoryEnabled ? $"D {label}" : label;
     }
+
+    private static string FormatVersion(string? version)
+        => string.IsNullOrWhiteSpace(version) ? "n/a" : version.Trim();
 
     private static Dictionary<string, double> ReadFirst(string[] paths, Func<string, string> normalizeInstance)
     {
@@ -902,9 +908,9 @@ internal sealed class HyperVInventory
             var fallback = TryReadPowerShell();
             lock (gate)
             {
-                if (fallback.Length > 0)
+                if (fallback.Available)
                 {
-                    cache = fallback;
+                    cache = fallback.Vms;
                     pendingEventMessage = DedupEvent("Hyper-V native WMI inventory disabled in single-file build, using PowerShell fallback.");
                     pendingEventSeverity = "WARN";
                 }
@@ -922,61 +928,77 @@ internal sealed class HyperVInventory
         }
     }
 
-    private static HyperVInventoryVm[] TryReadPowerShell()
+    private static HyperVInventoryData TryReadPowerShell()
     {
         const string script = "$ErrorActionPreference='Stop'; " +
             "$rows=@(); " +
             "try { " +
             "Import-Module Hyper-V -ErrorAction Stop | Out-Null; " +
-            "$rows = @(Get-VM | Select-Object Name,@{N='IsRunning';E={[bool]($_.State -eq 'Running')}},MemoryAssigned,MemoryDemand,MemoryStatus,DynamicMemoryEnabled) " +
+            "$rows = @(Get-VM | Select-Object Name,@{N='Version';E={[string]$_.Version}},@{N='IsRunning';E={[bool]($_.State -eq 'Running')}},MemoryAssigned,MemoryDemand,MemoryStatus,DynamicMemoryEnabled) " +
             "} catch { } ; " +
             "if (-not $rows -or $rows.Count -eq 0) { " +
             "$rows = @(Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_ComputerSystem " +
             "| Where-Object { $_.Caption -eq 'Virtual Machine' } " +
-            "| Select-Object @{N='Name';E={$_.ElementName}},@{N='IsRunning';E={[bool]($_.EnabledState -eq 2)}},@{N='MemoryAssigned';E={0}},@{N='MemoryDemand';E={0}},@{N='MemoryStatus';E={''}},@{N='DynamicMemoryEnabled';E={$false}}) " +
+            "| Select-Object @{N='Name';E={$_.ElementName}},@{N='Version';E={''}},@{N='IsRunning';E={[bool]($_.EnabledState -eq 2)}},@{N='MemoryAssigned';E={0}},@{N='MemoryDemand';E={0}},@{N='MemoryStatus';E={''}},@{N='DynamicMemoryEnabled';E={$false}}) " +
             "} ; " +
-            "@($rows) | ConvertTo-Json -Compress";
+            "[pscustomobject]@{Vms=@($rows)} | ConvertTo-Json -Compress -Depth 4";
 
         if (!PowerShellRunner.TryRun(script, 15000, out var output))
-            return [];
+            return HyperVInventoryData.Empty;
 
         return ParseInventoryJson(output);
     }
 
-    private static HyperVInventoryVm[] ParseInventoryJson(string json)
+    private static HyperVInventoryData ParseInventoryJson(string json)
     {
         if (string.IsNullOrWhiteSpace(json))
-            return [];
+            return HyperVInventoryData.Empty;
 
         try
         {
             using var document = JsonDocument.Parse(json);
-            var rows = document.RootElement.ValueKind switch
+            JsonElement[] rows;
+            if (document.RootElement.ValueKind == JsonValueKind.Object && document.RootElement.TryGetProperty("Vms", out var vmsElement))
             {
-                JsonValueKind.Array => document.RootElement.EnumerateArray().ToArray(),
-                JsonValueKind.Object => [document.RootElement],
-                _ => []
-            };
+                rows = vmsElement.ValueKind switch
+                {
+                    JsonValueKind.Array => vmsElement.EnumerateArray().ToArray(),
+                    JsonValueKind.Object => [vmsElement],
+                    _ => []
+                };
+            }
+            else
+            {
+                rows = document.RootElement.ValueKind switch
+                {
+                    JsonValueKind.Array => document.RootElement.EnumerateArray().ToArray(),
+                    JsonValueKind.Object => [document.RootElement],
+                    _ => []
+                };
+            }
 
-            return rows
+            var vms = rows
                 .Select(element =>
                 {
                     var name = ReadJsonString(element, "Name");
+                    var version = ReadJsonString(element, "Version");
                     var isRunning = ReadJsonBool(element, "IsRunning");
                     var memoryAssignedBytes = ReadJsonDouble(element, "MemoryAssigned");
                     var memoryDemandBytes = ReadJsonDouble(element, "MemoryDemand");
                     var memoryStatus = ReadJsonString(element, "MemoryStatus");
                     var dynamicMemoryEnabled = ReadJsonBool(element, "DynamicMemoryEnabled");
-                    return new HyperVInventoryVm(name, isRunning, memoryAssignedBytes, memoryDemandBytes, memoryStatus, dynamicMemoryEnabled);
+                    return new HyperVInventoryVm(name, version, isRunning, memoryAssignedBytes, memoryDemandBytes, memoryStatus, dynamicMemoryEnabled);
                 })
                 .Where(vm => !string.IsNullOrWhiteSpace(vm.Name))
                 .DistinctBy(vm => vm.Name, StringComparer.OrdinalIgnoreCase)
                 .OrderBy(vm => vm.Name, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
+
+            return new HyperVInventoryData(vms, true);
         }
         catch
         {
-            return [];
+            return HyperVInventoryData.Empty;
         }
     }
 
@@ -1045,10 +1067,87 @@ internal sealed class HyperVInventory
         lastEventMessage = message;
         return message;
     }
+
 }
 
-internal sealed record HyperVInventoryVm(string Name, bool IsRunning, double MemoryAssignedBytes, double MemoryDemandBytes, string MemoryStatus, bool DynamicMemoryEnabled);
+internal sealed record HyperVInventoryVm(string Name, string Version, bool IsRunning, double MemoryAssignedBytes, double MemoryDemandBytes, string MemoryStatus, bool DynamicMemoryEnabled);
+internal sealed record HyperVInventoryData(HyperVInventoryVm[] Vms, bool Available)
+{
+    public static HyperVInventoryData Empty { get; } = new([], false);
+}
 internal sealed record HyperVInventoryResult(HyperVInventoryVm[] Vms, string Source, string? EventMessage, string EventSeverity);
+
+internal static class HostVersionDetector
+{
+    private static string? cached;
+
+    public static string Detect()
+    {
+        if (!string.IsNullOrWhiteSpace(cached))
+            return cached;
+
+        cached = DetectCore();
+        return cached;
+    }
+
+    private static string DetectCore()
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
+            var productName = key?.GetValue("ProductName")?.ToString() ?? string.Empty;
+            var build = key?.GetValue("CurrentBuildNumber")?.ToString() ?? string.Empty;
+            var ubr = key?.GetValue("UBR")?.ToString() ?? string.Empty;
+            var displayVersion = key?.GetValue("DisplayVersion")?.ToString() ?? key?.GetValue("ReleaseId")?.ToString() ?? string.Empty;
+            var release = NormalizeProductName(productName, build);
+            if (string.IsNullOrWhiteSpace(release))
+                release = "WIN";
+
+            var fullBuild = string.IsNullOrWhiteSpace(ubr) ? build : $"{build}.{ubr}";
+            if (string.IsNullOrWhiteSpace(fullBuild))
+                return release;
+
+            return string.IsNullOrWhiteSpace(displayVersion)
+                ? $"{release} ({fullBuild})"
+                : $"{release} ({displayVersion}/{fullBuild})";
+        }
+        catch
+        {
+            var version = Environment.OSVersion.Version;
+            return version.Build > 0 ? $"WIN.{version.Build}" : "n/a";
+        }
+    }
+
+    private static string NormalizeProductName(string productName, string build)
+    {
+        var value = productName.Trim();
+        var isStandaloneHyperV = value.Contains("Hyper-V Server", StringComparison.OrdinalIgnoreCase);
+        var isServer = value.Contains("Server", StringComparison.OrdinalIgnoreCase);
+        var serverPrefix = isStandaloneHyperV ? "HVS" : isServer ? "SRV" : string.Empty;
+
+        if (isServer)
+        {
+            if (value.Contains("2012 R2", StringComparison.OrdinalIgnoreCase)) return $"{serverPrefix}2012R2";
+            if (value.Contains("2008 R2", StringComparison.OrdinalIgnoreCase)) return $"{serverPrefix}2008R2";
+
+            foreach (var year in new[] { "2025", "2022", "2019", "2016", "2012", "2008" })
+            {
+                if (value.Contains(year, StringComparison.OrdinalIgnoreCase))
+                    return $"{serverPrefix}{year}";
+            }
+        }
+
+        if (value.Contains("Windows 11", StringComparison.OrdinalIgnoreCase)
+            || (serverPrefix.Length == 0 && int.TryParse(build, out var buildNumber) && buildNumber >= 22000))
+            return "WIN11";
+        if (value.Contains("Windows 10", StringComparison.OrdinalIgnoreCase)) return "WIN10";
+        if (value.Contains("Windows 8.1", StringComparison.OrdinalIgnoreCase)) return "WIN8.1";
+        if (value.Contains("Windows 8", StringComparison.OrdinalIgnoreCase)) return "WIN8";
+        return value.StartsWith("Microsoft ", StringComparison.OrdinalIgnoreCase)
+            ? value["Microsoft ".Length..].Trim()
+            : value;
+    }
+}
 
 internal sealed class HyperVTopology
 {
@@ -2300,7 +2399,7 @@ internal sealed record Metric(double Current, double Max, Unit Unit)
 
 internal enum Unit { Plain, Percent, Mbps, Iops, Milliseconds }
 
-internal sealed record HostRow(string Name, Metric Cpu, string CpuCapacity, Metric Mem, string MemCapacity, Metric Io, Metric Net, string Status)
+internal sealed record HostRow(string Name, string Version, Metric Cpu, string CpuCapacity, Metric Mem, string MemCapacity, Metric Io, Metric Net, string Status)
 {
     public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
     {
@@ -2311,7 +2410,7 @@ internal sealed record HostRow(string Name, Metric Cpu, string CpuCapacity, Metr
     };
 }
 
-internal sealed record VmRow(string Name, string HostName, Metric Cpu, string CpuCapacity, Metric Mem, string MemCapacity, Metric Io, Metric Net, Metric Iops, Metric Latency, string Status)
+internal sealed record VmRow(string Name, string HostName, string Version, Metric Cpu, string CpuCapacity, Metric Mem, string MemCapacity, Metric Io, Metric Net, Metric Iops, Metric Latency, string Status)
 {
     public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
     {
@@ -2429,6 +2528,8 @@ internal sealed class Tui
     private const int CapacityMetricWidth = 25;
     private const int MetricWidth = 21;
     private const int ShortMetricWidth = 13;
+    private const int HostVersionWidth = 28;
+    private const int VmVersionWidth = 7;
     private const int SizeWidth = 10;
     private const int SwitchTypeWidth = 8;
     private const int UplinkWidth = 3;
@@ -2759,29 +2860,29 @@ internal sealed class Tui
                 {
                     var nameWidth = TableNameWidth(TableKind.VmLike);
                     RenderRows(
-                        Row(Header(DisplayName($"HOST {selectedHostName} -> VMS", nameWidth), nameWidth), GroupHeader("CPU", CapacityMetricWidth), GroupHeader("MEM", CapacityMetricWidth), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
-                        Row(Header(string.Empty, nameWidth), CapacityMetricSubHeader(), CapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
+                        Row(Header(DisplayName($"HOST {selectedHostName} -> VMS", nameWidth), nameWidth), Header("VER", VmVersionWidth), CapacityMetricGroupHeader("CPU"), CapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
+                        Row(Header(string.Empty, nameWidth), Header(string.Empty, VmVersionWidth), CapacityMetricSubHeader(), CapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
                         CurrentRows().Cast<VmRow>().ToArray(),
-                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), FmtWithCapacity(r.Cpu, r.CpuCapacity), FmtWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
+                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, VmVersionWidth), FmtWithCapacity(r.Cpu, r.CpuCapacity), FmtWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
                 }
                 else
                 {
-                    var nameWidth = TableNameWidth(TableKind.VmLike);
+                    var nameWidth = TableNameWidth(TableKind.HostLike);
                     RenderRows(
-                        Row(Header("HOSTNAME", nameWidth), GroupHeader("CPU", CapacityMetricWidth), GroupHeader("MEM", CapacityMetricWidth), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
-                        Row(Header(string.Empty, nameWidth), CapacityMetricSubHeader(), CapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
+                        Row(Header("HOSTNAME", nameWidth), Header("VER", HostVersionWidth), CapacityMetricGroupHeader("CPU"), CapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
+                        Row(Header(string.Empty, nameWidth), Header(string.Empty, HostVersionWidth), CapacityMetricSubHeader(), CapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
                         state.Read().Hosts,
-                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), FmtWithCapacity(r.Cpu, r.CpuCapacity), FmtWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
+                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, HostVersionWidth), FmtWithCapacity(r.Cpu, r.CpuCapacity), FmtWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
                 }
                 break;
             case Panel.Vms:
                 {
                     var nameWidth = TableNameWidth(TableKind.VmLike);
                     RenderRows(
-                        Row(Header("NAME", nameWidth), GroupHeader("CPU", CapacityMetricWidth), GroupHeader("MEM", CapacityMetricWidth), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
-                        Row(Header(string.Empty, nameWidth), CapacityMetricSubHeader(), CapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
+                        Row(Header("NAME", nameWidth), Header("VER", VmVersionWidth), CapacityMetricGroupHeader("CPU"), CapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
+                        Row(Header(string.Empty, nameWidth), Header(string.Empty, VmVersionWidth), CapacityMetricSubHeader(), CapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
                         state.Read().Vms,
-                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), FmtWithCapacity(r.Cpu, r.CpuCapacity), FmtWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
+                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, VmVersionWidth), FmtWithCapacity(r.Cpu, r.CpuCapacity), FmtWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
                 }
                 break;
             case Panel.Disks:
@@ -2834,6 +2935,9 @@ internal sealed class Tui
         var padRight = width - label.Length - padLeft;
         return new string(' ', padLeft) + label + new string(' ', padRight);
     }
+
+    private static string CapacityMetricGroupHeader(string label)
+        => Cell(new string(' ', 7) + Cell(label, 4), CapacityMetricWidth);
 
     private static string MetricSubHeader() => FixedMetricHeaderCell("cur", "max", valueWidth: 9, width: MetricWidth);
 
@@ -3186,7 +3290,8 @@ internal sealed class Tui
     {
         var fixedWidths = kind switch
         {
-            TableKind.VmLike => CapacityMetricWidth + CapacityMetricWidth + MetricWidth + MetricWidth + StatusWidth,
+            TableKind.HostLike => HostVersionWidth + CapacityMetricWidth + CapacityMetricWidth + MetricWidth + MetricWidth + StatusWidth,
+            TableKind.VmLike => VmVersionWidth + CapacityMetricWidth + CapacityMetricWidth + MetricWidth + MetricWidth + StatusWidth,
             TableKind.DiskLike => SizeWidth + MetricWidth + MetricWidth + MetricWidth + ShortMetricWidth + ShortMetricWidth + StatusWidth,
             TableKind.NetworkSwitchLike => SwitchTypeWidth + UplinkWidth + LinkWidth + MetricWidth + MetricWidth + MetricWidth + StatusWidth,
             TableKind.NetworkLike => LinkWidth + MetricWidth + MetricWidth + MetricWidth + ShortMetricWidth + StatusWidth,
@@ -3195,7 +3300,8 @@ internal sealed class Tui
 
         var columns = kind switch
         {
-            TableKind.VmLike => 6,
+            TableKind.HostLike => 7,
+            TableKind.VmLike => 7,
             TableKind.DiskLike => 8,
             TableKind.NetworkLike => 6,
             _ => 2
@@ -3264,7 +3370,7 @@ internal enum Panel { Hosts, Vms, Disks, Network, Events }
 
 internal enum DrillView { Overview, HostVms, NetworkAdapters, Detail }
 
-internal enum TableKind { VmLike, DiskLike, NetworkLike, NetworkSwitchLike }
+internal enum TableKind { HostLike, VmLike, DiskLike, NetworkLike, NetworkSwitchLike }
 
 internal sealed record ViewState(
     Panel Panel,
