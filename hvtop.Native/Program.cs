@@ -8,7 +8,7 @@ namespace hvtop.Native;
 
 internal static class Program
 {
-    public const string DisplayVersion = "0.2.0+20260504.1200";
+    public const string DisplayVersion = "0.3.0+20260506.2245";
     public const string AppName = "hvtop";
 
     public static async Task<int> Main(string[] args)
@@ -21,10 +21,12 @@ internal static class Program
         {
             var snapshot = collector.Collect();
             Console.WriteLine($"{AppName} {DisplayVersion} smoke sample at {snapshot.At:yyyy-MM-dd HH:mm:ss}");
+            foreach (var cluster in snapshot.Clusters)
+                Console.WriteLine($"CLUSTER {cluster.Name} NODES {cluster.NodeCount} UP {cluster.UpNodeCount} OWNER {cluster.OwnerNode} QUORUM {cluster.Quorum} STA {cluster.Status}");
             foreach (var host in snapshot.Hosts)
                 Console.WriteLine($"HOST {host.Name} VER {host.Version} CPU {FormatSmoke(host.Cpu)} | {FormatSmokeMax(host.Cpu)} | ({host.CpuCapacity}) MEM {FormatSmoke(host.Mem)} | {FormatSmokeMax(host.Mem)} | ({host.MemCapacity}) IO {FormatSmoke(host.Io)} NET {FormatSmoke(host.Net)} STA {host.Status}");
             foreach (var disk in snapshot.Disks.Take(5))
-                Console.WriteLine($"DISK {disk.Name} SIZE {disk.Size} FRE {FormatSmoke(disk.Free)} IO {FormatSmoke(disk.Io)} IOPS {FormatSmoke(disk.Iops)} QD {FormatSmoke(disk.QueueDepth)} LAT {FormatSmoke(disk.Latency)} STA {disk.Status}");
+                Console.WriteLine($"DISK {disk.Name} SIZE {disk.Size} FREE {FormatSmoke(disk.Free)} IO {FormatSmoke(disk.Io)} IOPS {FormatSmoke(disk.Iops)} QD {FormatSmoke(disk.QueueDepth)} LAT {FormatSmoke(disk.Latency)} STA {disk.Status}");
             foreach (var net in snapshot.Networks.Take(5))
                 Console.WriteLine($"NET  {net.Name} THR {FormatSmoke(net.Throughput)} RX {FormatSmoke(net.Rx)} TX {FormatSmoke(net.Tx)} STA {net.Status}");
             return 0;
@@ -200,6 +202,7 @@ internal sealed class Collector : IDisposable
     private readonly HyperVVmSampler hyperV = new();
     private readonly HyperVInventory inventory = new();
     private readonly HyperVTopology topology = new();
+    private readonly ClusterInventory clusterInventory = new();
     private readonly DemoVmSampler demoVms = new();
     private readonly Counter cpu;
     private readonly Counter memory;
@@ -249,16 +252,20 @@ internal sealed class Collector : IDisposable
         if (refreshRequested)
         {
             inventory.RequestRefresh();
+            clusterInventory.RequestRefresh();
             topologyRefreshRequested = true;
             networkDiagnosticsLogged = false;
         }
 
         var inventoryResult = inventory.TryRead();
+        var clusterResult = clusterInventory.TryRead();
         var inventoryVms = inventoryResult.Vms;
         LogicalDiskSampler.Refresh();
 
         if (!string.IsNullOrWhiteSpace(inventoryResult.EventMessage))
             AddEvent(inventoryResult.EventSeverity, inventoryResult.EventMessage);
+        if (!string.IsNullOrWhiteSpace(clusterResult.EventMessage))
+            AddEvent(clusterResult.EventSeverity, clusterResult.EventMessage);
 
         var host = new HostRow(
             Environment.MachineName,
@@ -270,6 +277,7 @@ internal sealed class Collector : IDisposable
             Metric.Mbps(hostIo),
             Metric.Mbps(hostNet),
             Status.From(hostCpu, hostMem, latency, queue));
+        var hosts = BuildHosts(host, clusterResult.Nodes);
 
         var disks = StorageInventory.Enumerate()
             .Select(storage =>
@@ -337,19 +345,55 @@ internal sealed class Collector : IDisposable
                 Io = Metric.Mbps(Math.Max(host.Io.Current, Math.Max(vms.Sum(v => v.Io.Current), disks.Sum(d => d.Io.Current))))
             };
             host = history.Apply("host:" + host.Name, host);
+            hosts = BuildHosts(host, clusterResult.Nodes);
             disks = disks.Select(d => history.Apply("disk:" + d.Name, d)).ToArray();
             networkSwitches = networkSwitches.Select(n => history.Apply("vswitch:" + n.Name, n)).ToArray();
             adapters = adapters.Select(n => history.Apply("net:" + n.Name, n)).ToArray();
             MaybeAddSpikeEvent(host, disks);
-            return new Snapshot(DateTime.Now, [host], vms, disks, networkSwitches, adapters, events, mergedTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery);
+            return new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, networkSwitches, adapters, events, mergedTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery);
         }
 
         host = history.Apply("host:" + host.Name, host);
+        hosts = BuildHosts(host, clusterResult.Nodes);
         disks = disks.Select(d => history.Apply("disk:" + d.Name, d)).ToArray();
         networkSwitches = networkSwitches.Select(n => history.Apply("vswitch:" + n.Name, n)).ToArray();
         adapters = adapters.Select(n => history.Apply("net:" + n.Name, n)).ToArray();
         MaybeAddSpikeEvent(host, disks);
-        return new Snapshot(DateTime.Now, [host], vms, disks, networkSwitches, adapters, events, liveTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery);
+        return new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, networkSwitches, adapters, events, liveTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery);
+    }
+
+    private static HostRow[] BuildHosts(HostRow localHost, ClusterNodeRow[] clusterNodes)
+    {
+        if (clusterNodes.Length == 0)
+            return [localHost];
+
+        return clusterNodes
+            .OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(node =>
+            {
+                if (node.Name.Equals(localHost.Name, StringComparison.OrdinalIgnoreCase)
+                    || node.Name.Equals(Environment.MachineName, StringComparison.OrdinalIgnoreCase))
+                    return localHost with { Status = MergeHostStatus(localHost.Status, node.Status) };
+
+                return new HostRow(
+                    node.Name,
+                    "n/a",
+                    Metric.Percent(double.NaN),
+                    "n/a CPU",
+                    Metric.Percent(double.NaN),
+                    "n/a",
+                    Metric.Mbps(double.NaN),
+                    Metric.Mbps(double.NaN),
+                    node.Status);
+            })
+            .ToArray();
+    }
+
+    private static string MergeHostStatus(string metricStatus, string nodeStatus)
+    {
+        if (nodeStatus.Equals("HOT", StringComparison.OrdinalIgnoreCase)) return "HOT";
+        if (nodeStatus.Equals("BUSY", StringComparison.OrdinalIgnoreCase) && metricStatus is "IDLE" or "OK") return "BUSY";
+        return metricStatus;
     }
 
     private static NetworkSwitchRow[] BuildNetworkSwitches(NetworkRow[] adapters, NetworkSwitchTopologyRow[] switches)
@@ -1076,6 +1120,164 @@ internal sealed record HyperVInventoryData(HyperVInventoryVm[] Vms, bool Availab
     public static HyperVInventoryData Empty { get; } = new([], false);
 }
 internal sealed record HyperVInventoryResult(HyperVInventoryVm[] Vms, string Source, string? EventMessage, string EventSeverity);
+
+internal sealed class ClusterInventory
+{
+    private readonly object gate = new();
+    private ClusterRow[] clusters = [];
+    private ClusterNodeRow[] nodes = [];
+    private string? pendingEventMessage;
+    private string pendingEventSeverity = "INFO";
+    private bool refreshRequested = true;
+    private bool loggedState;
+
+    public void RequestRefresh()
+    {
+        lock (gate)
+            refreshRequested = true;
+    }
+
+    public ClusterInventoryResult TryRead()
+    {
+        lock (gate)
+        {
+            if (refreshRequested)
+            {
+                refreshRequested = false;
+                Refresh();
+            }
+
+            var eventMessage = pendingEventMessage;
+            var eventSeverity = pendingEventSeverity;
+            pendingEventMessage = null;
+            return new ClusterInventoryResult(clusters, nodes, eventMessage, eventSeverity);
+        }
+    }
+
+    private void Refresh()
+    {
+        var data = TryReadPowerShell();
+        clusters = data.Clusters;
+        nodes = data.Nodes;
+
+        if (!loggedState)
+        {
+            loggedState = true;
+            if (clusters.Length > 0)
+            {
+                var cluster = clusters[0];
+                pendingEventMessage = $"Failover cluster detected: {cluster.Name} ({cluster.UpNodeCount}/{cluster.NodeCount} nodes up)";
+                pendingEventSeverity = "INFO";
+            }
+            else
+            {
+                pendingEventMessage = "No failover cluster detected on this host.";
+                pendingEventSeverity = "INFO";
+            }
+        }
+    }
+
+    private static ClusterInventoryData TryReadPowerShell()
+    {
+        const string script = "$ErrorActionPreference='Stop'; " +
+            "Import-Module FailoverClusters -ErrorAction Stop | Out-Null; " +
+            "$cluster=Get-Cluster -ErrorAction Stop; " +
+            "$nodes=@(Get-ClusterNode -Cluster $cluster.Name | Select-Object Name,State); " +
+            "$owner=''; " +
+            "try { $core=@(Get-ClusterGroup -Cluster $cluster.Name | Where-Object { $_.GroupType -eq 'Cluster' -or $_.Name -eq 'Cluster Group' } | Select-Object -First 1); if ($core.Count -gt 0 -and $core[0].OwnerNode) { $owner=[string]$core[0].OwnerNode.Name } } catch { } ; " +
+            "if ([string]::IsNullOrWhiteSpace($owner)) { try { $owner=[string](Get-ClusterGroup -Cluster $cluster.Name | Select-Object -First 1 -ExpandProperty OwnerNode).Name } catch { } } ; " +
+            "[pscustomobject]@{ " +
+            "Name=[string]$cluster.Name; " +
+            "OwnerNode=$owner; " +
+            "Quorum=[string]$cluster.QuorumType; " +
+            "FunctionalLevel=[string]$cluster.ClusterFunctionalLevel; " +
+            "Nodes=@($nodes) " +
+            "} | ConvertTo-Json -Compress -Depth 4";
+
+        if (!PowerShellRunner.TryRun(script, 8000, out var output))
+            return ClusterInventoryData.Empty;
+
+        return ParseJson(output);
+    }
+
+    private static ClusterInventoryData ParseJson(string json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return ClusterInventoryData.Empty;
+
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+                return ClusterInventoryData.Empty;
+
+            var name = HyperVInventory.ReadJsonString(document.RootElement, "Name");
+            if (string.IsNullOrWhiteSpace(name))
+                return ClusterInventoryData.Empty;
+
+            var nodes = ReadNodes(document.RootElement);
+            var upNodes = nodes.Count(n => n.Status is "OK" or "BUSY");
+            var clusterStatus = nodes.Length == 0 ? "OK"
+                : upNodes == nodes.Length ? "OK"
+                : upNodes == 0 ? "HOT"
+                : "BUSY";
+            var cluster = new ClusterRow(
+                name,
+                nodes.Length,
+                upNodes,
+                HyperVInventory.ReadJsonString(document.RootElement, "OwnerNode"),
+                HyperVInventory.ReadJsonString(document.RootElement, "Quorum"),
+                HyperVInventory.ReadJsonString(document.RootElement, "FunctionalLevel"),
+                clusterStatus);
+            return new ClusterInventoryData([cluster], nodes);
+        }
+        catch
+        {
+            return ClusterInventoryData.Empty;
+        }
+    }
+
+    private static ClusterNodeRow[] ReadNodes(JsonElement root)
+    {
+        if (!root.TryGetProperty("Nodes", out var value))
+            return [];
+
+        var rows = value.ValueKind switch
+        {
+            JsonValueKind.Array => value.EnumerateArray().ToArray(),
+            JsonValueKind.Object => [value],
+            _ => []
+        };
+
+        return rows
+            .Select(row =>
+            {
+                var name = HyperVInventory.ReadJsonString(row, "Name");
+                var state = HyperVInventory.ReadJsonString(row, "State");
+                return new ClusterNodeRow(name, state, ClusterNodeStatus(state));
+            })
+            .Where(row => !string.IsNullOrWhiteSpace(row.Name))
+            .DistinctBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static string ClusterNodeStatus(string state)
+    {
+        if (state.Equals("Up", StringComparison.OrdinalIgnoreCase)) return "OK";
+        if (state.Equals("Paused", StringComparison.OrdinalIgnoreCase)) return "BUSY";
+        if (state.Equals("Joining", StringComparison.OrdinalIgnoreCase)) return "BUSY";
+        if (state.Equals("Down", StringComparison.OrdinalIgnoreCase)) return "HOT";
+        return string.IsNullOrWhiteSpace(state) ? "OK" : "BUSY";
+    }
+}
+
+internal sealed record ClusterInventoryData(ClusterRow[] Clusters, ClusterNodeRow[] Nodes)
+{
+    public static ClusterInventoryData Empty { get; } = new([], []);
+}
+
+internal sealed record ClusterInventoryResult(ClusterRow[] Clusters, ClusterNodeRow[] Nodes, string? EventMessage, string EventSeverity);
 
 internal static class HostVersionDetector
 {
@@ -2304,9 +2506,12 @@ internal sealed class RollingHistory
     public DiskRow Apply(string key, DiskRow row)
     {
         var values = Add(key, row.Metrics);
+        var freeMin = points.TryGetValue(key, out var queue)
+            ? queue.Select(p => p.Values[nameof(row.Free)]).Where(v => !double.IsNaN(v)).DefaultIfEmpty(row.Free.Current).Min()
+            : row.Free.Current;
         return row with
         {
-            Free = row.Free with { Max = values[nameof(row.Free)] },
+            Free = row.Free with { Max = freeMin },
             Io = row.Io with { Max = values[nameof(row.Io)] },
             Iops = row.Iops with { Max = values[nameof(row.Iops)] },
             QueueDepth = row.QueueDepth with { Max = values[nameof(row.QueueDepth)] },
@@ -2359,6 +2564,7 @@ internal sealed class RollingHistory
 
 internal sealed record Snapshot(
     DateTime At,
+    ClusterRow[] Clusters,
     HostRow[] Hosts,
     VmRow[] Vms,
     DiskRow[] Disks,
@@ -2371,7 +2577,7 @@ internal sealed record Snapshot(
     bool TopologyRefreshing,
     DiscoveryProgress Discovery)
 {
-    public static Snapshot Empty { get; } = new(DateTime.Now, [], [], [], [], [], [], [], true, false, false, DiscoveryProgress.Empty);
+    public static Snapshot Empty { get; } = new(DateTime.Now, [], [], [], [], [], [], [], [], true, false, false, DiscoveryProgress.Empty);
 }
 
 internal sealed record DiscoveryProgress(
@@ -2398,6 +2604,10 @@ internal sealed record Metric(double Current, double Max, Unit Unit)
 }
 
 internal enum Unit { Plain, Percent, Mbps, Iops, Milliseconds }
+
+internal sealed record ClusterRow(string Name, int NodeCount, int UpNodeCount, string OwnerNode, string Quorum, string FunctionalLevel, string Status);
+
+internal sealed record ClusterNodeRow(string Name, string State, string Status);
 
 internal sealed record HostRow(string Name, string Version, Metric Cpu, string CpuCapacity, Metric Mem, string MemCapacity, Metric Io, Metric Net, string Status)
 {
@@ -2530,6 +2740,9 @@ internal sealed class Tui
     private const int ShortMetricWidth = 13;
     private const int HostVersionWidth = 28;
     private const int VmVersionWidth = 7;
+    private const int CountWidth = 5;
+    private const int OwnerWidth = 18;
+    private const int QuorumWidth = 14;
     private const int SizeWidth = 10;
     private const int SwitchTypeWidth = 8;
     private const int UplinkWidth = 3;
@@ -2590,6 +2803,9 @@ internal sealed class Tui
             case ConsoleKey.Q:
                 cts.Cancel();
                 return;
+            case ConsoleKey.C:
+                SetPanel(Panel.Cluster);
+                return;
             case ConsoleKey.H:
                 SetPanel(Panel.Hosts);
                 return;
@@ -2648,6 +2864,17 @@ internal sealed class Tui
         if (rows.Count == 0) return;
         selected = Math.Min(selected, rows.Count - 1);
         var row = rows[selected];
+
+        if (panel == Panel.Cluster && row is ClusterRow)
+        {
+            PushView();
+            panel = Panel.Hosts;
+            selected = 0;
+            drillView = DrillView.Overview;
+            selectedHostName = null;
+            selectedItemName = null;
+            return;
+        }
 
         if (panel == Panel.Hosts && drillView == DrillView.Overview && row is HostRow host)
         {
@@ -2777,6 +3004,7 @@ internal sealed class Tui
 
         return panel switch
         {
+            Panel.Cluster => s.Clusters,
             Panel.Hosts => s.Hosts,
             Panel.Vms => s.Vms,
             Panel.Disks => s.Disks,
@@ -2812,6 +3040,7 @@ internal sealed class Tui
     {
         return string.Join("  ", new[]
         {
+            panel == Panel.Cluster ? "[C] CLUSTER" : " C  CLUSTER",
             panel == Panel.Hosts ? "[H] HOSTS" : " H  HOSTS",
             panel == Panel.Vms ? "[V] VMS" : " V  VMS",
             panel == Panel.Disks ? "[D] CSV / STORAGE" : " D  CSV / STORAGE",
@@ -2855,6 +3084,15 @@ internal sealed class Tui
     {
         switch (panel)
         {
+            case Panel.Cluster:
+                {
+                    var nameWidth = TableNameWidth(TableKind.ClusterLike);
+                    RenderRows(
+                        Row(Header("CLUSTER", nameWidth), HeaderRight("NODES", CountWidth), HeaderRight("UP", CountWidth), Header("OWNER", OwnerWidth), Header("QUORUM", QuorumWidth), Header("STA", StatusWidth)),
+                        state.Read().Clusters,
+                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.NodeCount.ToString(), CountWidth, true), Cell(r.UpNodeCount.ToString(), CountWidth, true), Cell(DisplayName(r.OwnerNode, OwnerWidth), OwnerWidth), Cell(DisplayName(r.Quorum, QuorumWidth), QuorumWidth), Cell(r.Status, StatusWidth)));
+                }
+                break;
             case Panel.Hosts:
                 if (drillView == DrillView.HostVms)
                 {
@@ -2889,8 +3127,8 @@ internal sealed class Tui
                 {
                     var nameWidth = TableNameWidth(TableKind.DiskLike);
                     RenderRows(
-                        Row(Header("NAME", nameWidth), Header("SIZE", SizeWidth), GroupHeader("FRE", MetricWidth), GroupHeader("I/O", MetricWidth), GroupHeader("IOPS", MetricWidth), GroupHeader("QD", ShortMetricWidth), GroupHeader("LAT", ShortMetricWidth), Header("STA", StatusWidth)),
-                        Row(Header(string.Empty, nameWidth), Header(string.Empty, SizeWidth), MetricSubHeader(), MetricSubHeader(), MetricSubHeader(), ShortMetricSubHeader(), ShortMetricSubHeader(), Header(string.Empty, StatusWidth)),
+                        Row(Header("NAME", nameWidth), HeaderRight("SIZE", SizeWidth), GroupHeader("FREE", MetricWidth), GroupHeader("I/O", MetricWidth), GroupHeader("IOPS", MetricWidth), GroupHeader("QD", ShortMetricWidth), GroupHeader("LAT", ShortMetricWidth), Header("STA", StatusWidth)),
+                        Row(Header(string.Empty, nameWidth), Header(string.Empty, SizeWidth), FreeMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), ShortMetricSubHeader(), ShortMetricSubHeader(), Header(string.Empty, StatusWidth)),
                         state.Read().Disks,
                         r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Size, SizeWidth, true), Fmt(r.Free), Fmt(r.Io), Fmt(r.Iops), FmtShort(r.QueueDepth), FmtShort(r.Latency), Cell(r.Status, StatusWidth)));
                 }
@@ -2928,6 +3166,8 @@ internal sealed class Tui
 
     private static string Header(string text, int width) => Cell(text, width);
 
+    private static string HeaderRight(string text, int width) => Cell(text, width, true);
+
     private static string GroupHeader(string label, int width)
     {
         if (label.Length >= width) return label[..width];
@@ -2940,6 +3180,8 @@ internal sealed class Tui
         => Cell(new string(' ', 7) + Cell(label, 4), CapacityMetricWidth);
 
     private static string MetricSubHeader() => FixedMetricHeaderCell("cur", "max", valueWidth: 9, width: MetricWidth);
+
+    private static string FreeMetricSubHeader() => FixedMetricHeaderCell("cur", "min", valueWidth: 9, width: MetricWidth);
 
     private static string ShortMetricSubHeader() => FixedMetricHeaderCell("cur", "max", valueWidth: 5, width: ShortMetricWidth);
 
@@ -3041,6 +3283,14 @@ internal sealed class Tui
 
         switch (detailTarget)
         {
+            case ClusterRow cluster:
+                Detail(7, "Name", cluster.Name);
+                Detail(8, "Nodes", $"{cluster.UpNodeCount}/{cluster.NodeCount} up");
+                Detail(9, "Owner", cluster.OwnerNode);
+                Detail(10, "Quorum", cluster.Quorum);
+                Detail(11, "Functional level", cluster.FunctionalLevel);
+                Detail(13, "Status", cluster.Status, StatusColor(cluster.Status));
+                break;
             case VmRow vm:
                 var vmDisks = GetVmDisks(vm, state.Read());
                 var vmAdapters = GetVmNetworkAdapters(vm, state.Read());
@@ -3082,11 +3332,12 @@ internal sealed class Tui
                 break;
             case HostRow host:
                 Detail(7, "Name", host.Name);
-                DetailMetricWithCapacity(8, "CPU", host.Cpu, host.CpuCapacity);
-                DetailMetricWithCapacity(9, "Memory", host.Mem, host.MemCapacity);
-                DetailMetric(10, "I/O", host.Io);
-                DetailMetric(11, "Network", host.Net);
-                Detail(13, "Status", host.Status, StatusColor(host.Status));
+                Detail(8, "Version", host.Version);
+                DetailMetricWithCapacity(9, "CPU", host.Cpu, host.CpuCapacity);
+                DetailMetricWithCapacity(10, "Memory", host.Mem, host.MemCapacity);
+                DetailMetric(11, "I/O", host.Io);
+                DetailMetric(12, "Network", host.Net);
+                Detail(14, "Status", host.Status, StatusColor(host.Status));
                 break;
             case DiskRow disk:
                 Detail(7, "Name", disk.Name);
@@ -3131,6 +3382,7 @@ internal sealed class Tui
         var s = state.Read();
         return detailPanel switch
         {
+            Panel.Cluster => s.Clusters.FirstOrDefault(r => r.Name == selectedItemName),
             Panel.Hosts => s.Hosts.FirstOrDefault(r => r.Name == selectedItemName),
             Panel.Vms => s.Vms.FirstOrDefault(r => r.Name == selectedItemName && (string.IsNullOrEmpty(selectedHostName) || r.HostName == selectedHostName)),
             Panel.Disks => s.Disks.FirstOrDefault(r => r.Name == selectedItemName),
@@ -3144,6 +3396,8 @@ internal sealed class Tui
     {
         if (panel == Panel.Hosts && row is VmRow vm)
             return $"HOST {vm.HostName} -> VM {vm.Name}";
+        if (panel == Panel.Cluster && row is HostRow host)
+            return $"CLUSTER -> HOST {host.Name}";
         if (panel == Panel.Network && row is NetworkRow net && !string.IsNullOrWhiteSpace(selectedHostName))
             return $"VSWITCH {selectedHostName} -> pNIC {net.Name}";
         return $"{detailPanel} detail: {GetRowName(row)}";
@@ -3151,6 +3405,7 @@ internal sealed class Tui
 
     private static string GetRowName(object row) => row switch
     {
+        ClusterRow cluster => cluster.Name,
         HostRow host => host.Name,
         VmRow vm => vm.Name,
         DiskRow disk => disk.Name,
@@ -3192,16 +3447,16 @@ internal sealed class Tui
     private static string FmtWithCapacity(Metric metric, string capacity) => FixedMetricCell(FmtValue(metric.Current, metric.Unit), FmtValue(metric.Max, metric.Unit), $"({capacity})", valueWidth: 4, configWidth: 11, width: CapacityMetricWidth);
 
     private static string DetailMetricValue(Metric metric)
-        => $"{Cell(FmtValue(metric.Current, metric.Unit), 9, true)} | {Cell(FmtValue(metric.Max, metric.Unit), 9, true)}";
+        => $"{Cell(FmtValue(metric.Current, metric.Unit), 9, true)} | {Cell(FmtValue(metric.Max, metric.Unit), 9)}";
 
     private static string DetailMetricWithCapacityValue(Metric metric, string capacity)
         => $"{Cell(FmtValue(metric.Current, metric.Unit), 4, true)} | {Cell(FmtValue(metric.Max, metric.Unit), 4, true)} | {Cell($"({capacity})", 12)}";
 
     private static string DetailSplitValue(Metric metric, double ratio)
-        => $"{Cell(FmtValue(metric.Current * ratio, metric.Unit), 9, true)} | {Cell(FmtValue(metric.Max * ratio, metric.Unit), 9, true)}";
+        => $"{Cell(FmtValue(metric.Current * ratio, metric.Unit), 9, true)} | {Cell(FmtValue(metric.Max * ratio, metric.Unit), 9)}";
 
     private static string FixedMetricCell(string current, string max, int valueWidth, int width)
-        => Cell($"{Cell(current, valueWidth, true)} | {Cell(max, valueWidth, true)}", width, true);
+        => Cell($"{Cell(current, valueWidth, true)} | {Cell(max, valueWidth)}", width, true);
 
     private static string FixedMetricCell(string current, string max, string config, int valueWidth, int configWidth, int width)
         => Cell($"{Cell(current, valueWidth, true)} | {Cell(max, valueWidth, true)} | {Cell(config, configWidth)}", width, true);
@@ -3265,6 +3520,7 @@ internal sealed class Tui
 
     private static ConsoleColor RowColor(object row) => row switch
     {
+        ClusterRow cluster => StatusColor(cluster.Status),
         HostRow host => StatusColor(host.Status),
         VmRow vm => StatusColor(vm.Status),
         DiskRow disk => StatusColor(disk.Status),
@@ -3290,6 +3546,7 @@ internal sealed class Tui
     {
         var fixedWidths = kind switch
         {
+            TableKind.ClusterLike => CountWidth + CountWidth + OwnerWidth + QuorumWidth + StatusWidth,
             TableKind.HostLike => HostVersionWidth + CapacityMetricWidth + CapacityMetricWidth + MetricWidth + MetricWidth + StatusWidth,
             TableKind.VmLike => VmVersionWidth + CapacityMetricWidth + CapacityMetricWidth + MetricWidth + MetricWidth + StatusWidth,
             TableKind.DiskLike => SizeWidth + MetricWidth + MetricWidth + MetricWidth + ShortMetricWidth + ShortMetricWidth + StatusWidth,
@@ -3300,6 +3557,7 @@ internal sealed class Tui
 
         var columns = kind switch
         {
+            TableKind.ClusterLike => 6,
             TableKind.HostLike => 7,
             TableKind.VmLike => 7,
             TableKind.DiskLike => 8,
@@ -3366,11 +3624,11 @@ internal sealed class Tui
     }
 }
 
-internal enum Panel { Hosts, Vms, Disks, Network, Events }
+internal enum Panel { Cluster, Hosts, Vms, Disks, Network, Events }
 
 internal enum DrillView { Overview, HostVms, NetworkAdapters, Detail }
 
-internal enum TableKind { HostLike, VmLike, DiskLike, NetworkLike, NetworkSwitchLike }
+internal enum TableKind { ClusterLike, HostLike, VmLike, DiskLike, NetworkLike, NetworkSwitchLike }
 
 internal sealed record ViewState(
     Panel Panel,
