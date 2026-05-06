@@ -8,7 +8,7 @@ namespace hvtop.Native;
 
 internal static class Program
 {
-    public const string DisplayVersion = "0.3.0+20260506.2245";
+    public const string DisplayVersion = "0.3.1+20260507.0037";
     public const string AppName = "hvtop";
 
     public static async Task<int> Main(string[] args)
@@ -32,7 +32,7 @@ internal static class Program
             return 0;
         }
 
-        var state = new AppState();
+        var state = new AppState(options.Refresh);
         var sampler = Task.Run(() => RunSamplerAsync(collector, state, options, cts.Token));
 
         try
@@ -109,7 +109,7 @@ internal static class Program
             }
 
             var elapsed = Stopwatch.GetElapsedTime(started);
-            var delay = TimeSpan.FromMilliseconds(Math.Max(50, options.Refresh.TotalMilliseconds - elapsed.TotalMilliseconds));
+            var delay = TimeSpan.FromMilliseconds(Math.Max(50, state.Refresh.TotalMilliseconds - elapsed.TotalMilliseconds));
             await Task.Delay(delay, token).ConfigureAwait(false);
         }
     }
@@ -148,6 +148,21 @@ internal sealed class AppState
     private readonly object gate = new();
     private Snapshot snapshot = Snapshot.Empty;
     private bool refreshRequested = true;
+    private TimeSpan refresh;
+
+    public AppState(TimeSpan refresh)
+    {
+        this.refresh = refresh;
+    }
+
+    public TimeSpan Refresh
+    {
+        get
+        {
+            lock (gate)
+                return refresh;
+        }
+    }
 
     public void Publish(Snapshot next)
     {
@@ -180,6 +195,24 @@ internal sealed class AppState
     {
         lock (gate)
             refreshRequested = true;
+    }
+
+    public TimeSpan CycleRefresh(bool reverse = false)
+    {
+        var steps = new[] { 0.5, 1.0, 2.0, 5.0, 10.0 };
+        lock (gate)
+        {
+            var current = refresh.TotalSeconds;
+            var index = Array.FindIndex(steps, value => Math.Abs(value - current) < 0.01);
+            if (index < 0)
+                index = steps.Select((value, i) => new { value, i }).OrderBy(item => Math.Abs(item.value - current)).First().i;
+
+            index = reverse
+                ? (index - 1 + steps.Length) % steps.Length
+                : (index + 1) % steps.Length;
+            refresh = TimeSpan.FromSeconds(steps[index]);
+            return refresh;
+        }
     }
 
     public bool ConsumeRefreshRequest()
@@ -2755,6 +2788,7 @@ internal sealed class Tui
     private string? selectedHostName;
     private string? selectedItemName;
     private readonly Stack<ViewState> backStack = new();
+    private readonly Dictionary<string, SortState> sortStates = new(StringComparer.OrdinalIgnoreCase);
     private string[] previousLines = [];
     private ConsoleColor[] previousForegrounds = [];
     private ConsoleColor[] previousBackgrounds = [];
@@ -2825,11 +2859,30 @@ internal sealed class Tui
                 state.RequestRefresh();
                 state.AddEvent("INFO", "Inventory/topology refresh requested");
                 return;
+            case ConsoleKey.F:
+                var refresh = state.CycleRefresh((key.Modifiers & ConsoleModifiers.Shift) != 0);
+                state.AddEvent("INFO", $"Refresh delay set to {refresh.TotalSeconds:N1}s");
+                return;
+            case ConsoleKey.S:
+                CycleSort((key.Modifiers & ConsoleModifiers.Shift) != 0);
+                return;
             case ConsoleKey.UpArrow:
                 selected = Math.Max(0, selected - 1);
                 return;
             case ConsoleKey.DownArrow:
                 selected++;
+                return;
+            case ConsoleKey.PageUp:
+                selected = Math.Max(0, selected - PageSize());
+                return;
+            case ConsoleKey.PageDown:
+                selected = Math.Min(Math.Max(0, CurrentRows().Count - 1), selected + PageSize());
+                return;
+            case ConsoleKey.Home:
+                selected = 0;
+                return;
+            case ConsoleKey.End:
+                selected = Math.Max(0, CurrentRows().Count - 1);
                 return;
             case ConsoleKey.Enter:
                 if (drillView == DrillView.Detail)
@@ -2847,6 +2900,8 @@ internal sealed class Tui
         if (key.KeyChar == 'k') selected = Math.Max(0, selected - 1);
     }
 
+    private int PageSize() => Math.Max(1, Console.WindowHeight - 8);
+
     private void SetPanel(Panel next)
     {
         panel = next;
@@ -2855,6 +2910,41 @@ internal sealed class Tui
         selectedHostName = null;
         selectedItemName = null;
         backStack.Clear();
+    }
+
+    private void CycleSort(bool reverse)
+    {
+        var columns = SortColumns().ToArray();
+        if (columns.Length == 0) return;
+
+        var key = SortViewKey();
+        var current = SortStateFor(key, columns);
+        SortState next;
+        if (reverse)
+        {
+            next = current with { Descending = !current.Descending };
+        }
+        else
+        {
+            var index = Array.FindIndex(columns, c => c.Key.Equals(current.Column, StringComparison.OrdinalIgnoreCase));
+            index = index < 0 ? 0 : (index + 1) % columns.Length;
+            next = new SortState(columns[index].Key, DefaultDescending(columns[index].Key));
+        }
+
+        sortStates[key] = next;
+        selected = 0;
+        var label = columns.First(c => c.Key.Equals(next.Column, StringComparison.OrdinalIgnoreCase)).Label;
+        state.AddEvent("INFO", $"Sort set to {label} {(next.Descending ? "desc" : "asc")}");
+    }
+
+    private string CurrentSortLabel()
+    {
+        var columns = SortColumns().ToArray();
+        if (columns.Length == 0) return "n/a";
+
+        var current = SortStateFor(SortViewKey(), columns);
+        var label = columns.First(c => c.Key.Equals(current.Column, StringComparison.OrdinalIgnoreCase)).Label;
+        return $"{label} {(current.Descending ? "desc" : "asc")}";
     }
 
     private void OpenSelected()
@@ -2997,30 +3087,257 @@ internal sealed class Tui
     private IReadOnlyList<object> CurrentRows()
     {
         var s = state.Read();
+        IReadOnlyList<object> rows;
         if (panel == Panel.Hosts && drillView == DrillView.HostVms)
-            return s.Vms.Where(v => v.HostName == selectedHostName).Cast<object>().ToArray();
+            rows = s.Vms.Where(v => v.HostName == selectedHostName).Cast<object>().ToArray();
+        else if (panel == Panel.Network && drillView == DrillView.NetworkAdapters)
+            rows = GetSwitchUplinkRows(s, selectedHostName).Cast<object>().ToArray();
+        else
+        {
+            rows = panel switch
+            {
+                Panel.Cluster => s.Clusters,
+                Panel.Hosts => s.Hosts,
+                Panel.Vms => s.Vms,
+                Panel.Disks => s.Disks,
+                Panel.Network => s.NetworkSwitches,
+                Panel.Events => s.Events,
+                _ => []
+            };
+        }
+
+        return ApplySort(rows).ToArray();
+    }
+
+    private IEnumerable<object> ApplySort(IReadOnlyList<object> rows)
+    {
+        var columns = SortColumns().ToArray();
+        if (columns.Length == 0 || rows.Count <= 1)
+            return rows;
+
+        var state = SortStateFor(SortViewKey(), columns);
+        var sortable = rows.Select(row => new { Row = row, Value = SortValue(row, state.Column) }).ToArray();
+        var valid = sortable.Where(item => !IsMissingSortValue(item.Value)).ToArray();
+        var missing = sortable.Where(item => IsMissingSortValue(item.Value)).Select(item => item.Row).OrderBy(GetRowName, StringComparer.OrdinalIgnoreCase);
+        return state.Descending
+            ? valid.OrderByDescending(item => item.Value, SortValueComparer.Instance)
+                .ThenBy(item => GetRowName(item.Row), StringComparer.OrdinalIgnoreCase)
+                .Select(item => item.Row)
+                .Concat(missing)
+            : valid.OrderBy(item => item.Value, SortValueComparer.Instance)
+                .ThenBy(item => GetRowName(item.Row), StringComparer.OrdinalIgnoreCase)
+                .Select(item => item.Row)
+                .Concat(missing);
+    }
+
+    private SortState SortStateFor(string key, SortColumn[] columns)
+    {
+        if (sortStates.TryGetValue(key, out var state) && columns.Any(c => c.Key.Equals(state.Column, StringComparison.OrdinalIgnoreCase)))
+            return state;
+
+        var column = columns[0].Key;
+        state = new SortState(column, DefaultDescending(column));
+        sortStates[key] = state;
+        return state;
+    }
+
+    private string SortViewKey()
+    {
+        if (panel == Panel.Hosts && drillView == DrillView.HostVms) return "HostVms";
+        if (panel == Panel.Network && drillView == DrillView.NetworkAdapters) return "NetworkAdapters";
+        return panel.ToString();
+    }
+
+    private IEnumerable<SortColumn> SortColumns()
+    {
+        if (panel == Panel.Hosts && drillView == DrillView.HostVms)
+            return VmSortColumns();
         if (panel == Panel.Network && drillView == DrillView.NetworkAdapters)
-            return GetSwitchUplinkRows(s, selectedHostName).Cast<object>().ToArray();
+            return [new("NAME", "name"), new("LINK", "link"), new("THR", "throughput"), new("RX", "rx"), new("TX", "tx"), new("DROPS", "drops"), new("STA", "status")];
 
         return panel switch
         {
-            Panel.Cluster => s.Clusters,
-            Panel.Hosts => s.Hosts,
-            Panel.Vms => s.Vms,
-            Panel.Disks => s.Disks,
-            Panel.Network => s.NetworkSwitches,
-            Panel.Events => s.Events,
+            Panel.Cluster => [new("NAME", "name"), new("NODES", "nodes"), new("UP", "up"), new("OWNER", "owner"), new("QUORUM", "quorum"), new("STA", "status")],
+            Panel.Hosts => [new("NAME", "name"), new("VER", "version"), new("CPU", "cpu"), new("MEM", "memory"), new("IO", "i/o"), new("NET", "network"), new("STA", "status")],
+            Panel.Vms => VmSortColumns(),
+            Panel.Disks => [new("NAME", "name"), new("SIZE", "size"), new("FREE", "free"), new("IO", "i/o"), new("IOPS", "iops"), new("QD", "queue"), new("LAT", "latency"), new("STA", "status")],
+            Panel.Network => [new("NAME", "name"), new("TYPE", "type"), new("UPL", "uplinks"), new("LINK", "link"), new("THR", "throughput"), new("RX", "rx"), new("TX", "tx"), new("STA", "status")],
+            Panel.Events => [new("DATE", "date"), new("SEV", "severity"), new("WHAT", "message")],
             _ => []
         };
+    }
+
+    private static SortColumn[] VmSortColumns()
+        => [new("NAME", "name"), new("VER", "version"), new("CPU", "cpu"), new("MEM", "memory"), new("IO", "i/o"), new("NET", "network"), new("IOPS", "iops"), new("LAT", "latency"), new("STA", "status")];
+
+    private static bool DefaultDescending(string column)
+        => column is "CPU" or "MEM" or "IO" or "NET" or "IOPS" or "QD" or "LAT" or "SIZE" or "NODES" or "UP" or "THR" or "RX" or "TX" or "DROPS" or "DATE";
+
+    private static object? SortValue(object row, string column) => row switch
+    {
+        ClusterRow cluster => column switch
+        {
+            "NAME" => cluster.Name,
+            "NODES" => cluster.NodeCount,
+            "UP" => cluster.UpNodeCount,
+            "OWNER" => cluster.OwnerNode,
+            "QUORUM" => cluster.Quorum,
+            "STA" => StatusRank(cluster.Status),
+            _ => cluster.Name
+        },
+        HostRow host => column switch
+        {
+            "NAME" => host.Name,
+            "VER" => host.Version,
+            "CPU" => host.Cpu.Current,
+            "MEM" => host.Mem.Current,
+            "IO" => host.Io.Current,
+            "NET" => host.Net.Current,
+            "STA" => StatusRank(host.Status),
+            _ => host.Name
+        },
+        VmRow vm => column switch
+        {
+            "NAME" => vm.Name,
+            "VER" => vm.Version,
+            "CPU" => vm.Cpu.Current,
+            "MEM" => vm.Mem.Current,
+            "IO" => vm.Io.Current,
+            "NET" => vm.Net.Current,
+            "IOPS" => vm.Iops.Current,
+            "LAT" => vm.Latency.Current,
+            "STA" => StatusRank(vm.Status),
+            _ => vm.Name
+        },
+        DiskRow disk => column switch
+        {
+            "NAME" => disk.Name,
+            "SIZE" => ParseCapacity(disk.Size),
+            "FREE" => disk.Free.Current,
+            "IO" => disk.Io.Current,
+            "IOPS" => disk.Iops.Current,
+            "QD" => disk.QueueDepth.Current,
+            "LAT" => disk.Latency.Current,
+            "STA" => StatusRank(disk.Status),
+            _ => disk.Name
+        },
+        NetworkSwitchRow network => column switch
+        {
+            "NAME" => network.Name,
+            "TYPE" => network.SwitchType,
+            "UPL" => network.Uplinks.Length,
+            "LINK" => ParseLink(network.Link),
+            "THR" => network.Throughput.Current,
+            "RX" => network.Rx.Current,
+            "TX" => network.Tx.Current,
+            "STA" => StatusRank(network.Status),
+            _ => network.Name
+        },
+        NetworkRow net => column switch
+        {
+            "NAME" => net.Name,
+            "LINK" => ParseLink(net.Link),
+            "THR" => net.Throughput.Current,
+            "RX" => net.Rx.Current,
+            "TX" => net.Tx.Current,
+            "DROPS" => net.Drops.Current,
+            "STA" => StatusRank(net.Status),
+            _ => net.Name
+        },
+        EventRow evt => column switch
+        {
+            "DATE" => evt.At,
+            "SEV" => EventSeverityRank(evt.Severity),
+            "WHAT" => evt.Message,
+            _ => evt.At
+        },
+        _ => null
+    };
+
+    private static int StatusRank(string status) => status.ToUpperInvariant() switch
+    {
+        "HOT" => 4,
+        "BUSY" => 3,
+        "OK" => 2,
+        "IDLE" => 1,
+        "OFF" => 0,
+        _ => 0
+    };
+
+    private static int EventSeverityRank(string severity) => severity.ToUpperInvariant() switch
+    {
+        "ERR" => 3,
+        "WARN" => 2,
+        "INFO" => 1,
+        _ => 0
+    };
+
+    private static bool IsMissingSortValue(object? value)
+        => value is null || (value is double number && double.IsNaN(number));
+
+    private static double ParseCapacity(string value)
+    {
+        var parts = value.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length == 0 || !double.TryParse(parts[0], out var number))
+            return 0;
+
+        var multiplier = parts.Length > 1 ? parts[1].ToUpperInvariant() switch
+        {
+            "KB" => 1024d,
+            "MB" => 1024d * 1024,
+            "GB" => 1024d * 1024 * 1024,
+            "TB" => 1024d * 1024 * 1024 * 1024,
+            _ => 1d
+        } : 1d;
+        return number * multiplier;
+    }
+
+    private static double ParseLink(string value)
+    {
+        if (value.Equals("DOWN", StringComparison.OrdinalIgnoreCase)) return 0;
+        if (value.StartsWith("2x", StringComparison.OrdinalIgnoreCase)) return 2 * ParseLink(value[2..]);
+        if (value.EndsWith("100G", StringComparison.OrdinalIgnoreCase)) return 100;
+        if (value.EndsWith("40G", StringComparison.OrdinalIgnoreCase)) return 40;
+        if (value.EndsWith("25G", StringComparison.OrdinalIgnoreCase)) return 25;
+        if (value.EndsWith("10G", StringComparison.OrdinalIgnoreCase)) return 10;
+        if (value.Equals("GbE", StringComparison.OrdinalIgnoreCase)) return 1;
+        if (value.Equals("FE", StringComparison.OrdinalIgnoreCase)) return 0.1;
+        return 0;
+    }
+
+    private sealed class SortValueComparer : IComparer<object?>
+    {
+        public static SortValueComparer Instance { get; } = new();
+
+        public int Compare(object? x, object? y)
+        {
+            if (x is null && y is null) return 0;
+            if (x is null) return 1;
+            if (y is null) return -1;
+
+            if (x is double dx)
+            {
+                var dy = y is double yDouble ? yDouble : 0;
+                if (double.IsNaN(dx) && double.IsNaN(dy)) return 0;
+                if (double.IsNaN(dx)) return 1;
+                if (double.IsNaN(dy)) return -1;
+                return dx.CompareTo(dy);
+            }
+
+            if (x is int ix && y is int iy) return ix.CompareTo(iy);
+            if (x is DateTime tx && y is DateTime ty) return tx.CompareTo(ty);
+            return string.Compare(x.ToString(), y.ToString(), StringComparison.OrdinalIgnoreCase);
+        }
     }
 
     private void Render()
     {
         var s = state.Read();
         BeginFrame();
-        WriteLine(0, $"{Program.AppName} {Program.DisplayVersion}  Sample: {s.At:HH:mm:ss}  Refresh: {options.Refresh.TotalSeconds:N1}s  History: {options.History.TotalMinutes:N0}m", ConsoleColor.White);
+        var sort = CurrentSortLabel();
+        WriteLine(0, $"{Program.AppName} {Program.DisplayVersion}  Sample: {s.At:HH:mm:ss}  Refresh: {state.Refresh.TotalSeconds:N1}s  History: {options.History.TotalMinutes:N0}m  Sort: {sort}", ConsoleColor.White);
         WriteLine(1, Nav(), ConsoleColor.Yellow);
-        WriteLine(2, "Arrows/j/k move  Enter drill down  Backspace/Esc back  r rescan  q quit", ConsoleColor.DarkGray);
+        WriteLine(2, "Arrows/j/k move  PgUp/PgDn page  Home/End top/bottom  Enter drill  s sort  S dir  f refresh  r rescan  q quit", ConsoleColor.DarkGray);
 
         if (ShouldShowLoadingOverlay(s))
         {
@@ -3089,7 +3406,7 @@ internal sealed class Tui
                     var nameWidth = TableNameWidth(TableKind.ClusterLike);
                     RenderRows(
                         Row(Header("CLUSTER", nameWidth), HeaderRight("NODES", CountWidth), HeaderRight("UP", CountWidth), Header("OWNER", OwnerWidth), Header("QUORUM", QuorumWidth), Header("STA", StatusWidth)),
-                        state.Read().Clusters,
+                        CurrentRows().Cast<ClusterRow>().ToArray(),
                         r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.NodeCount.ToString(), CountWidth, true), Cell(r.UpNodeCount.ToString(), CountWidth, true), Cell(DisplayName(r.OwnerNode, OwnerWidth), OwnerWidth), Cell(DisplayName(r.Quorum, QuorumWidth), QuorumWidth), Cell(r.Status, StatusWidth)));
                 }
                 break;
@@ -3109,7 +3426,7 @@ internal sealed class Tui
                     RenderRows(
                         Row(Header("HOSTNAME", nameWidth), Header("VER", HostVersionWidth), CapacityMetricGroupHeader("CPU"), CapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
                         Row(Header(string.Empty, nameWidth), Header(string.Empty, HostVersionWidth), CapacityMetricSubHeader(), CapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
-                        state.Read().Hosts,
+                        CurrentRows().Cast<HostRow>().ToArray(),
                         r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, HostVersionWidth), FmtWithCapacity(r.Cpu, r.CpuCapacity), FmtWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
                 }
                 break;
@@ -3119,7 +3436,7 @@ internal sealed class Tui
                     RenderRows(
                         Row(Header("NAME", nameWidth), Header("VER", VmVersionWidth), CapacityMetricGroupHeader("CPU"), CapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
                         Row(Header(string.Empty, nameWidth), Header(string.Empty, VmVersionWidth), CapacityMetricSubHeader(), CapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
-                        state.Read().Vms,
+                        CurrentRows().Cast<VmRow>().ToArray(),
                         r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, VmVersionWidth), FmtWithCapacity(r.Cpu, r.CpuCapacity), FmtWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
                 }
                 break;
@@ -3129,7 +3446,7 @@ internal sealed class Tui
                     RenderRows(
                         Row(Header("NAME", nameWidth), HeaderRight("SIZE", SizeWidth), GroupHeader("FREE", MetricWidth), GroupHeader("I/O", MetricWidth), GroupHeader("IOPS", MetricWidth), GroupHeader("QD", ShortMetricWidth), GroupHeader("LAT", ShortMetricWidth), Header("STA", StatusWidth)),
                         Row(Header(string.Empty, nameWidth), Header(string.Empty, SizeWidth), FreeMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), ShortMetricSubHeader(), ShortMetricSubHeader(), Header(string.Empty, StatusWidth)),
-                        state.Read().Disks,
+                        CurrentRows().Cast<DiskRow>().ToArray(),
                         r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Size, SizeWidth, true), Fmt(r.Free), Fmt(r.Io), Fmt(r.Iops), FmtShort(r.QueueDepth), FmtShort(r.Latency), Cell(r.Status, StatusWidth)));
                 }
                 break;
@@ -3150,14 +3467,14 @@ internal sealed class Tui
                         RenderRows(
                             Row(Header("VSWITCH", nameWidth), Header("TYPE", SwitchTypeWidth), Header("UPL", UplinkWidth), Header("LINK", LinkWidth), GroupHeader("THR", MetricWidth), GroupHeader("RX", MetricWidth), GroupHeader("TX", MetricWidth), Header("STA", StatusWidth)),
                             Row(Header(string.Empty, nameWidth), Header(string.Empty, SwitchTypeWidth), Header(string.Empty, UplinkWidth), Header(string.Empty, LinkWidth), MetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
-                            state.Read().NetworkSwitches,
+                            CurrentRows().Cast<NetworkSwitchRow>().ToArray(),
                             r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.SwitchType, SwitchTypeWidth), Cell(r.Uplinks.Length.ToString(), UplinkWidth, true), Cell(r.Link, LinkWidth), Fmt(r.Throughput), Fmt(r.Rx), Fmt(r.Tx), Cell(r.Status, StatusWidth)));
                     }
                 }
                 break;
             case Panel.Events:
                 RenderRows(Row(Header("DATE", 19), Header("SEV", 5), Header("WHAT JUST HAPPENED", 80)),
-                    state.Read().Events, r => Row(Cell($"{r.At:yyyy-MM-dd HH:mm:ss}", 19), Cell(r.Severity, 5), r.Message));
+                    CurrentRows().Cast<EventRow>().ToArray(), r => Row(Cell($"{r.At:yyyy-MM-dd HH:mm:ss}", 19), Cell(r.Severity, 5), r.Message));
                 break;
         }
     }
@@ -3637,3 +3954,7 @@ internal sealed record ViewState(
     Panel DetailPanel,
     string? SelectedHostName,
     string? SelectedItemName);
+
+internal sealed record SortState(string Column, bool Descending);
+
+internal sealed record SortColumn(string Key, string Label);
