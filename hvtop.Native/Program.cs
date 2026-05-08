@@ -8,7 +8,7 @@ namespace hvtop.Native;
 
 internal static class Program
 {
-    public const string DisplayVersion = "0.3.1+20260507.0037";
+    public const string DisplayVersion = "0.4.0+20260508.0007";
     public const string AppName = "hvtop";
 
     public static async Task<int> Main(string[] args)
@@ -115,13 +115,12 @@ internal static class Program
     }
 }
 
-internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool DemoVms, bool Smoke)
+internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke)
 {
     public static Options Parse(string[] args)
     {
         var refresh = TimeSpan.FromSeconds(1);
         var history = TimeSpan.FromMinutes(15);
-        var demoVms = false;
         var smoke = false;
 
         for (var i = 0; i < args.Length; i++)
@@ -131,15 +130,11 @@ internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool DemoVms,
                 refresh = TimeSpan.FromSeconds(Math.Max(0.2, double.Parse(args[++i])));
             else if (arg.Equals("--history", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
                 history = TimeSpan.FromMinutes(Math.Max(1, double.Parse(args[++i])));
-            else if (arg.Equals("--demo-vms", StringComparison.OrdinalIgnoreCase))
-                demoVms = true;
-            else if (arg.Equals("--no-demo-vms", StringComparison.OrdinalIgnoreCase))
-                demoVms = false;
             else if (arg.Equals("--smoke", StringComparison.OrdinalIgnoreCase))
                 smoke = true;
         }
 
-        return new Options(refresh, history, demoVms, smoke);
+        return new Options(refresh, history, smoke);
     }
 }
 
@@ -236,7 +231,6 @@ internal sealed class Collector : IDisposable
     private readonly HyperVInventory inventory = new();
     private readonly HyperVTopology topology = new();
     private readonly ClusterInventory clusterInventory = new();
-    private readonly DemoVmSampler demoVms = new();
     private readonly Counter cpu;
     private readonly Counter memory;
     private readonly Counter diskBytes;
@@ -252,6 +246,7 @@ internal sealed class Collector : IDisposable
     private bool storageDiscoveryLogged;
     private bool networkDiscoveryLogged;
     private bool discoveryCompleteLogged;
+    private bool emptyVmInventoryLogged;
 
     public Collector(Options options)
     {
@@ -277,7 +272,8 @@ internal sealed class Collector : IDisposable
         var hostMem = memory.Read();
         var hostIo = diskBytes.Read() / 1024 / 1024;
         var adapterRates = network.Sample();
-        var hostNet = adapterRates.Where(a => a.IsHardwareInterface).Sum(a => a.TotalBytesPerSecond) / 1024 / 1024;
+        var visibleAdapterRates = adapterRates.Where(a => a.IsVisibleAdapter).ToArray();
+        var hostNet = visibleAdapterRates.Sum(a => a.TotalBytesPerSecond) / 1024 / 1024;
         var iops = diskIops.Read();
         var queue = diskQueue.Read();
         var latency = diskLatencySeconds.Read() * 1000;
@@ -316,16 +312,26 @@ internal sealed class Collector : IDisposable
             .Select(storage =>
             {
                 var free = 100.0 * storage.FreeBytes / storage.TotalBytes;
-                var diskIo = LogicalDiskSampler.TotalMbps(storage.CounterKey);
-                var diskIopsValue = LogicalDiskSampler.TotalIops(storage.CounterKey);
+                var diskReadIo = LogicalDiskSampler.ReadMbps(storage.CounterKey);
+                var diskWriteIo = LogicalDiskSampler.WriteMbps(storage.CounterKey);
+                var diskIo = diskReadIo + diskWriteIo;
+                var diskReadIopsValue = LogicalDiskSampler.ReadIops(storage.CounterKey);
+                var diskWriteIopsValue = LogicalDiskSampler.WriteIops(storage.CounterKey);
+                var diskIopsValue = diskReadIopsValue + diskWriteIopsValue;
                 var diskQueueDepth = LogicalDiskSampler.QueueDepth(storage.CounterKey);
                 var diskLatencyMs = LogicalDiskSampler.LatencyMs(storage.CounterKey);
                 var row = new DiskRow(
                     storage.DisplayName,
                     CapacityFormatter.FormatCapacity(storage.TotalBytes),
+                    CapacityFormatter.FormatCapacity(storage.TotalBytes - storage.FreeBytes),
+                    CapacityFormatter.FormatCapacity(storage.FreeBytes),
                     Metric.Percent(free),
                     Metric.Mbps(diskIo),
+                    Metric.Mbps(diskReadIo),
+                    Metric.Mbps(diskWriteIo),
                     Metric.Iops(diskIopsValue),
+                    Metric.Iops(diskReadIopsValue),
+                    Metric.Iops(diskWriteIopsValue),
                     Metric.Plain(diskQueueDepth),
                     Metric.Milliseconds(diskLatencyMs),
                     Status.From(10, 100 - free, diskLatencyMs, diskQueueDepth));
@@ -333,7 +339,7 @@ internal sealed class Collector : IDisposable
             })
             .ToArray();
 
-        var adapters = adapterRates
+        var adapters = visibleAdapterRates
             .Select(a =>
             {
                 var row = new NetworkRow(
@@ -351,17 +357,20 @@ internal sealed class Collector : IDisposable
             })
             .ToArray();
 
-        var vms = options.DemoVms ? demoVms.Collect(history, host.Name) : hyperV.Collect(history, host.Name, inventoryVms);
-        if (!options.DemoVms && vms.Length == 0)
-            AddEvent("INFO", "No Hyper-V VM counters found. Run with --demo-vms to show demo VM rows.");
+        var vms = hyperV.Collect(history, host.Name, inventoryVms);
+        if (vms.Length == 0 && !inventory.IsRefreshing && !emptyVmInventoryLogged)
+        {
+            emptyVmInventoryLogged = true;
+            AddEvent("INFO", "No Hyper-V VMs detected; VM pane is empty on this host.");
+        }
 
-        var vmTopologyResult = options.DemoVms ? HyperVTopologyResult.Empty : topology.TryRead(disks, adapters);
+        var vmTopologyResult = topology.TryRead(disks, adapters);
         if (topologyRefreshRequested)
             topology.RequestRefresh();
         if (!string.IsNullOrWhiteSpace(vmTopologyResult.EventMessage))
             AddEvent(vmTopologyResult.EventSeverity, vmTopologyResult.EventMessage);
 
-        var networkSwitches = !options.DemoVms && topology.IsRefreshing && vmTopologyResult.Switches.Length == 0
+        var networkSwitches = topology.IsRefreshing && vmTopologyResult.Switches.Length == 0
             ? []
             : BuildNetworkSwitches(adapters, vmTopologyResult.Switches);
         MaybeLogNetworkDiagnostics(refreshRequested, adapterRates, adapters, vmTopologyResult.Switches);
@@ -635,9 +644,9 @@ internal sealed class Collector : IDisposable
         NetworkSwitchRow[] networkSwitches)
     {
         var hostsReady = !string.IsNullOrWhiteSpace(host.Name);
-        var vmsReady = options.DemoVms || !inventory.IsRefreshing;
+        var vmsReady = !inventory.IsRefreshing;
         var storageReady = disks.Length > 0;
-        var networkReady = options.DemoVms || !topology.IsRefreshing;
+        var networkReady = !topology.IsRefreshing;
         var complete = hostsReady && vmsReady && storageReady && networkReady;
 
         if (complete)
@@ -698,7 +707,7 @@ internal sealed class Collector : IDisposable
         if (discovery.NetworkReady && !networkDiscoveryLogged)
         {
             networkDiscoveryLogged = true;
-            AddEvent("INFO", $"Discovery Network: {networkSwitches.Length} vSwitch(es), {adapters.Length} interface row(s)");
+            AddEvent("INFO", $"Discovery Network: {networkSwitches.Length} network target(s), {adapters.Length} adapter(s)");
         }
 
         if (discovery.Complete && !discoveryCompleteLogged)
@@ -714,10 +723,10 @@ internal sealed class Collector : IDisposable
             return;
 
         networkDiagnosticsLogged = true;
-        var hardware = adapterRates.Where(a => a.IsHardwareInterface).ToArray();
+        var hardware = adapterRates.Where(a => a.IsVisibleAdapter).ToArray();
         var upHardware = hardware.Count(a => a.IsUp);
         var totalHardwareMbps = hardware.Sum(a => a.TotalBytesPerSecond) / 1024d / 1024d;
-        AddEvent("INFO", $"NETDIAG live={adapterRates.Length} hw={hardware.Length} up={upHardware} sw={switches.Length} hw-throughput={totalHardwareMbps:0.00} MB/s");
+        AddEvent("INFO", $"NETDIAG live={adapterRates.Length} visible={hardware.Length} up={upHardware} sw={switches.Length} throughput={totalHardwareMbps:0.00} MB/s");
 
         foreach (var adapter in adapterRates
                      .OrderByDescending(a => a.IsHardwareInterface)
@@ -726,7 +735,7 @@ internal sealed class Collector : IDisposable
         {
             AddEvent(
                 "INFO",
-                $"NETIF name='{TrimForEvent(adapter.Name, 28)}' desc='{TrimForEvent(adapter.Description, 42)}' guid='{adapter.InterfaceId}' hw={adapter.IsHardwareInterface} up={adapter.IsUp} link={NetworkLinkFormatter.Format(adapter.LinkSpeedBitsPerSecond, adapter.IsUp)} rx={adapter.ReceivedBytesPerSecond / 1024d / 1024d:0.00} tx={adapter.SentBytesPerSecond / 1024d / 1024d:0.00} MB/s");
+                $"NETIF name='{TrimForEvent(adapter.Name, 28)}' desc='{TrimForEvent(adapter.Description, 42)}' guid='{adapter.InterfaceId}' hw={adapter.IsHardwareInterface} visible={adapter.IsVisibleAdapter} up={adapter.IsUp} link={NetworkLinkFormatter.Format(adapter.LinkSpeedBitsPerSecond, adapter.IsUp)} rx={adapter.ReceivedBytesPerSecond / 1024d / 1024d:0.00} tx={adapter.SentBytesPerSecond / 1024d / 1024d:0.00} MB/s");
         }
 
         foreach (var switchRow in switches.Take(4))
@@ -759,43 +768,6 @@ internal sealed class Collector : IDisposable
     }
 
     public void Dispose() => pdh.Dispose();
-}
-
-internal sealed class DemoVmSampler
-{
-    private int tick;
-
-    public VmRow[] Collect(RollingHistory history, string hostName)
-    {
-        tick++;
-        string[] names = ["SQL01", "WEB02", "FS01", "DC01", "BUILD03", "MON01"];
-        int[] vcpus = [4, 2, 4, 2, 8, 2];
-        double[] memoryGb = [32, 8, 16, 4, 64, 8];
-        return names.Select((name, i) =>
-        {
-            var cpu = Math.Max(0, 10 + i * 8 + 24 * Math.Abs(Math.Sin((tick + i) / (4.0 + i))));
-            if (name == "SQL01" && tick % 18 > 11) cpu += 35;
-            var mem = Math.Min(98, 20 + i * 9 + 12 * Math.Abs(Math.Cos((tick + i) / 8.0)));
-            var io = 80 + i * 65 + 760 * Math.Abs(Math.Sin((tick + i) / 10.0));
-            var net = 15 + i * 8 + 80 * Math.Abs(Math.Cos((tick + i) / 7.0));
-            var iops = 800 + i * 1100 + 15000 * Math.Abs(Math.Sin((tick + i) / 12.0));
-            var latency = name == "SQL01" ? 8 + 11 * Math.Abs(Math.Sin(tick / 9.0)) : 2 + i;
-            var row = new VmRow(
-                name,
-                hostName,
-                "demo",
-                Metric.Percent(cpu),
-                $"{vcpus[i]} vCPU",
-                Metric.Percent(mem),
-                CapacityFormatter.FormatConfigCapacity(memoryGb[i] * 1024 * 1024 * 1024),
-                Metric.Mbps(io),
-                Metric.Mbps(net),
-                Metric.Iops(iops),
-                Metric.Milliseconds(latency),
-                Status.From(cpu, mem, latency, 0));
-            return history.Apply("vm:" + row.Name, row);
-        }).ToArray();
-    }
 }
 
 internal sealed class HyperVVmSampler
@@ -993,8 +965,8 @@ internal sealed class HyperVInventory
                 }
                 else
                 {
-                    pendingEventMessage = DedupEvent("Hyper-V inventory unavailable via native API and PowerShell fallback.");
-                    pendingEventSeverity = "ERR";
+                    pendingEventMessage = DedupEvent("Hyper-V inventory not detected; standard Windows host mode active.");
+                    pendingEventSeverity = "INFO";
                 }
             }
         }
@@ -1008,17 +980,22 @@ internal sealed class HyperVInventory
     private static HyperVInventoryData TryReadPowerShell()
     {
         const string script = "$ErrorActionPreference='Stop'; " +
+            "$available=$false; " +
             "$rows=@(); " +
             "try { " +
             "Import-Module Hyper-V -ErrorAction Stop | Out-Null; " +
+            "$available=$true; " +
             "$rows = @(Get-VM | Select-Object Name,@{N='Version';E={[string]$_.Version}},@{N='IsRunning';E={[bool]($_.State -eq 'Running')}},MemoryAssigned,MemoryDemand,MemoryStatus,DynamicMemoryEnabled) " +
             "} catch { } ; " +
             "if (-not $rows -or $rows.Count -eq 0) { " +
+            "try { " +
             "$rows = @(Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_ComputerSystem " +
             "| Where-Object { $_.Caption -eq 'Virtual Machine' } " +
             "| Select-Object @{N='Name';E={$_.ElementName}},@{N='Version';E={''}},@{N='IsRunning';E={[bool]($_.EnabledState -eq 2)}},@{N='MemoryAssigned';E={0}},@{N='MemoryDemand';E={0}},@{N='MemoryStatus';E={''}},@{N='DynamicMemoryEnabled';E={$false}}) " +
+            "if ($rows -and $rows.Count -gt 0) { $available=$true } " +
+            "} catch { } " +
             "} ; " +
-            "[pscustomobject]@{Vms=@($rows)} | ConvertTo-Json -Compress -Depth 4";
+            "[pscustomobject]@{Available=$available; Vms=@($rows)} | ConvertTo-Json -Compress -Depth 4";
 
         if (!PowerShellRunner.TryRun(script, 15000, out var output))
             return HyperVInventoryData.Empty;
@@ -1035,8 +1012,10 @@ internal sealed class HyperVInventory
         {
             using var document = JsonDocument.Parse(json);
             JsonElement[] rows;
+            var available = true;
             if (document.RootElement.ValueKind == JsonValueKind.Object && document.RootElement.TryGetProperty("Vms", out var vmsElement))
             {
+                available = ReadJsonBool(document.RootElement, "Available");
                 rows = vmsElement.ValueKind switch
                 {
                     JsonValueKind.Array => vmsElement.EnumerateArray().ToArray(),
@@ -1071,7 +1050,7 @@ internal sealed class HyperVInventory
                 .OrderBy(vm => vm.Name, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
 
-            return new HyperVInventoryData(vms, true);
+            return new HyperVInventoryData(vms, available);
         }
         catch
         {
@@ -1433,16 +1412,24 @@ internal sealed class HyperVTopology
                     cache = data.Topology;
                 if (data.Switches.Length > 0 || switchCache.Length == 0)
                     switchCache = data.Switches;
-                pendingEventMessage = DedupEvent("Hyper-V native WMI topology disabled in single-file build, using PowerShell fallback.");
-                pendingEventSeverity = "WARN";
+                if (data.Topology.Length == 0 && data.Switches.Length == 0)
+                {
+                    pendingEventMessage = DedupEvent("Hyper-V network topology not detected; using Windows network adapter view.");
+                    pendingEventSeverity = "INFO";
+                }
+                else
+                {
+                    pendingEventMessage = DedupEvent("Hyper-V native WMI topology disabled in single-file build, using PowerShell fallback.");
+                    pendingEventSeverity = "WARN";
+                }
             }
         }
         catch
         {
             lock (gate)
             {
-                pendingEventMessage = DedupEvent("Hyper-V topology unavailable via native API and PowerShell fallback.");
-                pendingEventSeverity = "ERR";
+                pendingEventMessage = DedupEvent("Hyper-V topology unavailable; using Windows network adapter view.");
+                pendingEventSeverity = "WARN";
             }
         }
         finally
@@ -1969,21 +1956,33 @@ internal static class PowerShellRunner
 internal static class LogicalDiskSampler
 {
     private static readonly Dictionary<string, double> DiskBytes = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, double> DiskReadBytes = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, double> DiskWriteBytes = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Dictionary<string, double> DiskIops = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, double> DiskReadIops = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, double> DiskWriteIops = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Dictionary<string, double> Queue = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Dictionary<string, double> Latency = new(StringComparer.OrdinalIgnoreCase);
 
     public static void Refresh()
     {
         Replace(DiskBytes, PdhWildcardReader.Read(@"\LogicalDisk(*)\Disk Bytes/sec", NormalizeInstance));
+        Replace(DiskReadBytes, PdhWildcardReader.Read(@"\LogicalDisk(*)\Disk Read Bytes/sec", NormalizeInstance));
+        Replace(DiskWriteBytes, PdhWildcardReader.Read(@"\LogicalDisk(*)\Disk Write Bytes/sec", NormalizeInstance));
         Replace(DiskIops, PdhWildcardReader.Read(@"\LogicalDisk(*)\Disk Transfers/sec", NormalizeInstance));
+        Replace(DiskReadIops, PdhWildcardReader.Read(@"\LogicalDisk(*)\Disk Reads/sec", NormalizeInstance));
+        Replace(DiskWriteIops, PdhWildcardReader.Read(@"\LogicalDisk(*)\Disk Writes/sec", NormalizeInstance));
         Replace(Queue, PdhWildcardReader.Read(@"\LogicalDisk(*)\Current Disk Queue Length", NormalizeInstance));
         Replace(Latency, PdhWildcardReader.Read(@"\LogicalDisk(*)\Avg. Disk sec/Transfer", NormalizeInstance)
             .ToDictionary(kvp => kvp.Key, kvp => kvp.Value * 1000, StringComparer.OrdinalIgnoreCase));
     }
 
     public static double TotalMbps(string drive) => Read(DiskBytes, drive) / 1024 / 1024;
+    public static double ReadMbps(string drive) => Read(DiskReadBytes, drive) / 1024 / 1024;
+    public static double WriteMbps(string drive) => Read(DiskWriteBytes, drive) / 1024 / 1024;
     public static double TotalIops(string drive) => Read(DiskIops, drive);
+    public static double ReadIops(string drive) => Read(DiskReadIops, drive);
+    public static double WriteIops(string drive) => Read(DiskWriteIops, drive);
     public static double QueueDepth(string drive) => Read(Queue, drive);
     public static double LatencyMs(string drive) => Read(Latency, drive);
 
@@ -2213,11 +2212,48 @@ internal sealed class NetworkSampler
             unchecked((long)Math.Max(row.ReceiveLinkSpeed, row.TransmitLinkSpeed)),
             isUp,
             (row.InterfaceAndOperStatusFlags & Native.IF_HARDWARE_INTERFACE) != 0,
+            IsVisibleAdapter(row, alias, description),
             rx,
             tx,
             drops);
         return true;
     }
+
+    private static bool IsVisibleAdapter(MibIfRow2 row, string alias, string description)
+    {
+        if (row.Type == Native.IF_TYPE_SOFTWARE_LOOPBACK)
+            return false;
+
+        var text = $"{alias} {description}";
+        if (ContainsAny(text,
+                "Scheduler-0000",
+                "Filter-0000",
+                "WFP",
+                "QoS Packet Scheduler",
+                "LightWeight Filter",
+                "Kernel Debugger",
+                "IP-HTTPS",
+                "ISATAP",
+                "Teredo",
+                "6to4",
+                "Loopback"))
+            return false;
+
+        if (alias.StartsWith("vEthernet", StringComparison.OrdinalIgnoreCase)
+            || description.Contains("Hyper-V Virtual Ethernet", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var hasAddress = row.PhysicalAddressLength > 0;
+        var hasCounters = row.InOctets > 0 || row.OutOctets > 0;
+        var hasLinkSpeed = row.ReceiveLinkSpeed > 0 || row.TransmitLinkSpeed > 0;
+        var isEthernetLike = row.Type is Native.IF_TYPE_ETHERNET_CSMACD or Native.IF_TYPE_IEEE80211;
+        var isHardware = (row.InterfaceAndOperStatusFlags & Native.IF_HARDWARE_INTERFACE) != 0;
+
+        return isEthernetLike && (isHardware || hasAddress || hasLinkSpeed || hasCounters);
+    }
+
+    private static bool ContainsAny(string value, params string[] needles)
+        => needles.Any(needle => value.Contains(needle, StringComparison.OrdinalIgnoreCase));
 
     private static MibIfRow2[] ReadInterfaceRows()
     {
@@ -2253,7 +2289,7 @@ internal sealed class NetworkSampler
     private sealed record InterfaceCounterSnapshot(DateTime At, ulong InOctets, ulong OutOctets, ulong Discards);
 }
 
-internal sealed record AdapterRate(string Name, string Description, string InterfaceId, long LinkSpeedBitsPerSecond, bool IsUp, bool IsHardwareInterface, double ReceivedBytesPerSecond, double SentBytesPerSecond, double DropsPerSecond)
+internal sealed record AdapterRate(string Name, string Description, string InterfaceId, long LinkSpeedBitsPerSecond, bool IsUp, bool IsHardwareInterface, bool IsVisibleAdapter, double ReceivedBytesPerSecond, double SentBytesPerSecond, double DropsPerSecond)
 {
     public double TotalBytesPerSecond => ReceivedBytesPerSecond + SentBytesPerSecond;
 }
@@ -2303,7 +2339,9 @@ internal static partial class Native
 {
     public const uint PDH_FMT_DOUBLE = 0x00000200;
     public const uint IF_OPER_STATUS_UP = 1;
+    public const uint IF_TYPE_ETHERNET_CSMACD = 6;
     public const uint IF_TYPE_SOFTWARE_LOOPBACK = 24;
+    public const uint IF_TYPE_IEEE80211 = 71;
     public const byte IF_HARDWARE_INTERFACE = 0x01;
     private const int PDH_MORE_DATA = unchecked((int)0x800007D2);
 
@@ -2546,7 +2584,11 @@ internal sealed class RollingHistory
         {
             Free = row.Free with { Max = freeMin },
             Io = row.Io with { Max = values[nameof(row.Io)] },
+            ReadIo = row.ReadIo with { Max = values[nameof(row.ReadIo)] },
+            WriteIo = row.WriteIo with { Max = values[nameof(row.WriteIo)] },
             Iops = row.Iops with { Max = values[nameof(row.Iops)] },
+            ReadIops = row.ReadIops with { Max = values[nameof(row.ReadIops)] },
+            WriteIops = row.WriteIops with { Max = values[nameof(row.WriteIops)] },
             QueueDepth = row.QueueDepth with { Max = values[nameof(row.QueueDepth)] },
             Latency = row.Latency with { Max = values[nameof(row.Latency)] }
         };
@@ -2666,13 +2708,17 @@ internal sealed record VmRow(string Name, string HostName, string Version, Metri
     };
 }
 
-internal sealed record DiskRow(string Name, string Size, Metric Free, Metric Io, Metric Iops, Metric QueueDepth, Metric Latency, string Status)
+internal sealed record DiskRow(string Name, string Size, string UsedSpace, string FreeSpace, Metric Free, Metric Io, Metric ReadIo, Metric WriteIo, Metric Iops, Metric ReadIops, Metric WriteIops, Metric QueueDepth, Metric Latency, string Status)
 {
     public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
     {
         [nameof(Free)] = Free.Current,
         [nameof(Io)] = Io.Current,
+        [nameof(ReadIo)] = ReadIo.Current,
+        [nameof(WriteIo)] = WriteIo.Current,
         [nameof(Iops)] = Iops.Current,
+        [nameof(ReadIops)] = ReadIops.Current,
+        [nameof(WriteIops)] = WriteIops.Current,
         [nameof(QueueDepth)] = QueueDepth.Current,
         [nameof(Latency)] = Latency.Current
     };
@@ -3659,21 +3705,39 @@ internal sealed class Tui
             case DiskRow disk:
                 Detail(7, "Name", disk.Name);
                 Detail(8, "Size", disk.Size);
-                DetailMetric(9, "Free", disk.Free);
-                DetailMetric(10, "I/O", disk.Io);
-                DetailMetric(11, "IOPS", disk.Iops);
-                DetailMetric(12, "Queue depth", disk.QueueDepth);
-                DetailMetric(13, "Latency", disk.Latency);
-                Detail(15, "Status", disk.Status, StatusColor(disk.Status));
+                DetailScalar(9, "  ├ Used space", disk.UsedSpace);
+                DetailScalar(10, "  └ Free space", disk.FreeSpace);
+                DetailScalar(11, string.Empty, string.Empty);
+                DetailMetricHeader(12, string.Empty, "cur", "min");
+                DetailMetric(13, "Free", disk.Free);
+                DetailScalar(14, string.Empty, string.Empty);
+                DetailMetricHeader(15, string.Empty, "cur", "max");
+                DetailMetric(16, "Total I/O", disk.Io);
+                DetailMetric(17, "    ├ Read I/O", disk.ReadIo);
+                DetailMetric(18, "    └ Write I/O", disk.WriteIo);
+                DetailScalar(19, string.Empty, string.Empty);
+                DetailMetricHeader(20, string.Empty, "cur", "max");
+                DetailMetric(21, "Total IOPS", disk.Iops);
+                DetailMetric(22, "    ├ Read IOPS", disk.ReadIops);
+                DetailMetric(23, "    └ Write IOPS", disk.WriteIops);
+                DetailScalar(24, string.Empty, string.Empty);
+                DetailMetricHeader(25, string.Empty, "cur", "max");
+                DetailMetric(26, "Queue depth", disk.QueueDepth);
+                DetailMetric(27, "Latency", disk.Latency);
+                Detail(29, "Status", disk.Status, StatusColor(disk.Status));
                 break;
             case NetworkRow net:
                 Detail(7, "Name", net.Name);
                 Detail(8, "Link", net.Link);
-                DetailMetric(9, "Throughput", net.Throughput);
-                DetailMetric(10, "Receive", net.Rx);
-                DetailMetric(11, "Transmit", net.Tx);
-                DetailMetric(12, "Drops", net.Drops);
-                Detail(14, "Status", net.Status, StatusColor(net.Status));
+                DetailScalar(9, string.Empty, string.Empty);
+                DetailMetricHeader(10, string.Empty, "cur", "max");
+                DetailMetric(11, "Throughput", net.Throughput);
+                DetailMetric(12, "    ├ Transmit", net.Tx);
+                DetailMetric(13, "    └ Receive", net.Rx);
+                DetailScalar(14, string.Empty, string.Empty);
+                DetailMetricHeader(15, string.Empty, "cur", "max");
+                DetailMetric(16, "Drops", net.Drops);
+                Detail(18, "Status", net.Status, StatusColor(net.Status));
                 break;
         }
     }
@@ -3683,6 +3747,9 @@ internal sealed class Tui
 
     private void DetailMetric(int y, string label, Metric metric)
         => DetailScalar(y, label, DetailMetricValue(metric));
+
+    private void DetailMetricHeader(int y, string label, string currentLabel, string maxLabel)
+        => DetailScalar(y, label, DetailMetricHeaderValue(currentLabel, maxLabel), ConsoleColor.DarkCyan);
 
     private void DetailMetricWithCapacity(int y, string label, Metric metric, string capacity)
         => DetailScalar(y, label, DetailMetricWithCapacityValue(metric, capacity));
@@ -3765,6 +3832,9 @@ internal sealed class Tui
 
     private static string DetailMetricValue(Metric metric)
         => $"{Cell(FmtValue(metric.Current, metric.Unit), 9, true)} | {Cell(FmtValue(metric.Max, metric.Unit), 9)}";
+
+    private static string DetailMetricHeaderValue(string currentLabel, string maxLabel)
+        => $"{Cell(currentLabel, 9, true)} | {Cell(maxLabel, 9)}";
 
     private static string DetailMetricWithCapacityValue(Metric metric, string capacity)
         => $"{Cell(FmtValue(metric.Current, metric.Unit), 4, true)} | {Cell(FmtValue(metric.Max, metric.Unit), 4, true)} | {Cell($"({capacity})", 12)}";

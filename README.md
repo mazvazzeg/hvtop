@@ -1,15 +1,12 @@
 # hvtop
 
-hvtop is a TUI prototype for monitoring Hyper-V hosts, VMs, CSV/storage,
-network, and recent events. It is shaped like `htop` or `esxtop`, but with fast
-drill-down views and a small rolling history buffer for max/spike visibility.
+hvtop is a TUI prototype for monitoring Windows and Hyper-V hosts, VMs when
+Hyper-V is present, failover clusters, CSV/storage, network, and recent events.
+It is shaped like `htop` or `esxtop`, but with fast drill-down views and a small
+rolling history buffer for max/spike visibility.
 
-There are currently two implementations:
-
-- `hvtop.Native`: the preferred direction, written in C# with native Windows
-  counters and no PowerShell in the hot path.
-- `hvtop.ps1`: the original PowerShell concept demo. Useful for sketching,
-  but too slow for production data gathering.
+The native implementation is written in C# with native Windows counters and no
+PowerShell in the hot path.
 
 ## Run Native
 
@@ -28,20 +25,14 @@ Useful options:
 
 ```powershell
 dotnet run -- --refresh 0.5 --history 15
-dotnet run -- --no-demo-vms
 dotnet run -- --smoke
 ```
 
 The native version currently uses PDH for host CPU, memory, disk throughput,
-IOPS, queue depth, and latency. Network rates come from native .NET network
-interface statistics. VM rows are still demo data until the Hyper-V topology and
-per-VM counter mapping is added.
-
-## Run PowerShell Demo
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\hvtop.ps1 -Mode Demo
-```
+IOPS, queue depth, and latency. Network rates come from the native Windows IP
+Helper API. VM rows are populated from Hyper-V inventory and counters when
+Hyper-V is available; otherwise the VM pane is empty and the host/storage/network
+panes remain useful on standard Windows servers.
 
 ## Keys
 
