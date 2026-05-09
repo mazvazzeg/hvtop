@@ -8,7 +8,7 @@ namespace hvtop.Native;
 
 internal static class Program
 {
-    public const string DisplayVersion = "0.4.0+20260508.0007";
+    public const string DisplayVersion = "0.4.1+20260510.0007";
     public const string AppName = "hvtop";
 
     public static async Task<int> Main(string[] args)
@@ -291,14 +291,15 @@ internal sealed class Collector : IDisposable
         var inventoryVms = inventoryResult.Vms;
         LogicalDiskSampler.Refresh();
 
-        if (!string.IsNullOrWhiteSpace(inventoryResult.EventMessage))
-            AddEvent(inventoryResult.EventSeverity, inventoryResult.EventMessage);
+        foreach (var evt in inventoryResult.Events)
+            AddEvent(evt.Severity, evt.Message);
         if (!string.IsNullOrWhiteSpace(clusterResult.EventMessage))
             AddEvent(clusterResult.EventSeverity, clusterResult.EventMessage);
 
         var host = new HostRow(
             Environment.MachineName,
             HostVersionDetector.Detect(),
+            TimeSpan.FromMilliseconds(Environment.TickCount64),
             Metric.Percent(hostCpu),
             $"{Environment.ProcessorCount} CPU",
             Metric.Percent(hostMem),
@@ -420,6 +421,7 @@ internal sealed class Collector : IDisposable
                 return new HostRow(
                     node.Name,
                     "n/a",
+                    null,
                     Metric.Percent(double.NaN),
                     "n/a CPU",
                     Metric.Percent(double.NaN),
@@ -819,10 +821,19 @@ internal sealed class HyperVVmSampler
                 var netMbps = vm.IsRunning ? Get(net, name) / 1024 / 1024 : 0;
                 var iops = vm.IsRunning ? SumStorageCounters(readOps, name) + SumStorageCounters(writeOps, name) : 0;
                 var status = vm.IsRunning ? Status.From(cpuValue, memPercent, 0, 0) : "OFF";
+                var uptime = vm.IsRunning
+                    ? vm.Uptime + (DateTime.UtcNow - vm.UptimeSampledAt)
+                    : TimeSpan.Zero;
+                if (uptime < TimeSpan.Zero)
+                    uptime = TimeSpan.Zero;
                 var row = new VmRow(
                     name,
                     hostName,
                     FormatVersion(vm.Version),
+                    uptime,
+                    vm.IsRunning,
+                    vm.ReplicationDisplay,
+                    vm.ReplicationStatus,
                     Metric.Percent(cpuValue),
                     vcpuCount > 0 ? $"{vcpuCount} vCPU" : "n/a vCPU",
                     Metric.Percent(memPercent),
@@ -923,8 +934,7 @@ internal sealed class HyperVInventory
     private readonly object gate = new();
     private HyperVInventoryVm[] cache = [];
     private string? lastEventMessage;
-    private string? pendingEventMessage;
-    private string pendingEventSeverity = "INFO";
+    private readonly Queue<InventoryEvent> pendingEvents = new();
     public bool IsRefreshing { get; private set; }
 
     public void RequestRefresh()
@@ -939,14 +949,11 @@ internal sealed class HyperVInventory
 
     public HyperVInventoryResult TryRead()
     {
-        string? eventMessage;
-        string eventSeverity;
         lock (gate)
         {
-            eventMessage = pendingEventMessage;
-            eventSeverity = pendingEventSeverity;
-            pendingEventMessage = null;
-            return new HyperVInventoryResult(cache, "PowerShell", eventMessage, eventSeverity);
+            var events = pendingEvents.ToArray();
+            pendingEvents.Clear();
+            return new HyperVInventoryResult(cache, "PowerShell", events);
         }
     }
 
@@ -960,14 +967,15 @@ internal sealed class HyperVInventory
                 if (fallback.Available)
                 {
                     cache = fallback.Vms;
-                    pendingEventMessage = DedupEvent("Hyper-V native WMI inventory disabled in single-file build, using PowerShell fallback.");
-                    pendingEventSeverity = "WARN";
+                    EnqueueEvent("WARN", "Hyper-V native WMI inventory disabled in single-file build, using PowerShell fallback.");
                 }
                 else
                 {
-                    pendingEventMessage = DedupEvent("Hyper-V inventory not detected; standard Windows host mode active.");
-                    pendingEventSeverity = "INFO";
+                    EnqueueEvent("INFO", "Hyper-V inventory not detected; standard Windows host mode active.");
                 }
+
+                foreach (var evt in fallback.Events)
+                    EnqueueEvent(evt.Severity, evt.Message);
             }
         }
         finally
@@ -980,27 +988,80 @@ internal sealed class HyperVInventory
     private static HyperVInventoryData TryReadPowerShell()
     {
         const string script = "$ErrorActionPreference='Stop'; " +
-            "$available=$false; " +
-            "$rows=@(); " +
+            "$available=$false; $rows=@(); " +
             "try { " +
-            "Import-Module Hyper-V -ErrorAction Stop | Out-Null; " +
-            "$available=$true; " +
-            "$rows = @(Get-VM | Select-Object Name,@{N='Version';E={[string]$_.Version}},@{N='IsRunning';E={[bool]($_.State -eq 'Running')}},MemoryAssigned,MemoryDemand,MemoryStatus,DynamicMemoryEnabled) " +
-            "} catch { } ; " +
-            "if (-not $rows -or $rows.Count -eq 0) { " +
-            "try { " +
-            "$rows = @(Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_ComputerSystem " +
+            "Import-Module Hyper-V -ErrorAction Stop | Out-Null; $available=$true; " +
+            "$rows = @(Get-VM -ErrorAction Stop | Select-Object Name,@{N='Version';E={[string]$_.Version}},@{N='IsRunning';E={[bool]($_.State -eq 'Running')}},MemoryAssigned,MemoryDemand,MemoryStatus,DynamicMemoryEnabled,@{N='ReplicationState';E={try {[string]$_.ReplicationState} catch {''}}},@{N='ReplicationHealth';E={try {[string]$_.ReplicationHealth} catch {''}}}); " +
+            "} catch { " +
+            "$rows = @(Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_ComputerSystem -ErrorAction Stop " +
             "| Where-Object { $_.Caption -eq 'Virtual Machine' } " +
-            "| Select-Object @{N='Name';E={$_.ElementName}},@{N='Version';E={''}},@{N='IsRunning';E={[bool]($_.EnabledState -eq 2)}},@{N='MemoryAssigned';E={0}},@{N='MemoryDemand';E={0}},@{N='MemoryStatus';E={''}},@{N='DynamicMemoryEnabled';E={$false}}) " +
-            "if ($rows -and $rows.Count -gt 0) { $available=$true } " +
-            "} catch { } " +
+            "| Select-Object @{N='Name';E={$_.ElementName}},@{N='Version';E={''}},@{N='IsRunning';E={[bool]($_.EnabledState -eq 2)}},@{N='UptimeSeconds';E={if ($_.EnabledState -eq 2 -and $_.OnTimeInMilliseconds) { [double]$_.OnTimeInMilliseconds / 1000 } else { 0 }}},@{N='MemoryAssigned';E={0}},@{N='MemoryDemand';E={0}},@{N='MemoryStatus';E={''}},@{N='DynamicMemoryEnabled';E={$false}},@{N='ReplicationState';E={''}},@{N='ReplicationHealth';E={''}}); " +
+            "if ($rows -and $rows.Count -gt 0) { $available=$true }; " +
             "} ; " +
             "[pscustomobject]@{Available=$available; Vms=@($rows)} | ConvertTo-Json -Compress -Depth 4";
 
-        if (!PowerShellRunner.TryRun(script, 15000, out var output))
-            return HyperVInventoryData.Empty;
+        if (!PowerShellRunner.TryRun(script, 30000, out var output, out var error, out var exitCode, out var timedOut))
+        {
+            var reason = timedOut ? "timed out" : $"failed exit={exitCode}";
+            return new HyperVInventoryData([], false, [new InventoryEvent("WARN", $"HVDIAG inventory PowerShell {reason}: {TrimForEvent(error, 140)}")]);
+        }
 
-        return ParseInventoryJson(output);
+        var parsed = ParseInventoryJson(output);
+        var uptime = parsed.Vms.Length > 0 ? TryReadPowerShellUptime() : new Dictionary<string, TimeSpan>(StringComparer.OrdinalIgnoreCase);
+        var sampledAt = DateTime.UtcNow;
+        if (uptime.Count > 0)
+            parsed = parsed with
+            {
+                Vms = parsed.Vms
+                    .Select(vm => uptime.TryGetValue(vm.Name, out var value) ? vm with { Uptime = value, UptimeSampledAt = sampledAt } : vm)
+                    .ToArray()
+            };
+        var zeroVmEvents = parsed.Vms.Length == 0
+            ? new[] { new InventoryEvent("WARN", $"HVDIAG raw='{TrimForEvent(output, 120)}'") }
+            : [];
+        return parsed with
+        {
+            Events =
+            [
+                .. parsed.Events,
+                new InventoryEvent("INFO", $"HVDIAG inventory available={parsed.Available} rows={parsed.Vms.Length} json={output.Length}"),
+                .. parsed.Vms.Take(3).Select(vm => new InventoryEvent("INFO", $"HVDIAG vm='{TrimForEvent(vm.Name, 28)}' run={vm.IsRunning} up={UptimeFormatter.FormatShort(vm.Uptime)} ver='{TrimForEvent(vm.Version, 10)}' repl='{TrimForEvent(vm.ReplicationDisplay, 22)}'")),
+                .. zeroVmEvents
+            ]
+        };
+    }
+
+    private static Dictionary<string, TimeSpan> TryReadPowerShellUptime()
+    {
+        const string script = "Import-Module Hyper-V -ErrorAction Stop | Out-Null; " +
+            "@(Get-VM -ErrorAction Stop | Select-Object Name,@{N='UptimeSeconds';E={try { [double]$_.Uptime.TotalSeconds } catch { 0 }}}) | ConvertTo-Json -Compress -Depth 3";
+
+        if (!PowerShellRunner.TryRun(script, 5000, out var output) || string.IsNullOrWhiteSpace(output))
+            return new(StringComparer.OrdinalIgnoreCase);
+
+        try
+        {
+            using var document = JsonDocument.Parse(output);
+            var rows = document.RootElement.ValueKind switch
+            {
+                JsonValueKind.Array => document.RootElement.EnumerateArray().ToArray(),
+                JsonValueKind.Object => [document.RootElement],
+                _ => []
+            };
+
+            return rows
+                .Select(row => new
+                {
+                    Name = ReadJsonString(row, "Name"),
+                    Uptime = TimeSpan.FromSeconds(Math.Max(0, ReadJsonDouble(row, "UptimeSeconds")))
+                })
+                .Where(row => !string.IsNullOrWhiteSpace(row.Name))
+                .ToDictionary(row => row.Name, row => row.Uptime, StringComparer.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return new(StringComparer.OrdinalIgnoreCase);
+        }
     }
 
     private static HyperVInventoryData ParseInventoryJson(string json)
@@ -1039,22 +1100,31 @@ internal sealed class HyperVInventory
                     var name = ReadJsonString(element, "Name");
                     var version = ReadJsonString(element, "Version");
                     var isRunning = ReadJsonBool(element, "IsRunning");
+                    var uptime = ReadJsonTimeSpan(element, "Uptime");
+                    if (uptime == TimeSpan.Zero)
+                    {
+                        var uptimeSeconds = ReadJsonDouble(element, "UptimeSeconds");
+                        if (uptimeSeconds > 0)
+                            uptime = TimeSpan.FromSeconds(uptimeSeconds);
+                    }
                     var memoryAssignedBytes = ReadJsonDouble(element, "MemoryAssigned");
                     var memoryDemandBytes = ReadJsonDouble(element, "MemoryDemand");
                     var memoryStatus = ReadJsonString(element, "MemoryStatus");
                     var dynamicMemoryEnabled = ReadJsonBool(element, "DynamicMemoryEnabled");
-                    return new HyperVInventoryVm(name, version, isRunning, memoryAssignedBytes, memoryDemandBytes, memoryStatus, dynamicMemoryEnabled);
+                    var replicationState = ReadJsonString(element, "ReplicationState");
+                    var replicationHealth = ReadJsonString(element, "ReplicationHealth");
+                    return new HyperVInventoryVm(name, version, isRunning, uptime, DateTime.UtcNow, memoryAssignedBytes, memoryDemandBytes, memoryStatus, dynamicMemoryEnabled, replicationState, replicationHealth);
                 })
                 .Where(vm => !string.IsNullOrWhiteSpace(vm.Name))
                 .DistinctBy(vm => vm.Name, StringComparer.OrdinalIgnoreCase)
                 .OrderBy(vm => vm.Name, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
 
-            return new HyperVInventoryData(vms, available);
+            return new HyperVInventoryData(vms, available, []);
         }
-        catch
+        catch (Exception ex)
         {
-            return HyperVInventoryData.Empty;
+            return new HyperVInventoryData([], false, [new InventoryEvent("WARN", $"HVDIAG parse failed: {TrimForEvent(ex.Message, 120)}"), new InventoryEvent("WARN", $"HVDIAG raw='{TrimForEvent(json, 120)}'")]);
         }
     }
 
@@ -1087,6 +1157,36 @@ internal sealed class HyperVInventory
             JsonValueKind.String => double.TryParse(value.GetString(), out var number) ? number : 0,
             _ => 0
         };
+    }
+
+    private static TimeSpan ReadJsonTimeSpan(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var value))
+            return TimeSpan.Zero;
+
+        try
+        {
+            if (value.ValueKind == JsonValueKind.Object)
+            {
+                var ticks = ReadJsonDouble(value, "Ticks");
+                if (ticks > 0)
+                    return TimeSpan.FromTicks((long)ticks);
+
+                var days = ReadJsonDouble(value, "Days");
+                var hours = ReadJsonDouble(value, "Hours");
+                var minutes = ReadJsonDouble(value, "Minutes");
+                var seconds = ReadJsonDouble(value, "Seconds");
+                return TimeSpan.FromDays(days) + TimeSpan.FromHours(hours) + TimeSpan.FromMinutes(minutes) + TimeSpan.FromSeconds(seconds);
+            }
+
+            if (value.ValueKind == JsonValueKind.String && TimeSpan.TryParse(value.GetString(), out var parsed))
+                return parsed;
+        }
+        catch
+        {
+        }
+
+        return TimeSpan.Zero;
     }
 
     internal static string[] ParseCsvLine(string line)
@@ -1124,14 +1224,46 @@ internal sealed class HyperVInventory
         return message;
     }
 
+    private void EnqueueEvent(string severity, string message)
+    {
+        var deduped = DedupEvent(message);
+        if (!string.IsNullOrWhiteSpace(deduped))
+            pendingEvents.Enqueue(new InventoryEvent(severity, deduped));
+    }
+
+    private static string TrimForEvent(string value, int max)
+    {
+        value = (value ?? string.Empty)
+            .Replace('\r', ' ')
+            .Replace('\n', ' ')
+            .Trim();
+        return value.Length <= max ? value : value[..max];
+    }
+
 }
 
-internal sealed record HyperVInventoryVm(string Name, string Version, bool IsRunning, double MemoryAssignedBytes, double MemoryDemandBytes, string MemoryStatus, bool DynamicMemoryEnabled);
-internal sealed record HyperVInventoryData(HyperVInventoryVm[] Vms, bool Available)
+internal sealed record HyperVInventoryVm(
+    string Name,
+    string Version,
+    bool IsRunning,
+    TimeSpan Uptime,
+    DateTime UptimeSampledAt,
+    double MemoryAssignedBytes,
+    double MemoryDemandBytes,
+    string MemoryStatus,
+    bool DynamicMemoryEnabled,
+    string ReplicationState,
+    string ReplicationHealth)
 {
-    public static HyperVInventoryData Empty { get; } = new([], false);
+    public string ReplicationDisplay => ReplicationFormatter.Display(ReplicationState, ReplicationHealth);
+    public string ReplicationStatus => ReplicationFormatter.Status(ReplicationState, ReplicationHealth);
 }
-internal sealed record HyperVInventoryResult(HyperVInventoryVm[] Vms, string Source, string? EventMessage, string EventSeverity);
+internal sealed record HyperVInventoryData(HyperVInventoryVm[] Vms, bool Available, InventoryEvent[] Events)
+{
+    public static HyperVInventoryData Empty { get; } = new([], false, []);
+}
+internal sealed record InventoryEvent(string Severity, string Message);
+internal sealed record HyperVInventoryResult(HyperVInventoryVm[] Vms, string Source, InventoryEvent[] Events);
 
 internal sealed class ClusterInventory
 {
@@ -1927,10 +2059,14 @@ internal static class BoundedCall
 internal static class PowerShellRunner
 {
     public static bool TryRun(string command, int timeoutMs, out string output)
+        => TryRun(command, timeoutMs, out output, out _, out _, out _);
+
+    public static bool TryRun(string command, int timeoutMs, out string output, out string error, out int exitCode, out bool timedOut)
     {
         using var process = new Process();
         process.StartInfo.FileName = "powershell.exe";
-        process.StartInfo.Arguments = $"-NoProfile -NonInteractive -Command \"{command}\"";
+        var encoded = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(command));
+        process.StartInfo.Arguments = $"-NoProfile -NonInteractive -EncodedCommand {encoded}";
         process.StartInfo.UseShellExecute = false;
         process.StartInfo.RedirectStandardOutput = true;
         process.StartInfo.RedirectStandardError = true;
@@ -1944,11 +2080,17 @@ internal static class PowerShellRunner
         {
             try { process.Kill(true); } catch { }
             output = string.Empty;
+            error = "timeout";
+            exitCode = -1;
+            timedOut = true;
             return false;
         }
 
         Task.WaitAll([stdoutTask, stderrTask], 500);
         output = stdoutTask.IsCompletedSuccessfully ? stdoutTask.Result : string.Empty;
+        error = stderrTask.IsCompletedSuccessfully ? stderrTask.Result : string.Empty;
+        exitCode = process.ExitCode;
+        timedOut = false;
         return process.ExitCode == 0;
     }
 }
@@ -2539,6 +2681,119 @@ internal static class CapacityFormatter
         var gib = bytes / 1024d / 1024d / 1024d;
         return $"{Math.Round(gib, MidpointRounding.AwayFromZero):0} GB";
     }
+
+}
+
+internal static class UptimeFormatter
+{
+    public static string FormatShort(TimeSpan? uptime)
+    {
+        if (uptime is null)
+            return "n/a";
+
+        var value = uptime.Value < TimeSpan.Zero ? TimeSpan.Zero : uptime.Value;
+        var minutes = Math.Floor(value.TotalMinutes);
+        if (minutes <= 120)
+            return Clamp4($"{Math.Max(0, (int)minutes)}m");
+
+        var hours = value.TotalHours;
+        if (hours <= 24)
+            return Clamp4(FormatCompactUnit(hours, "h"));
+
+        var days = value.TotalDays;
+        if (days <= 365)
+            return Clamp4(FormatCompactUnit(days, "d"));
+
+        return Clamp4(FormatCompactUnit(days / 365d, "y"));
+    }
+
+    public static string FormatExact(TimeSpan? uptime)
+    {
+        if (uptime is null)
+            return "n/a";
+
+        var value = uptime.Value < TimeSpan.Zero ? TimeSpan.Zero : uptime.Value;
+        var totalDays = Math.Max(0, (int)Math.Floor(value.TotalDays));
+        var years = totalDays / 365;
+        var daysAfterYears = totalDays % 365;
+        var months = daysAfterYears / 30;
+        var days = daysAfterYears % 30;
+        var parts = new[]
+        {
+            FormatUnit(years, "year"),
+            FormatUnit(months, "month"),
+            FormatUnit(days, "day"),
+            FormatUnit(value.Hours, "hour"),
+            FormatUnit(value.Minutes, "minute"),
+            FormatUnit(value.Seconds, "second")
+        };
+        return $"{totalDays}:{value.Hours:00}:{value.Minutes:00}:{value.Seconds:00} ({string.Join(", ", parts)})";
+    }
+
+    private static string FormatCompactUnit(double value, string suffix)
+    {
+        if (value < 10)
+        {
+            var rounded = Math.Round(value, 1, MidpointRounding.AwayFromZero);
+            if (Math.Abs(rounded - Math.Round(rounded)) >= 0.05)
+                return $"{rounded:0.0}{suffix}";
+        }
+
+        return $"{Math.Round(value, MidpointRounding.AwayFromZero):0}{suffix}";
+    }
+
+    private static string Clamp4(string value)
+        => value.Length <= 4 ? value : value[..4];
+
+    private static string FormatUnit(int value, string unit)
+        => $"{value} {unit}{(value == 1 ? string.Empty : "s")}";
+}
+
+internal static class ReplicationFormatter
+{
+    public static string Display(string state, string health)
+    {
+        state = Normalize(state);
+        health = Normalize(health);
+        if (IsNotConfigured(state))
+            return "N/A";
+
+        if (!IsNotConfigured(health) && !IsNotConfigured(state))
+            return $"{health} ({state})";
+
+        return !IsNotConfigured(health) ? health : state;
+    }
+
+    public static string Status(string state, string health)
+    {
+        state = Normalize(state);
+        health = Normalize(health);
+        if (IsNotConfigured(state))
+            return "N/A";
+
+        var text = $"{health} {state}".Trim();
+        if (ContainsAny(text, "Critical", "Error", "Failed", "Failover", "Suspended", "ResynchronizationRequired"))
+            return "HOT";
+
+        if (ContainsAny(text, "Warning", "InProgress", "Waiting", "ReadyForInitialReplication", "Resynchronizing"))
+            return "BUSY";
+
+        return "OK";
+    }
+
+    private static string Normalize(string value)
+        => string.IsNullOrWhiteSpace(value) ? string.Empty : value.Trim();
+
+    private static bool IsNotConfigured(string value)
+        => string.IsNullOrWhiteSpace(value)
+           || value.Equals("N/A", StringComparison.OrdinalIgnoreCase)
+           || value.Equals("None", StringComparison.OrdinalIgnoreCase)
+           || value.Equals("Disabled", StringComparison.OrdinalIgnoreCase)
+           || value.Equals("NotApplicable", StringComparison.OrdinalIgnoreCase)
+           || value.Equals("Not Applicable", StringComparison.OrdinalIgnoreCase);
+
+    private static bool ContainsAny(string value, params string[] needles)
+        => needles.Any(needle => value.Contains(needle, StringComparison.OrdinalIgnoreCase));
 }
 
 internal sealed class RollingHistory
@@ -2684,7 +2939,7 @@ internal sealed record ClusterRow(string Name, int NodeCount, int UpNodeCount, s
 
 internal sealed record ClusterNodeRow(string Name, string State, string Status);
 
-internal sealed record HostRow(string Name, string Version, Metric Cpu, string CpuCapacity, Metric Mem, string MemCapacity, Metric Io, Metric Net, string Status)
+internal sealed record HostRow(string Name, string Version, TimeSpan? Uptime, Metric Cpu, string CpuCapacity, Metric Mem, string MemCapacity, Metric Io, Metric Net, string Status)
 {
     public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
     {
@@ -2695,7 +2950,7 @@ internal sealed record HostRow(string Name, string Version, Metric Cpu, string C
     };
 }
 
-internal sealed record VmRow(string Name, string HostName, string Version, Metric Cpu, string CpuCapacity, Metric Mem, string MemCapacity, Metric Io, Metric Net, Metric Iops, Metric Latency, string Status)
+internal sealed record VmRow(string Name, string HostName, string Version, TimeSpan Uptime, bool IsRunning, string Replication, string ReplicationStatus, Metric Cpu, string CpuCapacity, Metric Mem, string MemCapacity, Metric Io, Metric Net, Metric Iops, Metric Latency, string Status)
 {
     public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
     {
@@ -2819,6 +3074,7 @@ internal sealed class Tui
     private const int ShortMetricWidth = 13;
     private const int HostVersionWidth = 28;
     private const int VmVersionWidth = 7;
+    private const int UptimeWidth = 4;
     private const int CountWidth = 5;
     private const int OwnerWidth = 18;
     private const int QuorumWidth = 14;
@@ -2841,6 +3097,8 @@ internal sealed class Tui
     private bool[] touchedLines = [];
     private int previousWidth;
     private int previousHeight;
+    private int frameWidth;
+    private int frameHeight;
 
     public Tui(AppState state, Options options)
     {
@@ -3204,7 +3462,7 @@ internal sealed class Tui
         return panel switch
         {
             Panel.Cluster => [new("NAME", "name"), new("NODES", "nodes"), new("UP", "up"), new("OWNER", "owner"), new("QUORUM", "quorum"), new("STA", "status")],
-            Panel.Hosts => [new("NAME", "name"), new("VER", "version"), new("CPU", "cpu"), new("MEM", "memory"), new("IO", "i/o"), new("NET", "network"), new("STA", "status")],
+            Panel.Hosts => [new("NAME", "name"), new("VER", "version"), new("UP", "uptime"), new("CPU", "cpu"), new("MEM", "memory"), new("IO", "i/o"), new("NET", "network"), new("STA", "status")],
             Panel.Vms => VmSortColumns(),
             Panel.Disks => [new("NAME", "name"), new("SIZE", "size"), new("FREE", "free"), new("IO", "i/o"), new("IOPS", "iops"), new("QD", "queue"), new("LAT", "latency"), new("STA", "status")],
             Panel.Network => [new("NAME", "name"), new("TYPE", "type"), new("UPL", "uplinks"), new("LINK", "link"), new("THR", "throughput"), new("RX", "rx"), new("TX", "tx"), new("STA", "status")],
@@ -3214,7 +3472,7 @@ internal sealed class Tui
     }
 
     private static SortColumn[] VmSortColumns()
-        => [new("NAME", "name"), new("VER", "version"), new("CPU", "cpu"), new("MEM", "memory"), new("IO", "i/o"), new("NET", "network"), new("IOPS", "iops"), new("LAT", "latency"), new("STA", "status")];
+        => [new("NAME", "name"), new("VER", "version"), new("UP", "uptime"), new("CPU", "cpu"), new("MEM", "memory"), new("IO", "i/o"), new("NET", "network"), new("IOPS", "iops"), new("LAT", "latency"), new("STA", "status")];
 
     private static bool DefaultDescending(string column)
         => column is "CPU" or "MEM" or "IO" or "NET" or "IOPS" or "QD" or "LAT" or "SIZE" or "NODES" or "UP" or "THR" or "RX" or "TX" or "DROPS" or "DATE";
@@ -3235,6 +3493,7 @@ internal sealed class Tui
         {
             "NAME" => host.Name,
             "VER" => host.Version,
+            "UP" => host.Uptime?.TotalSeconds ?? double.NaN,
             "CPU" => host.Cpu.Current,
             "MEM" => host.Mem.Current,
             "IO" => host.Io.Current,
@@ -3246,6 +3505,7 @@ internal sealed class Tui
         {
             "NAME" => vm.Name,
             "VER" => vm.Version,
+            "UP" => vm.Uptime.TotalSeconds,
             "CPU" => vm.Cpu.Current,
             "MEM" => vm.Mem.Current,
             "IO" => vm.Io.Current,
@@ -3385,9 +3645,10 @@ internal sealed class Tui
         WriteLine(1, Nav(), ConsoleColor.Yellow);
         WriteLine(2, "Arrows/j/k move  PgUp/PgDn page  Home/End top/bottom  Enter drill  s sort  S dir  f refresh  r rescan  q quit", ConsoleColor.DarkGray);
 
-        if (ShouldShowLoadingOverlay(s))
+        if (IsLoading(s))
         {
             RenderLoadingOverlay(s);
+            RenderDiscoveryStatus(s);
             EndFrame();
             Console.ResetColor();
             return;
@@ -3395,6 +3656,7 @@ internal sealed class Tui
 
         if (drillView == DrillView.Detail) RenderDetail();
         else RenderTable();
+        RenderDiscoveryStatus(s);
         EndFrame();
         Console.ResetColor();
     }
@@ -3412,21 +3674,6 @@ internal sealed class Tui
         });
     }
 
-    private bool ShouldShowLoadingOverlay(Snapshot snapshot)
-    {
-        if (snapshot.Loading || !snapshot.Discovery.Complete || IsLoading(snapshot))
-            return true;
-
-        return panel switch
-        {
-            Panel.Vms => snapshot.InventoryRefreshing && snapshot.Vms.Length == 0,
-            Panel.Hosts when drillView == DrillView.HostVms => snapshot.InventoryRefreshing && CurrentRows().Count == 0,
-            Panel.Network when drillView == DrillView.Overview => snapshot.TopologyRefreshing && snapshot.NetworkSwitches.Length == 0,
-            Panel.Network when drillView == DrillView.NetworkAdapters => snapshot.TopologyRefreshing && CurrentRows().Count == 0,
-            _ => false
-        };
-    }
-
     private void RenderLoadingOverlay(Snapshot snapshot)
     {
         var discovery = snapshot.Discovery;
@@ -3442,6 +3689,34 @@ internal sealed class Tui
 
     private static ConsoleColor LoadingStatusColor(bool ready)
         => ready ? ConsoleColor.Green : ConsoleColor.DarkGray;
+
+    private void RenderDiscoveryStatus(Snapshot snapshot)
+    {
+        if (frameHeight <= 0)
+            return;
+
+        var discovery = snapshot.Discovery;
+        var text = discovery.Complete
+            ? $"Discovery complete: hosts ready, VMs {discovery.VmCount}, storage {discovery.StorageCount}, network {discovery.NetworkSwitchCount} target(s)"
+            : "Discovery: "
+              + StatusPart("hosts", discovery.HostsReady)
+              + "  "
+              + StatusPart("VMs", discovery.VmsReady, discovery.VmsReady ? discovery.VmCount.ToString() : null)
+              + "  "
+              + StatusPart("storage", discovery.StorageReady, discovery.StorageReady ? discovery.StorageCount.ToString() : null)
+              + "  "
+              + StatusPart("network", discovery.NetworkReady, discovery.NetworkReady ? discovery.NetworkSwitchCount.ToString() : null);
+
+        if (snapshot.InventoryRefreshing || snapshot.TopologyRefreshing)
+            text += $"  ({(snapshot.InventoryRefreshing ? "inventory " : string.Empty)}{(snapshot.TopologyRefreshing ? "topology " : string.Empty)}refreshing)";
+
+        WriteLine(frameHeight - 1, text.TrimEnd(), discovery.Complete ? ConsoleColor.DarkGray : ConsoleColor.Yellow);
+    }
+
+    private static string StatusPart(string label, bool ready, string? detail = null)
+        => ready
+            ? $"{label}: ready{(string.IsNullOrWhiteSpace(detail) ? string.Empty : $" {detail}")}"
+            : $"{label}: working...";
 
     private void RenderTable()
     {
@@ -3461,29 +3736,29 @@ internal sealed class Tui
                 {
                     var nameWidth = TableNameWidth(TableKind.VmLike);
                     RenderRows(
-                        Row(Header(DisplayName($"HOST {selectedHostName} -> VMS", nameWidth), nameWidth), Header("VER", VmVersionWidth), CapacityMetricGroupHeader("CPU"), CapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
-                        Row(Header(string.Empty, nameWidth), Header(string.Empty, VmVersionWidth), CapacityMetricSubHeader(), CapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
+                        Row(Header(DisplayName($"HOST {selectedHostName} -> VMS", nameWidth), nameWidth), Header("VER", VmVersionWidth), HeaderRight("UP", UptimeWidth), CapacityMetricGroupHeader("CPU"), CapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
+                        Row(Header(string.Empty, nameWidth), Header(string.Empty, VmVersionWidth), Header(string.Empty, UptimeWidth), CapacityMetricSubHeader(), CapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
                         CurrentRows().Cast<VmRow>().ToArray(),
-                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, VmVersionWidth), FmtWithCapacity(r.Cpu, r.CpuCapacity), FmtWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
+                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, VmVersionWidth), Cell(r.IsRunning ? UptimeFormatter.FormatShort(r.Uptime) : "OFF", UptimeWidth, true), FmtWithCapacity(r.Cpu, r.CpuCapacity), FmtWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
                 }
                 else
                 {
                     var nameWidth = TableNameWidth(TableKind.HostLike);
                     RenderRows(
-                        Row(Header("HOSTNAME", nameWidth), Header("VER", HostVersionWidth), CapacityMetricGroupHeader("CPU"), CapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
-                        Row(Header(string.Empty, nameWidth), Header(string.Empty, HostVersionWidth), CapacityMetricSubHeader(), CapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
+                        Row(Header("HOSTNAME", nameWidth), Header("VER", HostVersionWidth), HeaderRight("UP", UptimeWidth), CapacityMetricGroupHeader("CPU"), CapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
+                        Row(Header(string.Empty, nameWidth), Header(string.Empty, HostVersionWidth), Header(string.Empty, UptimeWidth), CapacityMetricSubHeader(), CapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
                         CurrentRows().Cast<HostRow>().ToArray(),
-                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, HostVersionWidth), FmtWithCapacity(r.Cpu, r.CpuCapacity), FmtWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
+                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, HostVersionWidth), Cell(UptimeFormatter.FormatShort(r.Uptime), UptimeWidth, true), FmtWithCapacity(r.Cpu, r.CpuCapacity), FmtWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
                 }
                 break;
             case Panel.Vms:
                 {
                     var nameWidth = TableNameWidth(TableKind.VmLike);
                     RenderRows(
-                        Row(Header("NAME", nameWidth), Header("VER", VmVersionWidth), CapacityMetricGroupHeader("CPU"), CapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
-                        Row(Header(string.Empty, nameWidth), Header(string.Empty, VmVersionWidth), CapacityMetricSubHeader(), CapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
+                        Row(Header("NAME", nameWidth), Header("VER", VmVersionWidth), HeaderRight("UP", UptimeWidth), CapacityMetricGroupHeader("CPU"), CapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
+                        Row(Header(string.Empty, nameWidth), Header(string.Empty, VmVersionWidth), Header(string.Empty, UptimeWidth), CapacityMetricSubHeader(), CapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
                         CurrentRows().Cast<VmRow>().ToArray(),
-                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, VmVersionWidth), FmtWithCapacity(r.Cpu, r.CpuCapacity), FmtWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
+                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, VmVersionWidth), Cell(r.IsRunning ? UptimeFormatter.FormatShort(r.Uptime) : "OFF", UptimeWidth, true), FmtWithCapacity(r.Cpu, r.CpuCapacity), FmtWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
                 }
                 break;
             case Panel.Disks:
@@ -3659,29 +3934,32 @@ internal sealed class Tui
                 var vmAdapters = GetVmNetworkAdapters(vm, state.Read());
                 selected = Math.Min(selected, Math.Max(0, vmDisks.Length + vmAdapters.Length - 1));
                 Detail(7, "Name", vm.Name);
-                DetailMetricWithCapacity(8, "CPU", vm.Cpu, vm.CpuCapacity);
-                DetailMetricWithCapacity(9, "Memory", vm.Mem, vm.MemCapacity);
+                Detail(8, "Uptime", vm.IsRunning ? UptimeFormatter.FormatExact(vm.Uptime) : "Powered off");
+                Detail(9, "Replication status", vm.Replication, ReplicationColor(vm.ReplicationStatus));
                 DetailScalar(10, string.Empty, string.Empty);
-                DetailMetric(11, "Total IO", vm.Io);
-                DetailMetricSplit(12, "  Read", vm.Io, 0.25);
-                DetailMetricSplit(13, "  Write", vm.Io, 0.75);
-                DetailScalar(14, string.Empty, string.Empty);
-                DetailMetric(15, "Total IOPS", vm.Iops);
-                DetailMetricSplit(16, "  Read IOPS", vm.Iops, 0.25);
-                DetailMetricSplit(17, "  Write IOPS", vm.Iops, 0.75);
-                DetailScalar(18, string.Empty, string.Empty);
-                DetailMetric(19, "Latency", vm.Latency);
-                Detail(21, "Status", vm.Status, StatusColor(vm.Status));
-                WriteLine(24, VmDiskHeaderRow(), ConsoleColor.Yellow);
+                DetailMetricWithCapacity(11, "CPU", vm.Cpu, vm.CpuCapacity);
+                DetailMetricWithCapacity(12, "Memory", vm.Mem, vm.MemCapacity);
+                DetailScalar(13, string.Empty, string.Empty);
+                DetailMetric(14, "Total IO", vm.Io);
+                DetailMetricSplit(15, "  Read", vm.Io, 0.25);
+                DetailMetricSplit(16, "  Write", vm.Io, 0.75);
+                DetailScalar(17, string.Empty, string.Empty);
+                DetailMetric(18, "Total IOPS", vm.Iops);
+                DetailMetricSplit(19, "  Read IOPS", vm.Iops, 0.25);
+                DetailMetricSplit(20, "  Write IOPS", vm.Iops, 0.75);
+                DetailScalar(21, string.Empty, string.Empty);
+                DetailMetric(22, "Latency", vm.Latency);
+                Detail(24, "Status", vm.Status, StatusColor(vm.Status));
+                WriteLine(27, VmDiskHeaderRow(), ConsoleColor.Yellow);
                 for (var i = 0; i < vmDisks.Length; i++)
                 {
                     var disk = vmDisks[i];
                     var row = VmDiskDataRow(disk);
                     var bg = i == selected ? ConsoleColor.DarkCyan : ConsoleColor.Black;
                     var fg = i == selected ? ConsoleColor.White : ConsoleColor.Gray;
-                    WriteLine(25 + i, row, fg, bg);
+                    WriteLine(28 + i, row, fg, bg);
                 }
-                var networkTop = 27 + vmDisks.Length;
+                var networkTop = 30 + vmDisks.Length;
                 WriteLine(networkTop, VmNetworkHeaderRow(), ConsoleColor.Yellow);
                 for (var i = 0; i < vmAdapters.Length; i++)
                 {
@@ -3696,11 +3974,12 @@ internal sealed class Tui
             case HostRow host:
                 Detail(7, "Name", host.Name);
                 Detail(8, "Version", host.Version);
-                DetailMetricWithCapacity(9, "CPU", host.Cpu, host.CpuCapacity);
-                DetailMetricWithCapacity(10, "Memory", host.Mem, host.MemCapacity);
-                DetailMetric(11, "I/O", host.Io);
-                DetailMetric(12, "Network", host.Net);
-                Detail(14, "Status", host.Status, StatusColor(host.Status));
+                Detail(9, "Uptime", UptimeFormatter.FormatExact(host.Uptime));
+                DetailMetricWithCapacity(10, "CPU", host.Cpu, host.CpuCapacity);
+                DetailMetricWithCapacity(11, "Memory", host.Mem, host.MemCapacity);
+                DetailMetric(12, "I/O", host.Io);
+                DetailMetric(13, "Network", host.Net);
+                Detail(15, "Status", host.Status, StatusColor(host.Status));
                 break;
             case DiskRow disk:
                 Detail(7, "Name", disk.Name);
@@ -3742,8 +4021,10 @@ internal sealed class Tui
         }
     }
 
+    private const int DetailLabelWidth = 19;
+
     private void Detail(int y, string label, string value, ConsoleColor color = ConsoleColor.Gray)
-        => WriteLine(y, $"  {label,-18} {value}", color);
+        => WriteLine(y, $"  {label,-DetailLabelWidth} {value}", color);
 
     private void DetailMetric(int y, string label, Metric metric)
         => DetailScalar(y, label, DetailMetricValue(metric));
@@ -3758,7 +4039,7 @@ internal sealed class Tui
         => DetailScalar(y, label, DetailSplitValue(metric, ratio));
 
     private void DetailScalar(int y, string label, string value, ConsoleColor color = ConsoleColor.Gray)
-        => WriteLine(y, $"  {label,-18} {value}", color);
+        => WriteLine(y, $"  {label,-DetailLabelWidth} {value}", color);
 
     private object? ResolveDetailTarget()
     {
@@ -3896,14 +4177,20 @@ internal sealed class Tui
         return text.Length > 4 ? text[..4] : text.PadLeft(4);
     }
 
-    private static ConsoleColor StatusColor(string status) => status switch
+    private static ConsoleColor StatusColor(string status)
     {
-        "HOT" => ConsoleColor.Red,
-        "OFF" => ConsoleColor.DarkGray,
-        "BUSY" => ConsoleColor.Yellow,
-        "IDLE" => ConsoleColor.Green,
-        _ => ConsoleColor.Green
-    };
+        return status.Trim().ToUpperInvariant() switch
+        {
+            "HOT" => ConsoleColor.Red,
+            "OFF" => ConsoleColor.DarkGray,
+            "N/A" => ConsoleColor.DarkGray,
+            "BUSY" => ConsoleColor.Yellow,
+            "IDLE" => ConsoleColor.Green,
+            _ => ConsoleColor.Green
+        };
+    }
+
+    private static ConsoleColor ReplicationColor(string status) => StatusColor(status);
 
     private static ConsoleColor RowColor(object row) => row switch
     {
@@ -3934,8 +4221,8 @@ internal sealed class Tui
         var fixedWidths = kind switch
         {
             TableKind.ClusterLike => CountWidth + CountWidth + OwnerWidth + QuorumWidth + StatusWidth,
-            TableKind.HostLike => HostVersionWidth + CapacityMetricWidth + CapacityMetricWidth + MetricWidth + MetricWidth + StatusWidth,
-            TableKind.VmLike => VmVersionWidth + CapacityMetricWidth + CapacityMetricWidth + MetricWidth + MetricWidth + StatusWidth,
+            TableKind.HostLike => HostVersionWidth + UptimeWidth + CapacityMetricWidth + CapacityMetricWidth + MetricWidth + MetricWidth + StatusWidth,
+            TableKind.VmLike => VmVersionWidth + UptimeWidth + CapacityMetricWidth + CapacityMetricWidth + MetricWidth + MetricWidth + StatusWidth,
             TableKind.DiskLike => SizeWidth + MetricWidth + MetricWidth + MetricWidth + ShortMetricWidth + ShortMetricWidth + StatusWidth,
             TableKind.NetworkSwitchLike => SwitchTypeWidth + UplinkWidth + LinkWidth + MetricWidth + MetricWidth + MetricWidth + StatusWidth,
             TableKind.NetworkLike => LinkWidth + MetricWidth + MetricWidth + MetricWidth + ShortMetricWidth + StatusWidth,
@@ -3945,8 +4232,8 @@ internal sealed class Tui
         var columns = kind switch
         {
             TableKind.ClusterLike => 6,
-            TableKind.HostLike => 7,
-            TableKind.VmLike => 7,
+            TableKind.HostLike => 8,
+            TableKind.VmLike => 8,
             TableKind.DiskLike => 8,
             TableKind.NetworkLike => 6,
             _ => 2
@@ -3959,12 +4246,14 @@ internal sealed class Tui
 
     private void BeginFrame()
     {
-        var width = Console.WindowWidth;
-        var height = Console.WindowHeight;
+        var width = Math.Max(0, Console.WindowWidth);
+        var height = Math.Max(0, Console.WindowHeight);
+        frameWidth = width;
+        frameHeight = height;
 
         if (width != previousWidth || height != previousHeight)
         {
-            Console.Clear();
+            TryClearConsole();
             previousLines = new string[height];
             previousForegrounds = Enumerable.Repeat(ConsoleColor.Gray, height).ToArray();
             previousBackgrounds = Enumerable.Repeat(ConsoleColor.Black, height).ToArray();
@@ -3980,7 +4269,8 @@ internal sealed class Tui
 
     private void EndFrame()
     {
-        for (var y = 0; y < previousLines.Length; y++)
+        var lines = Math.Min(previousLines.Length, touchedLines.Length);
+        for (var y = 0; y < lines; y++)
         {
             if (!touchedLines[y] && !string.IsNullOrEmpty(previousLines[y]))
                 WriteLine(y, string.Empty);
@@ -3989,10 +4279,12 @@ internal sealed class Tui
 
     private void WriteLine(int y, string text, ConsoleColor foreground = ConsoleColor.Gray, ConsoleColor background = ConsoleColor.Black)
     {
-        if (y < 0 || y >= Console.WindowHeight) return;
+        if (y < 0 || y >= frameHeight || y >= touchedLines.Length || y >= previousLines.Length) return;
         touchedLines[y] = true;
 
-        var width = Console.WindowWidth;
+        var width = Math.Min(frameWidth, Math.Max(0, Console.WindowWidth));
+        if (width <= 1) return;
+        width--;
         if (text.Length > width)
             text = text[..width];
         else if (text.Length < width)
@@ -4001,13 +4293,44 @@ internal sealed class Tui
         if (previousLines[y] == text && previousForegrounds[y] == foreground && previousBackgrounds[y] == background)
             return;
 
-        Console.SetCursorPosition(0, y);
-        Console.ForegroundColor = foreground;
-        Console.BackgroundColor = background;
-        Console.Write(text);
+        try
+        {
+            if (y >= Console.WindowHeight) return;
+            Console.SetCursorPosition(0, y);
+            Console.ForegroundColor = foreground;
+            Console.BackgroundColor = background;
+            Console.Write(text);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            previousWidth = -1;
+            previousHeight = -1;
+            return;
+        }
+        catch (IOException)
+        {
+            previousWidth = -1;
+            previousHeight = -1;
+            return;
+        }
+
         previousLines[y] = text;
         previousForegrounds[y] = foreground;
         previousBackgrounds[y] = background;
+    }
+
+    private static void TryClearConsole()
+    {
+        try
+        {
+            Console.Clear();
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+        }
+        catch (IOException)
+        {
+        }
     }
 }
 
