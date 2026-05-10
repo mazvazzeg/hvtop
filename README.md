@@ -25,7 +25,38 @@ Useful options:
 
 ```powershell
 dotnet run -- --refresh 0.5 --history 15
+dotnet run -- --rdc-disable
+dotnet run -- --debug-log
 dotnet run -- --smoke
+```
+
+## Command Line Options
+
+`hvtop.exe` accepts these options:
+
+```text
+--refresh <seconds>        Local UI/data refresh interval. Default: 1
+--history <minutes>        History window for max/min values. Default: 15
+--rdc-port <n>             Remote Data Collector TCP port. Default: 54321
+--rdc-refresh <seconds>    Remote Data Collector interval. Default: 5
+--rdc-disable              Disable remote data collection on cluster peers.
+--debug-log                Write hvtop.log; also enables remote hvtop-rdc.log.
+--smoke                    Print one sample and exit.
+--help                     Show help.
+--version                  Show version and exit.
+```
+
+`hvtop-rdc.exe` is normally deployed and started by `hvtop.exe`, but accepts:
+
+```text
+--port <n>                 Listen TCP port. Default: 54321
+--listen <prefix>          HTTP listener prefix. Default: http://+:<port>/
+--refresh <seconds>        Collection interval. Default: 5
+--history <minutes>        History window. Default: 15
+--token <value>            Required token for incoming requests.
+--debug-log                Write hvtop-rdc.log beside the executable.
+--help                     Show help.
+--version                  Show version and exit.
 ```
 
 The native version currently uses PDH for host CPU, memory, disk throughput,
@@ -36,13 +67,20 @@ panes remain useful on standard Windows servers.
 
 ## Keys
 
+- `C`: Cluster
 - `H`: Hosts
 - `V`: VMs
 - `D`: CSV/storage
 - `N`: Network
 - `E`: Events
 - `Up/Down` or `k/j`: move selection
+- `PgUp/PgDn`: move selection by one page
+- `Home/End`: move selection to top or bottom
 - `Enter`: drill down
+- `s`: select sort column
+- `S`: toggle sort direction
+- `f`: cycle refresh delay
+- `r`: rescan inventory/topology
 - `Backspace` or `Esc`: back
 - `q`: quit
 
@@ -51,18 +89,22 @@ panes remain useful on standard Windows servers.
 The intended navigation path is:
 
 ```text
-HOSTS -> select host -> VMs on that host -> select VM -> VM detail
+CLUSTER -> HOSTS -> select host -> VMs on that host -> select VM -> VM detail
 ```
+
+On non-cluster hosts, the flow starts at `HOSTS`. On standard Windows servers
+without Hyper-V, the VM pane is expected to be empty.
 
 Detail panes resolve the selected row from the latest snapshot on every repaint,
 so values continue updating live while you are drilled in.
 
 ## First Panels
 
-- Hosts: hostname, CPU, memory, I/O, network, status
-- VMs: name, CPU, memory, I/O, network, status
+- Clusters: cluster name, number of nodes, nodes in UP status, owner node
+- Hosts: hostname, version, uptime, CPU, memory, I/O, network, status
+- VMs: name, version, uptime, CPU, memory, I/O, network, status
 - CSV/storage: name, free space, I/O, IOPS, queue depth, latency, status
-- Network: adapter, throughput, receive, transmit, drops, status
+- Network: vSwitch or adapter, link, throughput, receive, transmit, drops, status
 - Events: timestamped status, spike, and collector events
 
 Each metric shows current and max-in-history values as `current | max`. The history
@@ -71,6 +113,15 @@ window defaults to 15 minutes.
 Throughput values scale as `KB/s`, `MB/s`, then `GB/s` with compact three-digit
 numbers, for example `999 KB/s`, `1.32 MB/s`, `11.3 MB/s`, `111 MB/s`,
 `1.33 GB/s`, and `32.2 GB/s`.
+
+## Remote Data Collector
+
+On Failover Cluster setups, hvtop can start an RDC (Remote Data Collector)
+process on peer nodes if the `ADMIN$` share is accessible for the currently
+logged-in user. `hvtop-rdc.exe` reports the same metrics to the local `hvtop.exe`
+process through a small HTTP interface. The main `hvtop.exe` process polls those
+remote collectors and merges the returned host/VM/storage/network telemetry into
+the local view.
 
 ## Native Collection Direction
 

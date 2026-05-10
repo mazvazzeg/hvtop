@@ -1,19 +1,212 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
+using System.Net;
+using System.Net.Http;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace hvtop.Native;
 
 internal static class Program
 {
-    public const string DisplayVersion = "0.4.1+20260510.0007";
+#if RDC
+    public const string DisplayVersion = "0.5.0-rdc+20260510.0114";
+    public const string AppName = "hvtop-rdc";
+
+    public static async Task<int> Main(string[] args)
+    {
+        var options = RdcOptions.Parse(args);
+        if (options.ShowVersion)
+        {
+            Console.WriteLine($"{AppName} {DisplayVersion}");
+            return 0;
+        }
+        if (options.ShowHelp || options.ParseError is not null)
+        {
+            if (options.ParseError is not null)
+                Console.Error.WriteLine(options.ParseError);
+            Console.WriteLine(RdcOptions.HelpText);
+            return options.ParseError is null ? 0 : 2;
+        }
+        RdcLog.Configure(options.DebugLog, "hvtop-rdc.log");
+        RdcLog.Info($"{AppName} {DisplayVersion} starting base='{AppContext.BaseDirectory}' process='{Environment.ProcessPath}' args='{RdcLog.SafeArgs(args)}'");
+        try
+        {
+            RdcLog.Info($"parsed options listen='{options.ListenPrefix}' port={options.Port} refresh={options.Refresh.TotalSeconds:N1}s history={options.History.TotalMinutes:N0}m token={(string.IsNullOrWhiteSpace(options.Token) ? "none" : "set")}");
+            using var cts = new CancellationTokenSource();
+            using var firewallRule = RdcFirewallRule.Ensure(options.Port);
+            using var collector = new Collector(new Options(options.Refresh, options.History, false, false, options.Port, options.Refresh, options.DebugLog, false, false, null));
+            var current = Snapshot.Empty;
+            var firstSample = true;
+            var sampler = Task.Run(async () =>
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    try
+                    {
+                        var started = Stopwatch.GetTimestamp();
+                        RdcLog.Info($"sample start first={firstSample}");
+                        current = collector.Collect(firstSample);
+                        firstSample = false;
+                        RdcLog.Info($"sample complete in {Stopwatch.GetElapsedTime(started).TotalMilliseconds:N0} ms hosts={current.Hosts.Length} vms={current.Vms.Length} disks={current.Disks.Length} networks={current.Networks.Length} switches={current.NetworkSwitches.Length}");
+                    }
+                    catch (Exception ex)
+                    {
+                        RdcLog.Info($"sample failed: {ex}");
+                    }
+
+                    try
+                    {
+                        await Task.Delay(options.Refresh, cts.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                    }
+                }
+            });
+
+            using var listener = new HttpListener();
+            listener.Prefixes.Add(options.ListenPrefix);
+            RdcLog.Info($"listener starting prefix='{options.ListenPrefix}' firewall={firewallRule.Status}");
+            listener.Start();
+            using var listenerStop = cts.Token.Register(() =>
+            {
+                RdcLog.Info("stop signal received, stopping listener");
+                try { listener.Stop(); } catch (Exception ex) { RdcLog.Info($"listener stop failed: {ex.Message}"); }
+            });
+            RdcLog.Info("listener started");
+            Console.WriteLine($"{AppName} {DisplayVersion} listening on {options.ListenPrefix} firewall={firewallRule.Status}");
+
+            while (!cts.IsCancellationRequested)
+            {
+                HttpListenerContext context;
+                try
+                {
+                    context = await listener.GetContextAsync().ConfigureAwait(false);
+                }
+                catch when (cts.IsCancellationRequested)
+                {
+                    break;
+                }
+
+                _ = Task.Run(() => HandleRdcRequest(context, options, () => current, cts));
+            }
+
+            try { listener.Stop(); } catch { }
+            try { await Task.WhenAny(sampler, Task.Delay(1000)).ConfigureAwait(false); } catch { }
+            RdcLog.Info("stopped");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            RdcLog.Info($"FATAL: {ex}");
+            return 1;
+        }
+    }
+
+    private static async Task HandleRdcRequest(HttpListenerContext context, RdcOptions options, Func<Snapshot> readSnapshot, CancellationTokenSource cts)
+    {
+        try
+        {
+            var path = context.Request.Url?.AbsolutePath ?? "/";
+            RdcLog.Info($"request {context.Request.HttpMethod} {path} from {context.Request.RemoteEndPoint}");
+            if (!RdcAuthorized(context.Request, options.Token))
+            {
+                RdcLog.Info($"request unauthorized {path} from {context.Request.RemoteEndPoint}");
+                context.Response.StatusCode = 403;
+                context.Response.Close();
+                return;
+            }
+
+            if (path.Equals("/stop", StringComparison.OrdinalIgnoreCase))
+            {
+                RdcLog.Info("stop requested");
+                await WriteJson(context.Response, new RdcStatus("stopping", Environment.MachineName)).ConfigureAwait(false);
+                cts.Cancel();
+                return;
+            }
+
+            if (path.Equals("/health", StringComparison.OrdinalIgnoreCase))
+            {
+                RdcLog.Info("health requested");
+                await WriteJson(context.Response, new RdcStatus("ok", Environment.MachineName)).ConfigureAwait(false);
+                return;
+            }
+
+            if (path.Equals("/snapshot", StringComparison.OrdinalIgnoreCase) || path.Equals("/", StringComparison.OrdinalIgnoreCase))
+            {
+                var snapshot = readSnapshot();
+                RdcLog.Info($"snapshot requested loading={snapshot.Loading} at={snapshot.At:HH:mm:ss} hosts={snapshot.Hosts.Length} vms={snapshot.Vms.Length} events={snapshot.Events.Length}");
+                await WriteJson(context.Response, snapshot).ConfigureAwait(false);
+                return;
+            }
+
+            RdcLog.Info($"request not found {path}");
+            context.Response.StatusCode = 404;
+            context.Response.Close();
+        }
+        catch (Exception ex)
+        {
+            RdcLog.Info($"request failed: {ex}");
+            try
+            {
+                context.Response.StatusCode = 500;
+                context.Response.Close();
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private static bool RdcAuthorized(HttpListenerRequest request, string token)
+    {
+        if (string.IsNullOrWhiteSpace(token))
+            return true;
+
+        return string.Equals(request.QueryString["token"], token, StringComparison.Ordinal)
+               || string.Equals(request.Headers["X-Hvtop-Token"], token, StringComparison.Ordinal);
+    }
+
+    private static Task WriteJson(HttpListenerResponse response, Snapshot value)
+        => WriteJsonBytes(response, JsonSerializer.SerializeToUtf8Bytes(value, HvtopJsonContext.Default.Snapshot));
+
+    private static Task WriteJson(HttpListenerResponse response, RdcStatus value)
+        => WriteJsonBytes(response, JsonSerializer.SerializeToUtf8Bytes(value, HvtopJsonContext.Default.RdcStatus));
+
+    private static async Task WriteJsonBytes(HttpListenerResponse response, byte[] bytes)
+    {
+        response.ContentType = "application/json";
+        response.ContentLength64 = bytes.Length;
+        await response.OutputStream.WriteAsync(bytes).ConfigureAwait(false);
+        response.Close();
+    }
+
+#else
+    public const string DisplayVersion = "0.5.0+20260510.0114";
     public const string AppName = "hvtop";
 
     public static async Task<int> Main(string[] args)
     {
         var options = Options.Parse(args);
+        if (options.ShowVersion)
+        {
+            Console.WriteLine($"{AppName} {DisplayVersion}");
+            return 0;
+        }
+        if (options.ShowHelp || options.ParseError is not null)
+        {
+            if (options.ParseError is not null)
+                Console.Error.WriteLine(options.ParseError);
+            Console.WriteLine(Options.HelpText);
+            return options.ParseError is null ? 0 : 2;
+        }
+        RdcLog.Configure(options.DebugLog, "hvtop.log");
+        RdcLog.Info($"{AppName} {DisplayVersion} starting base='{AppContext.BaseDirectory}' process='{Environment.ProcessPath}' args='{RdcLog.SafeArgs(args)}'");
         using var cts = new CancellationTokenSource();
         using var collector = new Collector(options);
 
@@ -44,6 +237,7 @@ internal static class Program
         {
             cts.Cancel();
             try { await Task.WhenAny(sampler, Task.Delay(1500)).ConfigureAwait(false); } catch (OperationCanceledException) { }
+            RdcLog.Info("hvtop stopped");
         }
 
         return 0;
@@ -92,6 +286,7 @@ internal static class Program
         else text = value.ToString("0.00");
         return text.Length > 4 ? text[..4] : text.PadLeft(4);
     }
+#endif
 
     private static async Task RunSamplerAsync(Collector collector, AppState state, Options options, CancellationToken token)
     {
@@ -115,26 +310,376 @@ internal static class Program
     }
 }
 
-internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke)
+internal sealed record RdcStatus(string Status, string Host);
+
+[JsonSourceGenerationOptions(NumberHandling = JsonNumberHandling.AllowNamedFloatingPointLiterals)]
+[JsonSerializable(typeof(Snapshot))]
+[JsonSerializable(typeof(RdcStatus))]
+internal sealed partial class HvtopJsonContext : JsonSerializerContext;
+
+internal static class RdcLog
 {
+    private static readonly object Gate = new();
+    private static string path = System.IO.Path.Combine(AppContext.BaseDirectory, "hvtop-rdc.log");
+    private static bool enabled;
+
+    public static void Configure(bool debugLog, string fileName)
+    {
+        lock (Gate)
+        {
+            enabled = debugLog;
+            path = System.IO.Path.Combine(AppContext.BaseDirectory, fileName);
+        }
+    }
+
+    public static void Info(string message)
+    {
+        if (!enabled)
+            return;
+
+        try
+        {
+            lock (Gate)
+            {
+                File.AppendAllText(path, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {message}{Environment.NewLine}");
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    public static string SafeArgs(string[] args)
+    {
+        var copy = args.ToArray();
+        for (var i = 0; i < copy.Length; i++)
+        {
+            if (copy[i].Equals("--token", StringComparison.OrdinalIgnoreCase) && i + 1 < copy.Length)
+                copy[i + 1] = "<redacted>";
+        }
+
+        return string.Join(" ", copy);
+    }
+}
+
+internal sealed class RdcFirewallRule : IDisposable
+{
+    private readonly string ruleName;
+    private readonly bool shouldRemove;
+
+    private RdcFirewallRule(string ruleName, string status, bool shouldRemove)
+    {
+        this.ruleName = ruleName;
+        Status = status;
+        this.shouldRemove = shouldRemove;
+    }
+
+    public string Status { get; }
+
+    public static RdcFirewallRule Ensure(int port)
+    {
+        var ruleName = $"hvtop-rdc TCP {port}";
+        try
+        {
+            RdcLog.Info($"firewall check rule='{ruleName}' port={port}");
+            if (!FirewallEnabled())
+            {
+                RdcLog.Info("firewall disabled, no rule needed");
+                return new RdcFirewallRule(ruleName, "disabled", false);
+            }
+
+            RdcLog.Info("firewall enabled, adding temporary inbound port-only allow rule");
+            RunNetsh($"advfirewall firewall delete rule name=\"{ruleName}\"");
+            var ok = RunNetsh($"advfirewall firewall add rule name=\"{ruleName}\" dir=in action=allow protocol=TCP localport={port} enable=yes profile=any");
+            RdcLog.Info($"firewall add rule result={(ok ? "ok" : "failed")}");
+            return new RdcFirewallRule(ruleName, ok ? "allow-rule-added" : "allow-rule-failed", ok);
+        }
+        catch (Exception ex)
+        {
+            RdcLog.Info($"firewall rule setup failed: {ex}");
+            return new RdcFirewallRule(ruleName, "allow-rule-failed", false);
+        }
+    }
+
+    public void Dispose()
+    {
+        if (!shouldRemove)
+            return;
+
+        try
+        {
+            RdcLog.Info($"firewall removing temporary rule='{ruleName}'");
+            RunNetsh($"advfirewall firewall delete rule name=\"{ruleName}\"");
+        }
+        catch (Exception ex)
+        {
+            RdcLog.Info($"firewall rule removal failed: {ex.Message}");
+        }
+    }
+
+    private static bool FirewallEnabled()
+    {
+        var output = RunNetshCapture("advfirewall show allprofiles state");
+        RdcLog.Info($"firewall state output='{output.ReplaceLineEndings(" ").Trim()}'");
+        return output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Any(line => line.Contains("State", StringComparison.OrdinalIgnoreCase)
+                         && line.Contains("ON", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool RunNetsh(string arguments)
+    {
+        using var process = CreateNetsh(arguments, redirectOutput: false);
+        process.Start();
+        return process.WaitForExit(5000) && process.ExitCode == 0;
+    }
+
+    private static string RunNetshCapture(string arguments)
+    {
+        using var process = CreateNetsh(arguments, redirectOutput: true);
+        process.Start();
+        var output = process.StandardOutput.ReadToEnd();
+        process.WaitForExit(5000);
+        return output;
+    }
+
+    private static Process CreateNetsh(string arguments, bool redirectOutput)
+    {
+        return new Process
+        {
+            StartInfo =
+            {
+                FileName = "netsh.exe",
+                Arguments = arguments,
+                UseShellExecute = false,
+                RedirectStandardOutput = redirectOutput,
+                RedirectStandardError = redirectOutput,
+                CreateNoWindow = true
+            }
+        };
+    }
+}
+
+internal sealed record RdcOptions(TimeSpan Refresh, TimeSpan History, int Port, string ListenPrefix, string Token, bool DebugLog, bool ShowHelp, bool ShowVersion, string? ParseError)
+{
+    public static string HelpText =>
+        """
+        hvtop-rdc remote data collector
+
+        Usage:
+          hvtop-rdc.exe [options]
+
+        Options:
+          --port <n>            Listen TCP port. Default: 54321
+          --listen <prefix>     HTTP listener prefix. Default: http://+:<port>/
+          --refresh <seconds>   Collection interval. Default: 5
+          --history <minutes>   History window. Default: 15
+          --token <value>       Required token for incoming requests.
+          --debug-log           Write hvtop-rdc.log beside the executable.
+          --help                Show this help.
+          --version             Show version and exit.
+        """;
+
+    public static RdcOptions Parse(string[] args)
+    {
+        var refresh = TimeSpan.FromSeconds(5);
+        var history = TimeSpan.FromMinutes(15);
+        var port = 54321;
+        string? listen = null;
+        var token = string.Empty;
+        var debugLog = false;
+        var showHelp = false;
+        var showVersion = false;
+        string? error = null;
+
+        for (var i = 0; i < args.Length; i++)
+        {
+            var arg = args[i].Trim();
+            if (ArgumentHelper.IsHelp(arg))
+            {
+                showHelp = true;
+                break;
+            }
+            if (ArgumentHelper.IsVersion(arg))
+            {
+                showVersion = true;
+                break;
+            }
+            if (arg.Equals("--refresh", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!ArgumentHelper.TryReadDouble(args, ref i, arg, out var value, out error)) break;
+                refresh = TimeSpan.FromSeconds(Math.Max(1, value));
+            }
+            else if (arg.Equals("--history", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!ArgumentHelper.TryReadDouble(args, ref i, arg, out var value, out error)) break;
+                history = TimeSpan.FromMinutes(Math.Max(1, value));
+            }
+            else if (arg.Equals("--port", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!ArgumentHelper.TryReadInt(args, ref i, arg, out var value, out error)) break;
+                port = Math.Clamp(value, 1, 65535);
+            }
+            else if (arg.Equals("--listen", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!ArgumentHelper.TryReadString(args, ref i, arg, out var value, out error)) break;
+                listen = value;
+            }
+            else if (arg.Equals("--token", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!ArgumentHelper.TryReadString(args, ref i, arg, out var value, out error)) break;
+                token = value;
+            }
+            else if (arg.Equals("--debug-log", StringComparison.OrdinalIgnoreCase))
+                debugLog = true;
+            else
+            {
+                error = $"Unknown option: {arg}";
+                break;
+            }
+        }
+
+        listen ??= $"http://+:{port}/";
+        if (!listen.EndsWith("/", StringComparison.Ordinal))
+            listen += "/";
+
+        return new RdcOptions(refresh, history, port, listen, token, debugLog, showHelp, showVersion, error);
+    }
+}
+
+internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, bool RemoteCollectors, int RdcPort, TimeSpan RemoteRefresh, bool DebugLog, bool ShowHelp, bool ShowVersion, string? ParseError)
+{
+    public static string HelpText =>
+        """
+        hvtop - Windows / Hyper-V / Failover Cluster TUI monitor
+
+        Usage:
+          hvtop.exe [options]
+
+        Options:
+          --refresh <seconds>        Local UI/data refresh interval. Default: 1
+          --history <minutes>        History window for max/min values. Default: 15
+          --rdc-port <n>             Remote Data Collector TCP port. Default: 54321
+          --rdc-refresh <seconds>    Remote Data Collector interval. Default: 5
+          --rdc-disable              Disable remote data collection on cluster peers.
+          --debug-log                Write hvtop.log; also enables remote hvtop-rdc.log.
+          --smoke                    Print one sample and exit.
+          --help                     Show this help.
+          --version                  Show version and exit.
+        """;
+
     public static Options Parse(string[] args)
     {
         var refresh = TimeSpan.FromSeconds(1);
         var history = TimeSpan.FromMinutes(15);
         var smoke = false;
+        var remoteCollectors = true;
+        var rdcPort = 54321;
+        var remoteRefresh = TimeSpan.FromSeconds(5);
+        var debugLog = false;
+        var showHelp = false;
+        var showVersion = false;
+        string? error = null;
 
         for (var i = 0; i < args.Length; i++)
         {
             var arg = args[i].Trim();
-            if (arg.Equals("--refresh", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
-                refresh = TimeSpan.FromSeconds(Math.Max(0.2, double.Parse(args[++i])));
-            else if (arg.Equals("--history", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
-                history = TimeSpan.FromMinutes(Math.Max(1, double.Parse(args[++i])));
+            if (ArgumentHelper.IsHelp(arg))
+            {
+                showHelp = true;
+                break;
+            }
+            if (ArgumentHelper.IsVersion(arg))
+            {
+                showVersion = true;
+                break;
+            }
+            if (arg.Equals("--refresh", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!ArgumentHelper.TryReadDouble(args, ref i, arg, out var value, out error)) break;
+                refresh = TimeSpan.FromSeconds(Math.Max(0.2, value));
+            }
+            else if (arg.Equals("--history", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!ArgumentHelper.TryReadDouble(args, ref i, arg, out var value, out error)) break;
+                history = TimeSpan.FromMinutes(Math.Max(1, value));
+            }
             else if (arg.Equals("--smoke", StringComparison.OrdinalIgnoreCase))
                 smoke = true;
+            else if (arg.Equals("--rdc-disable", StringComparison.OrdinalIgnoreCase))
+                remoteCollectors = false;
+            else if (arg.Equals("--rdc-port", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!ArgumentHelper.TryReadInt(args, ref i, arg, out var value, out error)) break;
+                rdcPort = Math.Clamp(value, 1, 65535);
+            }
+            else if (arg.Equals("--rdc-refresh", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!ArgumentHelper.TryReadDouble(args, ref i, arg, out var value, out error)) break;
+                remoteRefresh = TimeSpan.FromSeconds(Math.Max(1, value));
+            }
+            else if (arg.Equals("--debug-log", StringComparison.OrdinalIgnoreCase))
+                debugLog = true;
+            else
+            {
+                error = $"Unknown option: {arg}";
+                break;
+            }
         }
 
-        return new Options(refresh, history, smoke);
+        if (smoke)
+            remoteCollectors = false;
+
+        return new Options(refresh, history, smoke, remoteCollectors, rdcPort, remoteRefresh, debugLog, showHelp, showVersion, error);
+    }
+}
+
+internal static class ArgumentHelper
+{
+    public static bool IsHelp(string arg)
+        => arg.Equals("--help", StringComparison.OrdinalIgnoreCase);
+
+    public static bool IsVersion(string arg)
+        => arg.Equals("--version", StringComparison.OrdinalIgnoreCase);
+
+    public static bool TryReadString(string[] args, ref int index, string option, out string value, out string? error)
+    {
+        value = string.Empty;
+        error = null;
+        if (index + 1 >= args.Length || args[index + 1].StartsWith("-", StringComparison.Ordinal))
+        {
+            error = $"Missing value for {option}";
+            return false;
+        }
+
+        value = args[++index];
+        return true;
+    }
+
+    public static bool TryReadInt(string[] args, ref int index, string option, out int value, out string? error)
+    {
+        value = 0;
+        if (!TryReadString(args, ref index, option, out var text, out error))
+            return false;
+
+        if (int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
+            return true;
+
+        error = $"Invalid integer for {option}: {text}";
+        return false;
+    }
+
+    public static bool TryReadDouble(string[] args, ref int index, string option, out double value, out string? error)
+    {
+        value = 0;
+        if (!TryReadString(args, ref index, option, out var text, out error))
+            return false;
+
+        if (double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value)
+            || double.TryParse(text, NumberStyles.Float, CultureInfo.CurrentCulture, out value))
+            return true;
+
+        error = $"Invalid number for {option}: {text}";
+        return false;
     }
 }
 
@@ -177,6 +722,7 @@ internal sealed class AppState
 
     public void AddEvent(string severity, string message)
     {
+        RdcLog.Info($"{severity} {message}");
         lock (gate)
         {
             snapshot = snapshot with
@@ -231,6 +777,7 @@ internal sealed class Collector : IDisposable
     private readonly HyperVInventory inventory = new();
     private readonly HyperVTopology topology = new();
     private readonly ClusterInventory clusterInventory = new();
+    private readonly RemoteCollectorManager remote;
     private readonly Counter cpu;
     private readonly Counter memory;
     private readonly Counter diskBytes;
@@ -252,6 +799,7 @@ internal sealed class Collector : IDisposable
     {
         this.options = options;
         history = new RollingHistory(options.History);
+        remote = new RemoteCollectorManager(options);
         cpu = pdh.Add(@"\Processor(_Total)\% Processor Time");
         memory = pdh.Add(@"\Memory\% Committed Bytes In Use");
         diskBytes = pdh.Add(@"\LogicalDisk(_Total)\Disk Bytes/sec");
@@ -301,18 +849,19 @@ internal sealed class Collector : IDisposable
             HostVersionDetector.Detect(),
             TimeSpan.FromMilliseconds(Environment.TickCount64),
             Metric.Percent(hostCpu),
-            $"{Environment.ProcessorCount} CPU",
+            $"{Native.GetActiveLogicalProcessorCount()} CPU",
             Metric.Percent(hostMem),
             CapacityFormatter.FormatConfigCapacity(Native.GetPhysicalMemoryBytes()),
             Metric.Mbps(hostIo),
             Metric.Mbps(hostNet),
             Status.From(hostCpu, hostMem, latency, queue));
         var hosts = BuildHosts(host, clusterResult.Nodes);
+        remote.UpdateTargets(clusterResult.Nodes, host.Name);
 
         var disks = StorageInventory.Enumerate()
             .Select(storage =>
             {
-                var free = 100.0 * storage.FreeBytes / storage.TotalBytes;
+                var free = storage.TotalBytes > 0 ? 100.0 * storage.FreeBytes / storage.TotalBytes : 0;
                 var diskReadIo = LogicalDiskSampler.ReadMbps(storage.CounterKey);
                 var diskWriteIo = LogicalDiskSampler.WriteMbps(storage.CounterKey);
                 var diskIo = diskReadIo + diskWriteIo;
@@ -392,6 +941,7 @@ internal sealed class Collector : IDisposable
             disks = disks.Select(d => history.Apply("disk:" + d.Name, d)).ToArray();
             networkSwitches = networkSwitches.Select(n => history.Apply("vswitch:" + n.Name, n)).ToArray();
             adapters = adapters.Select(n => history.Apply("net:" + n.Name, n)).ToArray();
+            MergeRemoteTelemetry(ref hosts, ref vms);
             MaybeAddSpikeEvent(host, disks);
             return new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, networkSwitches, adapters, events, mergedTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery);
         }
@@ -401,8 +951,22 @@ internal sealed class Collector : IDisposable
         disks = disks.Select(d => history.Apply("disk:" + d.Name, d)).ToArray();
         networkSwitches = networkSwitches.Select(n => history.Apply("vswitch:" + n.Name, n)).ToArray();
         adapters = adapters.Select(n => history.Apply("net:" + n.Name, n)).ToArray();
+        MergeRemoteTelemetry(ref hosts, ref vms);
         MaybeAddSpikeEvent(host, disks);
         return new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, networkSwitches, adapters, events, liveTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery);
+    }
+
+    private void MergeRemoteTelemetry(ref HostRow[] hosts, ref VmRow[] vms)
+    {
+        foreach (var evt in remote.DrainEvents())
+            AddEvent(evt.Severity, evt.Message);
+
+        var snapshots = remote.ReadSnapshots();
+        if (snapshots.Length == 0)
+            return;
+
+        hosts = RemoteCollectorManager.MergeHosts(hosts, snapshots);
+        vms = RemoteCollectorManager.MergeVms(vms, snapshots);
     }
 
     private static HostRow[] BuildHosts(HostRow localHost, ClusterNodeRow[] clusterNodes)
@@ -766,11 +1330,451 @@ internal sealed class Collector : IDisposable
         if (events.FirstOrDefault()?.Message == message && DateTime.Now - events[0].At < TimeSpan.FromSeconds(30))
             return;
 
+        RdcLog.Info($"{severity} {message}");
         events = events.Prepend(new EventRow(DateTime.Now, severity, message)).Take(200).ToArray();
     }
 
-    public void Dispose() => pdh.Dispose();
+    public void Dispose()
+    {
+        remote.Dispose();
+        pdh.Dispose();
+    }
 }
+
+internal sealed class RemoteCollectorManager : IDisposable
+{
+    private const string RemoteInstallRelative = @"Temp\hvtop-rdc";
+    private const string RemoteExePath = @"C:\Windows\Temp\hvtop-rdc\hvtop-rdc.exe";
+    private static readonly TimeSpan NoDataRedeployAfter = TimeSpan.FromMinutes(3);
+    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
+
+    private readonly Options options;
+    private readonly object gate = new();
+    private readonly Dictionary<string, RemoteNodeSession> sessions = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentQueue<EventRow> events = new();
+    private readonly HttpClient http = new(new SocketsHttpHandler
+    {
+        UseProxy = false,
+        ConnectTimeout = TimeSpan.FromSeconds(3)
+    })
+    {
+        Timeout = TimeSpan.FromSeconds(10)
+    };
+    private readonly string token = Guid.NewGuid().ToString("N");
+    private bool clusterDetectedLogged;
+    private string lastTargetSummary = string.Empty;
+
+    public RemoteCollectorManager(Options options)
+    {
+        this.options = options;
+    }
+
+    public void UpdateTargets(ClusterNodeRow[] nodes, string localHost)
+    {
+        if (!options.RemoteCollectors)
+            return;
+
+        var wanted = nodes
+            .Where(n => n.Status != "HOT")
+            .Select(n => n.Name)
+            .Where(name => !string.IsNullOrWhiteSpace(name)
+                           && !name.Equals(localHost, StringComparison.OrdinalIgnoreCase)
+                           && !name.Equals(Environment.MachineName, StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (nodes.Length > 1 && !clusterDetectedLogged)
+        {
+            clusterDetectedLogged = true;
+            Enqueue("INFO", $"Cluster detected, deploying hvtop remote data collection agent to peer node(s) on TCP/{options.RdcPort}");
+        }
+
+        var targetSummary = wanted.Length == 0 ? "(none)" : string.Join(", ", wanted);
+        if (!targetSummary.Equals(lastTargetSummary, StringComparison.OrdinalIgnoreCase))
+        {
+            lastTargetSummary = targetSummary;
+            Enqueue("INFO", $"RDC target nodes: {targetSummary}");
+        }
+
+        lock (gate)
+        {
+            foreach (var node in wanted)
+            {
+                if (sessions.ContainsKey(node))
+                    continue;
+
+                var session = new RemoteNodeSession(node);
+                sessions[node] = session;
+                Enqueue("INFO", $"RDC {node}: scheduling remote collector deployment");
+                session.Worker = Task.Run(() => RunNodeAsync(session));
+            }
+
+            foreach (var node in sessions.Keys.Except(wanted, StringComparer.OrdinalIgnoreCase).ToArray())
+            {
+                Enqueue("INFO", $"RDC {node}: node no longer targeted, stopping remote collector");
+                sessions[node].Cancel();
+                sessions.Remove(node);
+            }
+        }
+    }
+
+    public RemoteSnapshot[] ReadSnapshots()
+    {
+        lock (gate)
+        {
+            return sessions.Values
+                .Where(s => s.Latest is not null)
+                .Select(s => new RemoteSnapshot(s.NodeName, s.Latest!))
+                .ToArray();
+        }
+    }
+
+    public EventRow[] DrainEvents()
+    {
+        var result = new List<EventRow>();
+        while (events.TryDequeue(out var evt))
+            result.Add(evt);
+        return result.ToArray();
+    }
+
+    public static HostRow[] MergeHosts(HostRow[] local, RemoteSnapshot[] remote)
+    {
+        var rows = local.ToDictionary(h => h.Name, h => h, StringComparer.OrdinalIgnoreCase);
+        foreach (var item in remote)
+        {
+            var host = item.Snapshot.Hosts.FirstOrDefault(h => h.Name.Equals(item.NodeName, StringComparison.OrdinalIgnoreCase))
+                       ?? item.Snapshot.Hosts.FirstOrDefault(h => !double.IsNaN(h.Cpu.Current))
+                       ?? item.Snapshot.Hosts.FirstOrDefault();
+            if (host is not null)
+                rows[host.Name] = host;
+        }
+
+        return rows.Values.OrderBy(h => h.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    public static VmRow[] MergeVms(VmRow[] local, RemoteSnapshot[] remote)
+    {
+        return local
+            .Concat(remote.SelectMany(r => r.Snapshot.Vms))
+            .Where(vm => !string.IsNullOrWhiteSpace(vm.Name))
+            .GroupBy(vm => $"{vm.HostName}\0{vm.Name}", StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.Last())
+            .OrderBy(vm => vm.Name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private async Task RunNodeAsync(RemoteNodeSession session)
+    {
+        while (!session.Cts.IsCancellationRequested)
+        {
+            try
+            {
+                if (!session.Deployed)
+                {
+                    SetState(session, "deploying");
+                    DeployAndStart(session);
+                    session.Deployed = true;
+                    session.DeployedAt = DateTime.UtcNow;
+                    session.RedeployRequested = false;
+                    SetState(session, "started");
+                }
+
+                var snapshot = await PollAsync(session).ConfigureAwait(false);
+                lock (gate)
+                    session.Latest = snapshot;
+                session.PollFailures = 0;
+                session.FirstDataAt ??= DateTime.UtcNow;
+                session.LastDataAt = DateTime.UtcNow;
+                SetState(session, "connected");
+            }
+            catch (HttpRequestException ex)
+            {
+                session.PollFailures++;
+                session.PollEndpoint = null;
+                var tcpProbe = await TcpProbeAsync(session.PollHost ?? session.NodeName, options.RdcPort, session.Cts.Token).ConfigureAwait(false);
+                SetState(session, "poll-error", $"HTTP poll failed ({session.PollFailures}): {Trim(ex.Message, 100)}; TCP probe {tcpProbe}");
+                MaybeScheduleRedeploy(session);
+            }
+            catch (TaskCanceledException ex) when (!session.Cts.IsCancellationRequested)
+            {
+                session.PollFailures++;
+                session.PollEndpoint = null;
+                var tcpProbe = await TcpProbeAsync(session.PollHost ?? session.NodeName, options.RdcPort, session.Cts.Token).ConfigureAwait(false);
+                SetState(session, "poll-error", $"HTTP poll timed out ({session.PollFailures}): {Trim(ex.Message, 100)}; TCP probe {tcpProbe}");
+                MaybeScheduleRedeploy(session);
+            }
+            catch (Exception ex)
+            {
+                SetState(session, "error", $"deploy/start failed: {Trim(ex.Message, 120)}");
+                session.Deployed = false;
+            }
+
+            try
+            {
+                await Task.Delay(options.RemoteRefresh, session.Cts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+    }
+
+    private void MaybeScheduleRedeploy(RemoteNodeSession session)
+    {
+        if (session.FirstDataAt is not null || session.RedeployRequested)
+            return;
+
+        var age = DateTime.UtcNow - session.DeployedAt;
+        if (age < NoDataRedeployAfter)
+            return;
+
+        session.RedeployRequested = true;
+        session.Deployed = false;
+        session.PollingLogged = false;
+        session.PollFailures = 0;
+        Enqueue("WARN", $"RDC {session.NodeName}: deployed but no data received for {NoDataRedeployAfter.TotalMinutes:N0} minutes; redeploying remote collector");
+    }
+
+    private void DeployAndStart(RemoteNodeSession session)
+    {
+        var localExe = Path.Combine(AppContext.BaseDirectory, "hvtop-rdc.exe");
+        if (!File.Exists(localExe))
+            throw new FileNotFoundException("hvtop-rdc.exe not found next to hvtop.exe", localExe);
+
+        var remoteShareDir = $@"\\{session.NodeName}\ADMIN$\{RemoteInstallRelative}";
+        SetState(session, "stopping");
+        StopRemoteProcess(session.NodeName);
+
+        SetState(session, "copying");
+        Directory.CreateDirectory(remoteShareDir);
+        CopyRemoteCollector(localExe, Path.Combine(remoteShareDir, "hvtop-rdc.exe"), session.NodeName);
+
+        var refresh = options.RemoteRefresh.TotalSeconds.ToString("0.###", CultureInfo.InvariantCulture);
+        var history = options.History.TotalMinutes.ToString("0.###", CultureInfo.InvariantCulture);
+        var logging = options.DebugLog ? " --debug-log" : string.Empty;
+        var commandLine = $"\"{RemoteExePath}\" --port {options.RdcPort} --refresh {refresh} --history {history} --token {token}{logging}";
+        var script =
+            "$ErrorActionPreference='Stop'; " +
+            $"$node={PsSingle(session.NodeName)}; $cmd={PsSingle(commandLine)}; " +
+            "Invoke-CimMethod -ComputerName $node -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=$cmd} | Out-Null";
+
+        SetState(session, "starting");
+        if (!PowerShellRunner.TryRun(script, 10000, out _, out var error, out var exitCode, out var timedOut))
+            throw new InvalidOperationException(timedOut ? "remote process start timed out" : $"remote process start failed exit={exitCode}: {Trim(error, 100)}");
+    }
+
+    private void StopRemoteProcess(string nodeName)
+    {
+        var script =
+            "$ErrorActionPreference='SilentlyContinue'; " +
+            $"$node={PsSingle(nodeName)}; " +
+            "Get-CimInstance -ComputerName $node -ClassName Win32_Process -Filter \"Name='hvtop-rdc.exe'\" | Invoke-CimMethod -MethodName Terminate | Out-Null";
+        PowerShellRunner.TryRun(script, 7000, out _);
+        Thread.Sleep(500);
+    }
+
+    private void CopyRemoteCollector(string source, string destination, string nodeName)
+    {
+        try
+        {
+            File.Copy(source, destination, overwrite: true);
+            return;
+        }
+        catch (IOException ex)
+        {
+            Enqueue("WARN", $"RDC {nodeName}: remote collector exe was locked, stopping old agent and retrying copy");
+            StopRemoteProcess(nodeName);
+            Thread.Sleep(1000);
+            try
+            {
+                File.Copy(source, destination, overwrite: true);
+                return;
+            }
+            catch (IOException)
+            {
+                throw new IOException($"copy failed after stopping old agent: {ex.Message}");
+            }
+        }
+    }
+
+    private async Task<Snapshot> PollAsync(RemoteNodeSession session)
+    {
+        var uri = await ResolvePollEndpointAsync(session).ConfigureAwait(false);
+        if (!session.PollingLogged)
+        {
+            session.PollingLogged = true;
+            Enqueue("INFO", $"RDC {session.NodeName}: polling {uri} with direct HTTP proxy=off");
+        }
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+        request.Headers.TryAddWithoutValidation("X-Hvtop-Token", token);
+        using var response = await http.SendAsync(request, session.Cts.Token).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+        await using var stream = await response.Content.ReadAsStreamAsync(session.Cts.Token).ConfigureAwait(false);
+        return await JsonSerializer.DeserializeAsync(stream, HvtopJsonContext.Default.Snapshot, session.Cts.Token).ConfigureAwait(false)
+               ?? throw new InvalidOperationException("remote snapshot was empty");
+    }
+
+    private async Task<string> ResolvePollEndpointAsync(RemoteNodeSession session)
+    {
+        if (!string.IsNullOrWhiteSpace(session.PollEndpoint))
+            return session.PollEndpoint;
+
+        IPAddress[] addresses;
+        try
+        {
+            addresses = await Dns.GetHostAddressesAsync(session.NodeName, session.Cts.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Enqueue("WARN", $"RDC {session.NodeName}: DNS resolution failed: {Trim(ex.Message, 120)}");
+            addresses = [];
+        }
+        var ordered = addresses
+            .OrderBy(a => a.AddressFamily == AddressFamily.InterNetwork ? 0 : 1)
+            .ThenBy(a => a.ToString(), StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var summary = ordered.Length == 0 ? "(none)" : string.Join(", ", ordered.Select(a => a.ToString()));
+        Enqueue("INFO", $"RDC {session.NodeName}: resolved addresses {summary}");
+
+        foreach (var address in ordered)
+        {
+            var probeHost = address.ToString();
+            var uriHost = FormatUriHost(address);
+            var probe = await TcpProbeAsync(probeHost, options.RdcPort, session.Cts.Token).ConfigureAwait(false);
+            Enqueue("INFO", $"RDC {session.NodeName}: TCP probe {uriHost}:{options.RdcPort} {probe}");
+            if (!probe.Equals("connect OK", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            session.PollHost = probeHost;
+            session.PollEndpoint = $"http://{uriHost}:{options.RdcPort}/snapshot";
+            session.PollingLogged = false;
+            return session.PollEndpoint;
+        }
+
+        session.PollHost = session.NodeName;
+        session.PollEndpoint = $"http://{session.NodeName}:{options.RdcPort}/snapshot";
+        session.PollingLogged = false;
+        return session.PollEndpoint;
+    }
+
+    private static string FormatUriHost(IPAddress address)
+        => address.AddressFamily == AddressFamily.InterNetworkV6 ? $"[{address}]" : address.ToString();
+
+    private static async Task<string> TcpProbeAsync(string host, int port, CancellationToken token)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+        timeout.CancelAfter(TimeSpan.FromSeconds(2));
+        try
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync(host, port, timeout.Token).ConfigureAwait(false);
+            return "connect OK";
+        }
+        catch (OperationCanceledException) when (!token.IsCancellationRequested)
+        {
+            return "connect timeout";
+        }
+        catch (Exception ex)
+        {
+            return $"connect failed: {Trim(ex.Message, 80)}";
+        }
+    }
+
+    private void SetState(RemoteNodeSession session, string state, string detail = "")
+    {
+        if (session.LastState == state && string.IsNullOrWhiteSpace(detail))
+            return;
+
+        session.LastState = state;
+        var severity = state == "error" ? "WARN" : "INFO";
+        var message = state switch
+        {
+            "deploying" => $"RDC {session.NodeName}: deploying hvtop-rdc",
+            "stopping" => $"RDC {session.NodeName}: stopping old hvtop-rdc process if present",
+            "copying" => $"RDC {session.NodeName}: copying hvtop-rdc.exe via ADMIN$",
+            "starting" => $"RDC {session.NodeName}: starting remote collector",
+            "started" => $"RDC {session.NodeName}: deployed hvtop-rdc on TCP/{options.RdcPort}",
+            "connected" => $"RDC {session.NodeName}: connected, polling every {options.RemoteRefresh.TotalSeconds:N0}s",
+            "poll-error" => $"RDC {session.NodeName}: {detail}; keeping remote collector running",
+            _ => $"RDC {session.NodeName}: {detail}"
+        };
+        Enqueue(severity, message);
+    }
+
+    private void Enqueue(string severity, string message)
+    {
+        RdcLog.Info($"{severity} {message}");
+        events.Enqueue(new EventRow(DateTime.Now, severity, message));
+    }
+
+    private static string PsSingle(string value) => "'" + value.Replace("'", "''") + "'";
+
+    private static string Trim(string value, int max)
+    {
+        value = (value ?? string.Empty).Trim();
+        return value.Length <= max ? value : value[..max];
+    }
+
+    public void Dispose()
+    {
+        RemoteNodeSession[] copy;
+        lock (gate)
+            copy = sessions.Values.ToArray();
+
+        foreach (var session in copy)
+        {
+            session.Cancel();
+            try
+            {
+                var stopHost = session.PollHost ?? session.NodeName;
+                using var stop = new HttpRequestMessage(HttpMethod.Get, $"http://{stopHost}:{options.RdcPort}/stop");
+                stop.Headers.TryAddWithoutValidation("X-Hvtop-Token", token);
+                http.Send(stop);
+                Enqueue("INFO", $"RDC {session.NodeName}: stop requested, preserving remote log at \\\\{session.NodeName}\\ADMIN$\\{RemoteInstallRelative}\\hvtop-rdc.log");
+            }
+            catch
+            {
+                Enqueue("WARN", $"RDC {session.NodeName}: stop request failed, preserving remote log at \\\\{session.NodeName}\\ADMIN$\\{RemoteInstallRelative}\\hvtop-rdc.log");
+            }
+
+            try
+            {
+                File.Delete($@"\\{session.NodeName}\ADMIN$\{RemoteInstallRelative}\hvtop-rdc.exe");
+            }
+            catch
+            {
+            }
+        }
+
+        http.Dispose();
+    }
+
+    private sealed class RemoteNodeSession
+    {
+        public RemoteNodeSession(string nodeName) => NodeName = nodeName;
+        public string NodeName { get; }
+        public CancellationTokenSource Cts { get; } = new();
+        public Task? Worker { get; set; }
+        public Snapshot? Latest { get; set; }
+        public bool Deployed { get; set; }
+        public DateTime DeployedAt { get; set; } = DateTime.UtcNow;
+        public DateTime? FirstDataAt { get; set; }
+        public DateTime? LastDataAt { get; set; }
+        public bool PollingLogged { get; set; }
+        public bool RedeployRequested { get; set; }
+        public int PollFailures { get; set; }
+        public string? PollHost { get; set; }
+        public string? PollEndpoint { get; set; }
+        public string LastState { get; set; } = string.Empty;
+        public void Cancel()
+        {
+            try { Cts.Cancel(); } catch { }
+        }
+    }
+}
+
+internal sealed record RemoteSnapshot(string NodeName, Snapshot Snapshot);
 
 internal sealed class HyperVVmSampler
 {
@@ -2485,6 +3489,7 @@ internal static partial class Native
     public const uint IF_TYPE_SOFTWARE_LOOPBACK = 24;
     public const uint IF_TYPE_IEEE80211 = 71;
     public const byte IF_HARDWARE_INTERFACE = 0x01;
+    private const ushort ALL_PROCESSOR_GROUPS = 0xFFFF;
     private const int PDH_MORE_DATA = unchecked((int)0x800007D2);
 
     [LibraryImport("pdh.dll", EntryPoint = "PdhOpenQueryW", StringMarshalling = StringMarshalling.Utf16)]
@@ -2526,6 +3531,24 @@ internal static partial class Native
     [LibraryImport("kernel32.dll", EntryPoint = "GetDiskFreeSpaceExW", StringMarshalling = StringMarshalling.Utf16, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool GetDiskFreeSpaceEx(string directoryName, out ulong freeBytesAvailable, out ulong totalNumberOfBytes, out ulong totalNumberOfFreeBytes);
+
+    [LibraryImport("kernel32.dll")]
+    private static partial uint GetActiveProcessorCount(ushort groupNumber);
+
+    public static int GetActiveLogicalProcessorCount()
+    {
+        try
+        {
+            var count = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+            if (count > 0 && count <= int.MaxValue)
+                return (int)count;
+        }
+        catch
+        {
+        }
+
+        return Environment.ProcessorCount;
+    }
 
     public static ulong GetPhysicalMemoryBytes()
     {
