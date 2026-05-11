@@ -38,7 +38,7 @@ dotnet run -- --smoke
 --refresh <seconds>        Local UI/data refresh interval. Default: 1
 --history <minutes>        History window for max/min values. Default: 15
 --rdc-port <n>             Remote Data Collector TCP port. Default: 54321
---rdc-refresh <seconds>    Remote Data Collector interval. Default: 5
+--rdc-refresh <seconds>    Remote Data Collector interval. Default: 1
 --rdc-disable              Disable remote data collection on cluster peers.
 --debug-log                Write hvtop.log; also enables remote hvtop-rdc.log.
 --smoke                    Print one sample and exit.
@@ -51,7 +51,7 @@ dotnet run -- --smoke
 ```text
 --port <n>                 Listen TCP port. Default: 54321
 --listen <prefix>          HTTP listener prefix. Default: http://+:<port>/
---refresh <seconds>        Collection interval. Default: 5
+--refresh <seconds>        Collection interval. Default: 1
 --history <minutes>        History window. Default: 15
 --token <value>            Required token for incoming requests.
 --debug-log                Write hvtop-rdc.log beside the executable.
@@ -89,11 +89,15 @@ panes remain useful on standard Windows servers.
 The intended navigation path is:
 
 ```text
-CLUSTER -> HOSTS -> select host -> VMs on that host -> select VM -> VM detail
+CLUSTER -> HOSTS -> select host -> host detail -> select VM -> VM detail
 ```
 
 On non-cluster hosts, the flow starts at `HOSTS`. On standard Windows servers
 without Hyper-V, the VM pane is expected to be empty.
+
+The top-level `VMs`, `CSV/storage`, and `Network` panes are global views. In
+cluster/RDC mode they include rows from all reporting hosts and show a `HOST`
+column so the source node is visible.
 
 Detail panes resolve the selected row from the latest snapshot on every repaint,
 so values continue updating live while you are drilled in.
@@ -102,9 +106,9 @@ so values continue updating live while you are drilled in.
 
 - Clusters: cluster name, number of nodes, nodes in UP status, owner node
 - Hosts: hostname, version, uptime, CPU, memory, I/O, network, status
-- VMs: name, version, uptime, CPU, memory, I/O, network, status
-- CSV/storage: name, free space, I/O, IOPS, queue depth, latency, status
-- Network: vSwitch or adapter, link, throughput, receive, transmit, drops, status
+- VMs: host, name, version, uptime, CPU, memory, I/O, network, status
+- CSV/storage: host, name, free space, I/O, IOPS, queue depth, latency, status
+- Network: host, vSwitch or adapter, link, throughput, receive, transmit, drops, status
 - Events: timestamped status, spike, and collector events
 
 Each metric shows current and max-in-history values as `current | max`. The history

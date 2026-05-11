@@ -14,7 +14,7 @@ namespace hvtop.Native;
 internal static class Program
 {
 #if RDC
-    public const string DisplayVersion = "0.5.0-rdc+20260510.0114";
+    public const string DisplayVersion = "0.5.1-rdc+20260511.0011";
     public const string AppName = "hvtop-rdc";
 
     public static async Task<int> Main(string[] args)
@@ -187,7 +187,7 @@ internal static class Program
     }
 
 #else
-    public const string DisplayVersion = "0.5.0+20260510.0114";
+    public const string DisplayVersion = "0.5.1+20260511.0011";
     public const string AppName = "hvtop";
 
     public static async Task<int> Main(string[] args)
@@ -219,9 +219,9 @@ internal static class Program
             foreach (var host in snapshot.Hosts)
                 Console.WriteLine($"HOST {host.Name} VER {host.Version} CPU {FormatSmoke(host.Cpu)} | {FormatSmokeMax(host.Cpu)} | ({host.CpuCapacity}) MEM {FormatSmoke(host.Mem)} | {FormatSmokeMax(host.Mem)} | ({host.MemCapacity}) IO {FormatSmoke(host.Io)} NET {FormatSmoke(host.Net)} STA {host.Status}");
             foreach (var disk in snapshot.Disks.Take(5))
-                Console.WriteLine($"DISK {disk.Name} SIZE {disk.Size} FREE {FormatSmoke(disk.Free)} IO {FormatSmoke(disk.Io)} IOPS {FormatSmoke(disk.Iops)} QD {FormatSmoke(disk.QueueDepth)} LAT {FormatSmoke(disk.Latency)} STA {disk.Status}");
+                Console.WriteLine($"DISK {disk.HostName} {disk.Name} SIZE {disk.Size} FREE {FormatSmoke(disk.Free)} IO {FormatSmoke(disk.Io)} IOPS {FormatSmoke(disk.Iops)} QD {FormatSmoke(disk.QueueDepth)} LAT {FormatSmoke(disk.Latency)} STA {disk.Status}");
             foreach (var net in snapshot.Networks.Take(5))
-                Console.WriteLine($"NET  {net.Name} THR {FormatSmoke(net.Throughput)} RX {FormatSmoke(net.Rx)} TX {FormatSmoke(net.Tx)} STA {net.Status}");
+                Console.WriteLine($"NET  {net.HostName} {net.Name} THR {FormatSmoke(net.Throughput)} RX {FormatSmoke(net.Rx)} TX {FormatSmoke(net.Tx)} STA {net.Status}");
             return 0;
         }
 
@@ -471,7 +471,7 @@ internal sealed record RdcOptions(TimeSpan Refresh, TimeSpan History, int Port, 
         Options:
           --port <n>            Listen TCP port. Default: 54321
           --listen <prefix>     HTTP listener prefix. Default: http://+:<port>/
-          --refresh <seconds>   Collection interval. Default: 5
+          --refresh <seconds>   Collection interval. Default: 1
           --history <minutes>   History window. Default: 15
           --token <value>       Required token for incoming requests.
           --debug-log           Write hvtop-rdc.log beside the executable.
@@ -481,7 +481,7 @@ internal sealed record RdcOptions(TimeSpan Refresh, TimeSpan History, int Port, 
 
     public static RdcOptions Parse(string[] args)
     {
-        var refresh = TimeSpan.FromSeconds(5);
+        var refresh = TimeSpan.FromSeconds(1);
         var history = TimeSpan.FromMinutes(15);
         var port = 54321;
         string? listen = null;
@@ -559,7 +559,7 @@ internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, b
           --refresh <seconds>        Local UI/data refresh interval. Default: 1
           --history <minutes>        History window for max/min values. Default: 15
           --rdc-port <n>             Remote Data Collector TCP port. Default: 54321
-          --rdc-refresh <seconds>    Remote Data Collector interval. Default: 5
+          --rdc-refresh <seconds>    Remote Data Collector interval. Default: 1
           --rdc-disable              Disable remote data collection on cluster peers.
           --debug-log                Write hvtop.log; also enables remote hvtop-rdc.log.
           --smoke                    Print one sample and exit.
@@ -574,7 +574,7 @@ internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, b
         var smoke = false;
         var remoteCollectors = true;
         var rdcPort = 54321;
-        var remoteRefresh = TimeSpan.FromSeconds(5);
+        var remoteRefresh = TimeSpan.FromSeconds(1);
         var debugLog = false;
         var showHelp = false;
         var showVersion = false;
@@ -871,6 +871,7 @@ internal sealed class Collector : IDisposable
                 var diskQueueDepth = LogicalDiskSampler.QueueDepth(storage.CounterKey);
                 var diskLatencyMs = LogicalDiskSampler.LatencyMs(storage.CounterKey);
                 var row = new DiskRow(
+                    host.Name,
                     storage.DisplayName,
                     CapacityFormatter.FormatCapacity(storage.TotalBytes),
                     CapacityFormatter.FormatCapacity(storage.TotalBytes - storage.FreeBytes),
@@ -893,6 +894,7 @@ internal sealed class Collector : IDisposable
             .Select(a =>
             {
                 var row = new NetworkRow(
+                    host.Name,
                     a.Name,
                     a.Description,
                     NetworkLinkFormatter.Format(a.LinkSpeedBitsPerSecond, a.IsUp),
@@ -902,7 +904,12 @@ internal sealed class Collector : IDisposable
                     Metric.Mbps(a.ReceivedBytesPerSecond / 1024 / 1024),
                     Metric.Mbps(a.SentBytesPerSecond / 1024 / 1024),
                     Metric.Plain(a.DropsPerSecond),
-                    Status.FromNetwork(a.TotalBytesPerSecond, a.LinkSpeedBitsPerSecond, a.IsUp));
+                    Status.FromNetwork(a.TotalBytesPerSecond, a.LinkSpeedBitsPerSecond, a.IsUp),
+                    a.PdhInstance,
+                    a.RawReceivedBytesPerSecond,
+                    a.RawSentBytesPerSecond,
+                    a.PdhReceivedBytesPerSecond,
+                    a.PdhSentBytesPerSecond);
                 return row;
             })
             .ToArray();
@@ -922,11 +929,13 @@ internal sealed class Collector : IDisposable
 
         var networkSwitches = topology.IsRefreshing && vmTopologyResult.Switches.Length == 0
             ? []
-            : BuildNetworkSwitches(adapters, vmTopologyResult.Switches);
+            : BuildNetworkSwitches(host.Name, adapters, vmTopologyResult.Switches);
         MaybeLogNetworkDiagnostics(refreshRequested, adapterRates, adapters, vmTopologyResult.Switches);
         var discovery = BuildDiscoveryProgress(host, vms, disks, adapters, networkSwitches);
         MaybeLogDiscoveryProgress(discovery, host, vms, disks, adapters, networkSwitches);
-        var liveTopology = EnrichTopologyWithLiveStats(vmTopologyResult.Topology);
+        var liveTopology = EnrichTopologyWithLiveStats(vmTopologyResult.Topology)
+            .Select(t => t with { HostName = host.Name })
+            .ToArray();
         if (liveTopology.Length > 0)
         {
             var mergedTopology = MergeVmTotalsIntoTopology(vms, liveTopology);
@@ -938,25 +947,25 @@ internal sealed class Collector : IDisposable
             };
             host = history.Apply("host:" + host.Name, host);
             hosts = BuildHosts(host, clusterResult.Nodes);
-            disks = disks.Select(d => history.Apply("disk:" + d.Name, d)).ToArray();
-            networkSwitches = networkSwitches.Select(n => history.Apply("vswitch:" + n.Name, n)).ToArray();
-            adapters = adapters.Select(n => history.Apply("net:" + n.Name, n)).ToArray();
-            MergeRemoteTelemetry(ref hosts, ref vms);
+            disks = disks.Select(d => history.Apply("disk:" + d.HostName + ":" + d.Name, d)).ToArray();
+            networkSwitches = networkSwitches.Select(n => history.Apply("vswitch:" + n.HostName + ":" + n.Name, n)).ToArray();
+            adapters = adapters.Select(n => history.Apply("net:" + n.HostName + ":" + n.Name, n)).ToArray();
+            MergeRemoteTelemetry(ref hosts, ref vms, ref disks, ref networkSwitches, ref adapters, ref mergedTopology);
             MaybeAddSpikeEvent(host, disks);
             return new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, networkSwitches, adapters, events, mergedTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery);
         }
 
         host = history.Apply("host:" + host.Name, host);
         hosts = BuildHosts(host, clusterResult.Nodes);
-        disks = disks.Select(d => history.Apply("disk:" + d.Name, d)).ToArray();
-        networkSwitches = networkSwitches.Select(n => history.Apply("vswitch:" + n.Name, n)).ToArray();
-        adapters = adapters.Select(n => history.Apply("net:" + n.Name, n)).ToArray();
-        MergeRemoteTelemetry(ref hosts, ref vms);
+        disks = disks.Select(d => history.Apply("disk:" + d.HostName + ":" + d.Name, d)).ToArray();
+        networkSwitches = networkSwitches.Select(n => history.Apply("vswitch:" + n.HostName + ":" + n.Name, n)).ToArray();
+        adapters = adapters.Select(n => history.Apply("net:" + n.HostName + ":" + n.Name, n)).ToArray();
+        MergeRemoteTelemetry(ref hosts, ref vms, ref disks, ref networkSwitches, ref adapters, ref liveTopology);
         MaybeAddSpikeEvent(host, disks);
         return new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, networkSwitches, adapters, events, liveTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery);
     }
 
-    private void MergeRemoteTelemetry(ref HostRow[] hosts, ref VmRow[] vms)
+    private void MergeRemoteTelemetry(ref HostRow[] hosts, ref VmRow[] vms, ref DiskRow[] disks, ref NetworkSwitchRow[] networkSwitches, ref NetworkRow[] networks, ref VmTopologyRow[] topology)
     {
         foreach (var evt in remote.DrainEvents())
             AddEvent(evt.Severity, evt.Message);
@@ -967,6 +976,10 @@ internal sealed class Collector : IDisposable
 
         hosts = RemoteCollectorManager.MergeHosts(hosts, snapshots);
         vms = RemoteCollectorManager.MergeVms(vms, snapshots);
+        disks = RemoteCollectorManager.MergeDisks(disks, snapshots);
+        networkSwitches = RemoteCollectorManager.MergeNetworkSwitches(networkSwitches, snapshots);
+        networks = RemoteCollectorManager.MergeNetworks(networks, snapshots);
+        topology = RemoteCollectorManager.MergeTopology(topology, snapshots);
     }
 
     private static HostRow[] BuildHosts(HostRow localHost, ClusterNodeRow[] clusterNodes)
@@ -1004,18 +1017,24 @@ internal sealed class Collector : IDisposable
         return metricStatus;
     }
 
-    private static NetworkSwitchRow[] BuildNetworkSwitches(NetworkRow[] adapters, NetworkSwitchTopologyRow[] switches)
+    private static NetworkSwitchRow[] BuildNetworkSwitches(string hostName, NetworkRow[] adapters, NetworkSwitchTopologyRow[] switches)
     {
+        var hyperVSwitchRates = HyperVNetworkPdhSampler.ReadSwitchRates();
         var switchRows = switches.Length > 0
             ? switches
-            : adapters.Select(adapter => new NetworkSwitchTopologyRow(adapter.Name, "Adapter", [new NetworkUplinkInfo(adapter.Name, adapter.Description, adapter.Link, adapter.IsUp, adapter.LinkSpeedBitsPerSecond)])).ToArray();
+            : hyperVSwitchRates.Count > 0
+                ? hyperVSwitchRates.Keys
+                    .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+                    .Select(name => new NetworkSwitchTopologyRow(name, "Switch", [], string.Empty))
+                    .ToArray()
+            : adapters.Select(adapter => new NetworkSwitchTopologyRow(adapter.Name, "Adapter", [new NetworkUplinkInfo(adapter.Name, adapter.Description, adapter.Link, adapter.IsUp, adapter.LinkSpeedBitsPerSecond)], string.Empty)).ToArray();
 
         return switchRows
             .OrderBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
             .Select(switchRow =>
             {
                 var uplinks = switchRow.Uplinks
-                    .Select(uplink => NetworkTopologyMatcher.MergeWithLive(adapters, uplink))
+                    .Select(uplink => NetworkTopologyMatcher.MergeWithLive(adapters, uplink, hostName))
                     .Where(adapter => adapter is not null)
                     .Cast<NetworkRow>()
                     .DistinctBy(adapter => adapter.Name, StringComparer.OrdinalIgnoreCase)
@@ -1024,6 +1043,14 @@ internal sealed class Collector : IDisposable
                 var throughput = uplinks.Sum(a => a.Throughput.Current);
                 var rx = uplinks.Sum(a => a.Rx.Current);
                 var tx = uplinks.Sum(a => a.Tx.Current);
+                if (hyperVSwitchRates.TryGetValue(switchRow.Name, out var switchRate))
+                {
+                    var switchRx = switchRate.ReceivedBytesPerSecond / 1024d / 1024d;
+                    var switchTx = switchRate.SentBytesPerSecond / 1024d / 1024d;
+                    rx = Math.Max(rx, switchRx);
+                    tx = Math.Max(tx, switchTx);
+                    throughput = Math.Max(throughput, switchRx + switchTx);
+                }
                 var drops = uplinks.Sum(a => a.Drops.Current);
                 var linkSpeedBitsPerSecond = uplinks.Length > 0
                     ? uplinks.Where(a => a.IsUp).Sum(a => Math.Max(0L, a.LinkSpeedBitsPerSecond))
@@ -1035,8 +1062,10 @@ internal sealed class Collector : IDisposable
                     : Status.FromNetwork(throughput * 1024d * 1024d, linkSpeedBitsPerSecond, true);
 
                 return new NetworkSwitchRow(
+                    hostName,
                     switchRow.Name,
                     switchRow.SwitchType,
+                    switchRow.TeamMode,
                     switchRow.Uplinks,
                     SummarizeLink(switchRow.Uplinks, uplinks),
                     Metric.Mbps(throughput),
@@ -1076,10 +1105,10 @@ internal sealed class Collector : IDisposable
 
     private static VmRow[] ApplyTopologyFallback(VmRow[] vms, VmTopologyRow[] topology)
     {
-        var topologyMap = topology.ToDictionary(t => t.VmName, StringComparer.OrdinalIgnoreCase);
+        var topologyMap = topology.ToDictionary(t => $"{t.HostName}\0{t.VmName}", StringComparer.OrdinalIgnoreCase);
         return vms.Select(vm =>
         {
-            if (!topologyMap.TryGetValue(vm.Name, out var topo) || topo.Disks.Length == 0)
+            if (!topologyMap.TryGetValue($"{vm.HostName}\0{vm.Name}", out var topo) || topo.Disks.Length == 0)
                 return vm;
 
             var io = topo.Disks.Sum(d => d.ReadMbps + d.WriteMbps);
@@ -1094,10 +1123,10 @@ internal sealed class Collector : IDisposable
 
     private static VmTopologyRow[] MergeVmTotalsIntoTopology(VmRow[] vms, VmTopologyRow[] topology)
     {
-        var vmMap = vms.ToDictionary(v => v.Name, StringComparer.OrdinalIgnoreCase);
+        var vmMap = vms.ToDictionary(v => $"{v.HostName}\0{v.Name}", StringComparer.OrdinalIgnoreCase);
         return topology.Select(vm =>
         {
-            if (!vmMap.TryGetValue(vm.VmName, out var liveVm) || vm.Disks.Length == 0)
+            if (!vmMap.TryGetValue($"{vm.HostName}\0{vm.VmName}", out var liveVm) || vm.Disks.Length == 0)
                 return vm;
 
             var diskIo = vm.Disks.Sum(d => d.ReadMbps + d.WriteMbps);
@@ -1164,20 +1193,20 @@ internal sealed class Collector : IDisposable
     private DiskRow[] ApplyVmDiskLoadToStorage(DiskRow[] disks, VmTopologyRow[] topology)
     {
         var byStorage = topology
-            .SelectMany(vm => vm.Disks)
-            .GroupBy(d => d.StorageName, StringComparer.OrdinalIgnoreCase)
+            .SelectMany(vm => vm.Disks.Select(disk => new { vm.HostName, Disk = disk }))
+            .GroupBy(d => $"{d.HostName}\0{d.Disk.StorageName}", StringComparer.OrdinalIgnoreCase)
             .ToDictionary(
                 g => g.Key,
                 g => new
                 {
-                    Io = g.Sum(d => d.ReadMbps + d.WriteMbps),
-                    Iops = g.Sum(d => d.ReadIops + d.WriteIops)
+                    Io = g.Sum(d => d.Disk.ReadMbps + d.Disk.WriteMbps),
+                    Iops = g.Sum(d => d.Disk.ReadIops + d.Disk.WriteIops)
                 },
                 StringComparer.OrdinalIgnoreCase);
 
         return disks.Select(disk =>
         {
-            if (!byStorage.TryGetValue(disk.Name, out var totals))
+            if (!byStorage.TryGetValue($"{disk.HostName}\0{disk.Name}", out var totals))
                 return disk;
 
             var ioCurrent = Math.Max(disk.Io.Current, totals.Io);
@@ -1292,7 +1321,30 @@ internal sealed class Collector : IDisposable
         var hardware = adapterRates.Where(a => a.IsVisibleAdapter).ToArray();
         var upHardware = hardware.Count(a => a.IsUp);
         var totalHardwareMbps = hardware.Sum(a => a.TotalBytesPerSecond) / 1024d / 1024d;
-        AddEvent("INFO", $"NETDIAG live={adapterRates.Length} visible={hardware.Length} up={upHardware} sw={switches.Length} throughput={totalHardwareMbps:0.00} MB/s");
+        var pdhRates = NetworkPdhSampler.LastRates;
+        var pdhMatched = adapterRates.Count(a => !string.IsNullOrWhiteSpace(a.PdhInstance));
+        AddEvent("INFO", $"NETDIAG live={adapterRates.Length} visible={hardware.Length} up={upHardware} sw={switches.Length} pdh={pdhRates.Length} matched={pdhMatched} throughput={totalHardwareMbps:0.00} MB/s");
+
+        foreach (var pdh in pdhRates
+                     .OrderByDescending(p => p.ReceivedBytesPerSecond + p.SentBytesPerSecond)
+                     .Take(8))
+        {
+            AddEvent(
+                "INFO",
+                $"NETPDH inst='{TrimForEvent(pdh.Instance, 48)}' rx={pdh.ReceivedBytesPerSecond / 1024d / 1024d:0.00} tx={pdh.SentBytesPerSecond / 1024d / 1024d:0.00} MB/s");
+        }
+
+        foreach (var family in HyperVNetworkPdhSampler.Read())
+        {
+            var active = family.Rates.Count(r => r.TotalBytesPerSecond > 0 || r.ReceivedBytesPerSecond > 0 || r.SentBytesPerSecond > 0);
+            AddEvent("INFO", $"NETVSW family='{family.Name}' instances={family.Rates.Length} active={active}");
+            foreach (var rate in family.Rates.OrderByDescending(r => Math.Max(r.TotalBytesPerSecond, r.ReceivedBytesPerSecond + r.SentBytesPerSecond)).Take(6))
+            {
+                AddEvent(
+                    "INFO",
+                    $"NETVSW family='{family.Name}' inst='{TrimForEvent(rate.Instance, 44)}' total={rate.TotalBytesPerSecond / 1024d / 1024d:0.00} rx={rate.ReceivedBytesPerSecond / 1024d / 1024d:0.00} tx={rate.SentBytesPerSecond / 1024d / 1024d:0.00} MB/s");
+            }
+        }
 
         foreach (var adapter in adapterRates
                      .OrderByDescending(a => a.IsHardwareInterface)
@@ -1301,18 +1353,18 @@ internal sealed class Collector : IDisposable
         {
             AddEvent(
                 "INFO",
-                $"NETIF name='{TrimForEvent(adapter.Name, 28)}' desc='{TrimForEvent(adapter.Description, 42)}' guid='{adapter.InterfaceId}' hw={adapter.IsHardwareInterface} visible={adapter.IsVisibleAdapter} up={adapter.IsUp} link={NetworkLinkFormatter.Format(adapter.LinkSpeedBitsPerSecond, adapter.IsUp)} rx={adapter.ReceivedBytesPerSecond / 1024d / 1024d:0.00} tx={adapter.SentBytesPerSecond / 1024d / 1024d:0.00} MB/s");
+                $"NETIF name='{TrimForEvent(adapter.Name, 28)}' desc='{TrimForEvent(adapter.Description, 42)}' guid='{adapter.InterfaceId}' hw={adapter.IsHardwareInterface} visible={adapter.IsVisibleAdapter} up={adapter.IsUp} link={NetworkLinkFormatter.Format(adapter.LinkSpeedBitsPerSecond, adapter.IsUp)} rx={adapter.ReceivedBytesPerSecond / 1024d / 1024d:0.00} tx={adapter.SentBytesPerSecond / 1024d / 1024d:0.00} rawRx={adapter.RawReceivedBytesPerSecond / 1024d / 1024d:0.00} rawTx={adapter.RawSentBytesPerSecond / 1024d / 1024d:0.00} pdh='{TrimForEvent(adapter.PdhInstance, 32)}' pdhRx={adapter.PdhReceivedBytesPerSecond / 1024d / 1024d:0.00} pdhTx={adapter.PdhSentBytesPerSecond / 1024d / 1024d:0.00} MB/s");
         }
 
         foreach (var switchRow in switches.Take(4))
         {
-            AddEvent("INFO", $"NETSW '{switchRow.Name}' type={switchRow.SwitchType} uplinks={switchRow.Uplinks.Length}");
+            AddEvent("INFO", $"NETSW '{switchRow.Name}' type={switchRow.SwitchType} team={switchRow.TeamMode} uplinks={switchRow.Uplinks.Length}");
             foreach (var uplink in switchRow.Uplinks.Take(6))
             {
                 var match = NetworkTopologyMatcher.MatchAdapter(adapters, uplink.Name, uplink.Description);
                 AddEvent(
                     match is null ? "WARN" : "INFO",
-                    $"NETMAP sw='{TrimForEvent(switchRow.Name, 18)}' uplink='{TrimForEvent(uplink.Name, 28)}' desc='{TrimForEvent(uplink.Description, 36)}' -> {(match is null ? "NO MATCH" : $"'{TrimForEvent(match.Name, 28)}'")}");
+                    $"NETMAP sw='{TrimForEvent(switchRow.Name, 18)}' uplink='{TrimForEvent(uplink.Name, 28)}' desc='{TrimForEvent(uplink.Description, 36)}' -> {(match is null ? "NO MATCH" : $"'{TrimForEvent(match.Name, 28)}' rx={match.Rx.Current:0.00} tx={match.Tx.Current:0.00} pdh='{TrimForEvent(match.PdhInstance, 28)}'")}");
             }
         }
     }
@@ -1460,6 +1512,54 @@ internal sealed class RemoteCollectorManager : IDisposable
             .GroupBy(vm => $"{vm.HostName}\0{vm.Name}", StringComparer.OrdinalIgnoreCase)
             .Select(g => g.Last())
             .OrderBy(vm => vm.Name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    public static DiskRow[] MergeDisks(DiskRow[] local, RemoteSnapshot[] remote)
+    {
+        return local
+            .Concat(remote.SelectMany(r => r.Snapshot.Disks.Select(d => string.IsNullOrWhiteSpace(d.HostName) ? d with { HostName = r.NodeName } : d)))
+            .Where(disk => !string.IsNullOrWhiteSpace(disk.Name))
+            .GroupBy(disk => $"{disk.HostName}\0{disk.Name}", StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.Last())
+            .OrderBy(disk => disk.HostName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(disk => disk.Name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    public static NetworkSwitchRow[] MergeNetworkSwitches(NetworkSwitchRow[] local, RemoteSnapshot[] remote)
+    {
+        return local
+            .Concat(remote.SelectMany(r => r.Snapshot.NetworkSwitches.Select(n => string.IsNullOrWhiteSpace(n.HostName) ? n with { HostName = r.NodeName } : n)))
+            .Where(network => !string.IsNullOrWhiteSpace(network.Name))
+            .GroupBy(network => $"{network.HostName}\0{network.Name}", StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.Last())
+            .OrderBy(network => network.HostName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(network => network.Name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    public static NetworkRow[] MergeNetworks(NetworkRow[] local, RemoteSnapshot[] remote)
+    {
+        return local
+            .Concat(remote.SelectMany(r => r.Snapshot.Networks.Select(n => string.IsNullOrWhiteSpace(n.HostName) ? n with { HostName = r.NodeName } : n)))
+            .Where(network => !string.IsNullOrWhiteSpace(network.Name))
+            .GroupBy(network => $"{network.HostName}\0{network.Name}", StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.Last())
+            .OrderBy(network => network.HostName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(network => network.Name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    public static VmTopologyRow[] MergeTopology(VmTopologyRow[] local, RemoteSnapshot[] remote)
+    {
+        return local
+            .Concat(remote.SelectMany(r => r.Snapshot.VmTopology.Select(t => string.IsNullOrWhiteSpace(t.HostName) ? t with { HostName = r.NodeName } : t)))
+            .Where(topology => !string.IsNullOrWhiteSpace(topology.VmName))
+            .GroupBy(topology => $"{topology.HostName}\0{topology.VmName}", StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.Last())
+            .OrderBy(topology => topology.HostName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(topology => topology.VmName, StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }
 
@@ -2638,11 +2738,24 @@ internal sealed class HyperVTopology
         const string script = "Import-Module Hyper-V -ErrorAction Stop | Out-Null; " +
             "$netAdapters = @(Get-NetAdapter | Where-Object { $_.HardwareInterface -eq $true } | Select-Object Name,InterfaceDescription,Status,LinkSpeed); " +
             "$switches = @(Get-VMSwitch | ForEach-Object { " +
-            "$sw = $_; $members=@(); " +
-            "try { if (Get-Command Get-NetSwitchTeamMember -ErrorAction SilentlyContinue) { $members = @(Get-NetSwitchTeamMember -Team $sw.Name -ErrorAction Stop | Select-Object -ExpandProperty Name) } } catch { } ; " +
+            "$sw = $_; $members=@(); $teamMode=''; " +
             "$descs=@(); " +
             "if ($sw.PSObject.Properties.Match('NetAdapterInterfaceDescriptions').Count -gt 0) { $descs = @($sw.NetAdapterInterfaceDescriptions) } " +
             "elseif ($sw.PSObject.Properties.Match('NetAdapterInterfaceDescription').Count -gt 0 -and $sw.NetAdapterInterfaceDescription) { $descs = @($sw.NetAdapterInterfaceDescription) } " +
+            "try { if ($sw.PSObject.Properties.Match('EmbeddedTeamingEnabled').Count -gt 0 -and [bool]$sw.EmbeddedTeamingEnabled) { $teamMode='SET' } } catch { } ; " +
+            "try { if (Get-Command Get-VMSwitchTeam -ErrorAction SilentlyContinue) { " +
+            "$setTeam = Get-VMSwitchTeam -Name $sw.Name -ErrorAction SilentlyContinue; " +
+            "if ($setTeam) { $teamMode='SET'; " +
+            "if ($setTeam.PSObject.Properties.Match('NetAdapterInterfaceDescriptions').Count -gt 0) { $members += @($setTeam.NetAdapterInterfaceDescriptions) } " +
+            "elseif ($setTeam.PSObject.Properties.Match('NetAdapterInterfaceDescription').Count -gt 0) { $members += @($setTeam.NetAdapterInterfaceDescription) } " +
+            "if ($setTeam.PSObject.Properties.Match('NetAdapterNames').Count -gt 0) { $members += @($setTeam.NetAdapterNames) } " +
+            "elseif ($setTeam.PSObject.Properties.Match('NetAdapterName').Count -gt 0) { $members += @($setTeam.NetAdapterName) } " +
+            "} } } catch { } ; " +
+            "if ([string]::IsNullOrWhiteSpace($teamMode)) { try { if (Get-Command Get-NetLbfoTeam -ErrorAction SilentlyContinue) { " +
+            "$bound=@(Get-NetAdapter | Where-Object { $descs -contains $_.InterfaceDescription -or $descs -contains $_.Name }); " +
+            "foreach ($adapter in $bound) { $team=@(Get-NetLbfoTeam -ErrorAction Stop | Where-Object { $_.Name -eq $adapter.Name -or $_.TeamNics -contains $adapter.Name } | Select-Object -First 1); " +
+            "if ($team.Count -gt 0) { $teamMode='LBFO'; $members += @(Get-NetLbfoTeamMember -Team $team[0].Name -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name); break } } " +
+            "} } catch { } } " +
             "$keys=@($members + $descs | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique); " +
             "$uplinks=@(); " +
             "foreach ($key in $keys) { " +
@@ -2653,7 +2766,7 @@ internal sealed class HyperVTopology
             "} " +
             "} ; " +
             "$uplinks = @($uplinks | Group-Object Name | ForEach-Object { $_.Group | Select-Object -First 1 }); " +
-            "[pscustomobject]@{ Name=$sw.Name; SwitchType=[string]$sw.SwitchType; Uplinks=@($uplinks) } " +
+            "[pscustomobject]@{ Name=$sw.Name; SwitchType=[string]$sw.SwitchType; Uplinks=@($uplinks); TeamMode=$teamMode } " +
             "}); @($switches) | ConvertTo-Json -Compress -Depth 4";
         if (!PowerShellRunner.TryRun(script, 7000, out var output))
             return [];
@@ -2730,7 +2843,8 @@ internal sealed class HyperVTopology
                 .Select(element => new NetworkSwitchTopologyRow(
                     HyperVInventory.ReadJsonString(element, "Name"),
                     HyperVInventory.ReadJsonString(element, "SwitchType"),
-                    ReadJsonUplinks(element, "Uplinks")))
+                    ReadJsonUplinks(element, "Uplinks"),
+                    HyperVInventory.ReadJsonString(element, "TeamMode")))
                 .Where(row => !string.IsNullOrWhiteSpace(row.Name))
                 .DistinctBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
                 .OrderBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
@@ -2867,13 +2981,14 @@ internal static class NetworkTopologyMatcher
         return null;
     }
 
-    public static NetworkRow MergeWithLive(NetworkRow[] adapters, NetworkUplinkInfo uplink)
+    public static NetworkRow MergeWithLive(NetworkRow[] adapters, NetworkUplinkInfo uplink, string hostName = "")
     {
         var live = MatchAdapter(adapters, uplink.Name, uplink.Description);
         if (live is not null)
             return live;
 
         return new NetworkRow(
+            hostName,
             uplink.Name,
             uplink.Description,
             uplink.Link,
@@ -3317,15 +3432,16 @@ internal sealed class NetworkSampler
     public AdapterRate[] Sample()
     {
         var now = DateTime.UtcNow;
+        var pdhRates = NetworkPdhSampler.Read();
         return ReadInterfaceRows()
             .Where(row => row.Type != Native.IF_TYPE_SOFTWARE_LOOPBACK)
-            .Select(row => TryRead(row, now, out var rate) ? rate : null)
+            .Select(row => TryRead(row, now, pdhRates, out var rate) ? rate : null)
             .Where(rate => rate is not null)
             .Cast<AdapterRate>()
             .ToArray();
     }
 
-    private bool TryRead(MibIfRow2 row, DateTime now, out AdapterRate rate)
+    private bool TryRead(MibIfRow2 row, DateTime now, NetworkPdhRate[] pdhRates, out AdapterRate rate)
     {
         if (row.InterfaceGuid == Guid.Empty)
         {
@@ -3340,6 +3456,8 @@ internal sealed class NetworkSampler
         var isUp = row.OperStatus == Native.IF_OPER_STATUS_UP;
         var rx = isUp && current.InOctets >= prior.InOctets ? (current.InOctets - prior.InOctets) / seconds : 0;
         var tx = isUp && current.OutOctets >= prior.OutOctets ? (current.OutOctets - prior.OutOctets) / seconds : 0;
+        var rawRx = rx;
+        var rawTx = tx;
         var drops = isUp && current.Discards >= prior.Discards ? (current.Discards - prior.Discards) / seconds : 0;
 
         previous[key] = current;
@@ -3349,6 +3467,18 @@ internal sealed class NetworkSampler
         {
             alias = ReadRowString(row.Alias, $"if-{row.InterfaceIndex}");
             description = ReadRowString(row.Description, alias);
+        }
+
+        var pdhInstance = string.Empty;
+        var pdhRx = 0d;
+        var pdhTx = 0d;
+        if (NetworkPdhSampler.TryMatch(pdhRates, alias, description, out var pdhRate))
+        {
+            pdhInstance = pdhRate.Instance;
+            pdhRx = pdhRate.ReceivedBytesPerSecond;
+            pdhTx = pdhRate.SentBytesPerSecond;
+            rx = Math.Max(rx, pdhRate.ReceivedBytesPerSecond);
+            tx = Math.Max(tx, pdhRate.SentBytesPerSecond);
         }
 
         rate = new AdapterRate(
@@ -3361,6 +3491,11 @@ internal sealed class NetworkSampler
             IsVisibleAdapter(row, alias, description),
             rx,
             tx,
+            rawRx,
+            rawTx,
+            pdhInstance,
+            pdhRx,
+            pdhTx,
             drops);
         return true;
     }
@@ -3435,7 +3570,144 @@ internal sealed class NetworkSampler
     private sealed record InterfaceCounterSnapshot(DateTime At, ulong InOctets, ulong OutOctets, ulong Discards);
 }
 
-internal sealed record AdapterRate(string Name, string Description, string InterfaceId, long LinkSpeedBitsPerSecond, bool IsUp, bool IsHardwareInterface, bool IsVisibleAdapter, double ReceivedBytesPerSecond, double SentBytesPerSecond, double DropsPerSecond)
+internal static class NetworkPdhSampler
+{
+    public static NetworkPdhRate[] LastRates { get; private set; } = [];
+
+    public static NetworkPdhRate[] Read()
+    {
+        var rx = PdhWildcardReader.Read(@"\Network Interface(*)\Bytes Received/sec", NormalizeInstance);
+        var tx = PdhWildcardReader.Read(@"\Network Interface(*)\Bytes Sent/sec", NormalizeInstance);
+        var rates = rx.Keys
+            .Concat(tx.Keys)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(name => new NetworkPdhRate(
+                name,
+                rx.TryGetValue(name, out var received) ? received : 0,
+                tx.TryGetValue(name, out var sent) ? sent : 0))
+            .ToArray();
+        LastRates = rates;
+        return rates;
+    }
+
+    public static bool TryMatch(NetworkPdhRate[] rates, string alias, string description, out NetworkPdhRate rate)
+    {
+        var candidates = new[] { alias, description }
+            .Select(NormalizeForMatch)
+            .Where(value => value.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        foreach (var candidate in candidates)
+        {
+            var exact = rates.FirstOrDefault(r => NormalizeForMatch(r.Instance).Equals(candidate, StringComparison.OrdinalIgnoreCase));
+            if (exact is not null)
+            {
+                rate = exact;
+                return true;
+            }
+        }
+
+        var fuzzy = rates
+            .Select(r => new { Rate = r, Key = NormalizeForMatch(r.Instance) })
+            .Where(item => candidates.Any(candidate => item.Key.Contains(candidate, StringComparison.OrdinalIgnoreCase) || candidate.Contains(item.Key, StringComparison.OrdinalIgnoreCase)))
+            .Select(item => item.Rate)
+            .Distinct()
+            .ToArray();
+
+        if (fuzzy.Length == 1)
+        {
+            rate = fuzzy[0];
+            return true;
+        }
+
+        rate = default!;
+        return false;
+    }
+
+    private static string NormalizeInstance(string instance)
+        => instance.Trim();
+
+    private static string NormalizeForMatch(string value)
+    {
+        Span<char> buffer = stackalloc char[value.Length];
+        var index = 0;
+        foreach (var ch in value)
+        {
+            if (char.IsLetterOrDigit(ch))
+                buffer[index++] = char.ToLowerInvariant(ch);
+        }
+
+        return new string(buffer[..index]);
+    }
+}
+
+internal sealed record NetworkPdhRate(string Instance, double ReceivedBytesPerSecond, double SentBytesPerSecond);
+
+internal static class HyperVNetworkPdhSampler
+{
+    public static Dictionary<string, HyperVNetworkPdhRate> ReadSwitchRates()
+    {
+        return ReadFamily(
+                "Hyper-V Virtual Switch",
+                @"\Hyper-V Virtual Switch(*)\Bytes/sec",
+                @"\Hyper-V Virtual Switch(*)\Bytes Received/sec",
+                @"\Hyper-V Virtual Switch(*)\Bytes Sent/sec")
+            .Rates
+            .GroupBy(rate => rate.Instance, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group => group.OrderByDescending(rate => Math.Max(rate.TotalBytesPerSecond, rate.ReceivedBytesPerSecond + rate.SentBytesPerSecond)).First(),
+                StringComparer.OrdinalIgnoreCase);
+    }
+
+    public static HyperVNetworkPdhFamily[] Read()
+        =>
+        [
+            ReadFamily(
+                "Hyper-V Virtual Switch",
+                @"\Hyper-V Virtual Switch(*)\Bytes/sec",
+                @"\Hyper-V Virtual Switch(*)\Bytes Received/sec",
+                @"\Hyper-V Virtual Switch(*)\Bytes Sent/sec"),
+            ReadFamily(
+                "Hyper-V Virtual Switch Port",
+                @"\Hyper-V Virtual Switch Port(*)\Bytes/sec",
+                @"\Hyper-V Virtual Switch Port(*)\Bytes Received/sec",
+                @"\Hyper-V Virtual Switch Port(*)\Bytes Sent/sec"),
+            ReadFamily(
+                "Hyper-V Virtual Network Adapter",
+                @"\Hyper-V Virtual Network Adapter(*)\Bytes/sec",
+                @"\Hyper-V Virtual Network Adapter(*)\Bytes Received/sec",
+                @"\Hyper-V Virtual Network Adapter(*)\Bytes Sent/sec")
+        ];
+
+    private static HyperVNetworkPdhFamily ReadFamily(string name, string totalPath, string rxPath, string txPath)
+    {
+        var total = PdhWildcardReader.Read(totalPath, NormalizeInstance);
+        var rx = PdhWildcardReader.Read(rxPath, NormalizeInstance);
+        var tx = PdhWildcardReader.Read(txPath, NormalizeInstance);
+        var rates = total.Keys
+            .Concat(rx.Keys)
+            .Concat(tx.Keys)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(instance => new HyperVNetworkPdhRate(
+                instance,
+                total.TryGetValue(instance, out var totalValue) ? totalValue : 0,
+                rx.TryGetValue(instance, out var rxValue) ? rxValue : 0,
+                tx.TryGetValue(instance, out var txValue) ? txValue : 0))
+            .ToArray();
+        return new HyperVNetworkPdhFamily(name, rates);
+    }
+
+    private static string NormalizeInstance(string instance)
+        => instance.Trim();
+}
+
+internal sealed record HyperVNetworkPdhFamily(string Name, HyperVNetworkPdhRate[] Rates);
+
+internal sealed record HyperVNetworkPdhRate(string Instance, double TotalBytesPerSecond, double ReceivedBytesPerSecond, double SentBytesPerSecond);
+
+internal sealed record AdapterRate(string Name, string Description, string InterfaceId, long LinkSpeedBitsPerSecond, bool IsUp, bool IsHardwareInterface, bool IsVisibleAdapter, double ReceivedBytesPerSecond, double SentBytesPerSecond, double RawReceivedBytesPerSecond, double RawSentBytesPerSecond, string PdhInstance, double PdhReceivedBytesPerSecond, double PdhSentBytesPerSecond, double DropsPerSecond)
 {
     public double TotalBytesPerSecond => ReceivedBytesPerSecond + SentBytesPerSecond;
 }
@@ -3986,7 +4258,7 @@ internal sealed record VmRow(string Name, string HostName, string Version, TimeS
     };
 }
 
-internal sealed record DiskRow(string Name, string Size, string UsedSpace, string FreeSpace, Metric Free, Metric Io, Metric ReadIo, Metric WriteIo, Metric Iops, Metric ReadIops, Metric WriteIops, Metric QueueDepth, Metric Latency, string Status)
+internal sealed record DiskRow(string HostName, string Name, string Size, string UsedSpace, string FreeSpace, Metric Free, Metric Io, Metric ReadIo, Metric WriteIo, Metric Iops, Metric ReadIops, Metric WriteIops, Metric QueueDepth, Metric Latency, string Status)
 {
     public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
     {
@@ -4002,7 +4274,7 @@ internal sealed record DiskRow(string Name, string Size, string UsedSpace, strin
     };
 }
 
-internal sealed record NetworkRow(string Name, string Description, string Link, bool IsUp, long LinkSpeedBitsPerSecond, Metric Throughput, Metric Rx, Metric Tx, Metric Drops, string Status)
+internal sealed record NetworkRow(string HostName, string Name, string Description, string Link, bool IsUp, long LinkSpeedBitsPerSecond, Metric Throughput, Metric Rx, Metric Tx, Metric Drops, string Status, string PdhInstance = "", double RawReceivedBytesPerSecond = 0, double RawSentBytesPerSecond = 0, double PdhReceivedBytesPerSecond = 0, double PdhSentBytesPerSecond = 0)
 {
     public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
     {
@@ -4015,7 +4287,7 @@ internal sealed record NetworkRow(string Name, string Description, string Link, 
 
 internal sealed record NetworkUplinkInfo(string Name, string Description, string Link, bool IsUp, long LinkSpeedBitsPerSecond);
 
-internal sealed record NetworkSwitchRow(string Name, string SwitchType, NetworkUplinkInfo[] Uplinks, string Link, Metric Throughput, Metric Rx, Metric Tx, Metric Drops, string Status)
+internal sealed record NetworkSwitchRow(string HostName, string Name, string SwitchType, string TeamMode, NetworkUplinkInfo[] Uplinks, string Link, Metric Throughput, Metric Rx, Metric Tx, Metric Drops, string Status)
 {
     public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
     {
@@ -4045,12 +4317,14 @@ internal sealed record VmNetworkPathRow(
 internal sealed record NetworkSwitchTopologyRow(
     string Name,
     string SwitchType,
-    NetworkUplinkInfo[] Uplinks);
+    NetworkUplinkInfo[] Uplinks,
+    string TeamMode = "");
 
 internal sealed record VmTopologyRow(
     string VmName,
     VDiskRow[] Disks,
-    VmNetworkPathRow[] Networks);
+    VmNetworkPathRow[] Networks,
+    string HostName = "");
 
 internal static class Status
 {
@@ -4097,12 +4371,12 @@ internal sealed class Tui
     private const int ShortMetricWidth = 13;
     private const int HostVersionWidth = 28;
     private const int VmVersionWidth = 7;
+    private const int HostColumnWidth = 14;
     private const int UptimeWidth = 4;
     private const int CountWidth = 5;
     private const int OwnerWidth = 18;
     private const int QuorumWidth = 14;
     private const int SizeWidth = 10;
-    private const int SwitchTypeWidth = 8;
     private const int UplinkWidth = 3;
     private const int LinkWidth = 6;
     private const int StatusWidth = 6;
@@ -4297,17 +4571,18 @@ internal sealed class Tui
         {
             PushView();
             selectedHostName = host.Name;
-            selectedItemName = null;
+            selectedItemName = host.Name;
+            detailPanel = Panel.Hosts;
             selected = 0;
-            drillView = DrillView.HostVms;
+            drillView = DrillView.Detail;
             return;
         }
 
         if (panel == Panel.Network && drillView == DrillView.Overview && row is NetworkSwitchRow networkSwitch)
         {
             PushView();
-            selectedHostName = networkSwitch.Name;
-            selectedItemName = null;
+            selectedHostName = networkSwitch.HostName;
+            selectedItemName = networkSwitch.Name;
             selected = 0;
             drillView = DrillView.NetworkAdapters;
             return;
@@ -4315,6 +4590,14 @@ internal sealed class Tui
 
         PushView();
         selectedItemName = GetRowName(row);
+        selectedHostName = row switch
+        {
+            VmRow vmRow => vmRow.HostName,
+            DiskRow diskRow => diskRow.HostName,
+            NetworkSwitchRow switchRow => switchRow.HostName,
+            NetworkRow networkRow => networkRow.HostName,
+            _ => selectedHostName
+        };
         detailPanel = row is VmRow ? Panel.Vms : panel;
         drillView = DrillView.Detail;
         selected = 0;
@@ -4323,6 +4606,46 @@ internal sealed class Tui
     private void OpenDetailSelection()
     {
         var target = ResolveDetailTarget();
+        if (target is HostRow host)
+        {
+            var hostSnapshot = state.Read();
+            var rows = HostDetailRows(hostSnapshot, host.Name);
+            if (rows.Length == 0) return;
+            selected = Math.Clamp(selected, 0, rows.Length - 1);
+            var row = rows[selected];
+            PushView();
+
+            switch (row)
+            {
+                case VmRow vmRow:
+                    panel = Panel.Vms;
+                    detailPanel = Panel.Vms;
+                    drillView = DrillView.Detail;
+                    selectedHostName = vmRow.HostName;
+                    selectedItemName = vmRow.Name;
+                    selected = 0;
+                    return;
+                case DiskRow diskRow:
+                    panel = Panel.Disks;
+                    detailPanel = Panel.Disks;
+                    drillView = DrillView.Detail;
+                    selectedHostName = diskRow.HostName;
+                    selectedItemName = diskRow.Name;
+                    selected = 0;
+                    return;
+                case NetworkSwitchRow switchRow:
+                    panel = Panel.Network;
+                    drillView = DrillView.NetworkAdapters;
+                    selectedHostName = switchRow.HostName;
+                    selectedItemName = switchRow.Name;
+                    selected = 0;
+                    return;
+            }
+
+            PopView();
+            return;
+        }
+
         if (target is not VmRow vm) return;
 
         var snapshot = state.Read();
@@ -4336,23 +4659,22 @@ internal sealed class Tui
 
         if (selected < disks.Length)
         {
-            var storageIndex = FindStorageIndex(snapshot, disks[selected]);
+            var storageIndex = FindStorageIndex(snapshot, disks[selected], vm.HostName);
             if (storageIndex < 0)
             {
                 PopView();
                 return;
             }
-
             panel = Panel.Disks;
             drillView = DrillView.Overview;
-            selectedHostName = null;
+            selectedHostName = vm.HostName;
             selectedItemName = null;
             selected = storageIndex;
             return;
         }
 
         var adapter = adapters[selected - disks.Length];
-        var networkIndex = FindNetworkSwitchIndex(snapshot, adapter.SwitchName);
+        var networkIndex = FindNetworkSwitchIndex(snapshot, adapter.SwitchName, vm.HostName);
         if (networkIndex < 0)
         {
             PopView();
@@ -4361,28 +4683,28 @@ internal sealed class Tui
 
         panel = Panel.Network;
         drillView = DrillView.Overview;
-        selectedHostName = null;
+        selectedHostName = vm.HostName;
         selectedItemName = null;
         selected = networkIndex;
     }
 
-    private static int FindStorageIndex(Snapshot snapshot, VDiskRow disk)
+    private static int FindStorageIndex(Snapshot snapshot, VDiskRow disk, string hostName)
     {
-        var exact = Array.FindIndex(snapshot.Disks, d => d.Name.Equals(disk.StorageName, StringComparison.OrdinalIgnoreCase));
+        var exact = Array.FindIndex(snapshot.Disks, d => d.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase) && d.Name.Equals(disk.StorageName, StringComparison.OrdinalIgnoreCase));
         if (exact >= 0) return exact;
 
         var root = Path.GetPathRoot(disk.Path)?.TrimEnd('\\') ?? string.Empty;
         if (!string.IsNullOrWhiteSpace(root))
         {
-            var byRoot = Array.FindIndex(snapshot.Disks, d => d.Name.StartsWith(root, StringComparison.OrdinalIgnoreCase));
+            var byRoot = Array.FindIndex(snapshot.Disks, d => d.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase) && d.Name.StartsWith(root, StringComparison.OrdinalIgnoreCase));
             if (byRoot >= 0) return byRoot;
         }
 
         return -1;
     }
 
-    private static int FindNetworkSwitchIndex(Snapshot snapshot, string switchName)
-        => Array.FindIndex(snapshot.NetworkSwitches, n => n.Name.Equals(switchName, StringComparison.OrdinalIgnoreCase));
+    private static int FindNetworkSwitchIndex(Snapshot snapshot, string switchName, string hostName)
+        => Array.FindIndex(snapshot.NetworkSwitches, n => n.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase) && n.Name.Equals(switchName, StringComparison.OrdinalIgnoreCase));
 
     private void GoBack()
     {
@@ -4415,10 +4737,12 @@ internal sealed class Tui
     {
         var s = state.Read();
         IReadOnlyList<object> rows;
-        if (panel == Panel.Hosts && drillView == DrillView.HostVms)
-            rows = s.Vms.Where(v => v.HostName == selectedHostName).Cast<object>().ToArray();
+        if (drillView == DrillView.Detail && ResolveDetailTarget() is HostRow host)
+            rows = HostDetailRows(s, host.Name);
+        else if (drillView == DrillView.Detail && ResolveDetailTarget() is VmRow vm)
+            rows = GetVmDisks(vm, s).Cast<object>().Concat(GetVmNetworkAdapters(vm, s)).ToArray();
         else if (panel == Panel.Network && drillView == DrillView.NetworkAdapters)
-            rows = GetSwitchUplinkRows(s, selectedHostName).Cast<object>().ToArray();
+            rows = GetSwitchUplinkRows(s, selectedHostName, selectedItemName).Cast<object>().ToArray();
         else
         {
             rows = panel switch
@@ -4487,15 +4811,15 @@ internal sealed class Tui
             Panel.Cluster => [new("NAME", "name"), new("NODES", "nodes"), new("UP", "up"), new("OWNER", "owner"), new("QUORUM", "quorum"), new("STA", "status")],
             Panel.Hosts => [new("NAME", "name"), new("VER", "version"), new("UP", "uptime"), new("CPU", "cpu"), new("MEM", "memory"), new("IO", "i/o"), new("NET", "network"), new("STA", "status")],
             Panel.Vms => VmSortColumns(),
-            Panel.Disks => [new("NAME", "name"), new("SIZE", "size"), new("FREE", "free"), new("IO", "i/o"), new("IOPS", "iops"), new("QD", "queue"), new("LAT", "latency"), new("STA", "status")],
-            Panel.Network => [new("NAME", "name"), new("TYPE", "type"), new("UPL", "uplinks"), new("LINK", "link"), new("THR", "throughput"), new("RX", "rx"), new("TX", "tx"), new("STA", "status")],
+            Panel.Disks => [new("HOST", "host"), new("NAME", "name"), new("SIZE", "size"), new("FREE", "free"), new("IO", "i/o"), new("IOPS", "iops"), new("QD", "queue"), new("LAT", "latency"), new("STA", "status")],
+            Panel.Network => [new("HOST", "host"), new("NAME", "name"), new("UPL", "uplinks"), new("LINK", "link"), new("THR", "throughput"), new("RX", "rx"), new("TX", "tx"), new("STA", "status")],
             Panel.Events => [new("DATE", "date"), new("SEV", "severity"), new("WHAT", "message")],
             _ => []
         };
     }
 
     private static SortColumn[] VmSortColumns()
-        => [new("NAME", "name"), new("VER", "version"), new("UP", "uptime"), new("CPU", "cpu"), new("MEM", "memory"), new("IO", "i/o"), new("NET", "network"), new("IOPS", "iops"), new("LAT", "latency"), new("STA", "status")];
+        => [new("HOST", "host"), new("NAME", "name"), new("VER", "version"), new("UP", "uptime"), new("CPU", "cpu"), new("MEM", "memory"), new("IO", "i/o"), new("NET", "network"), new("IOPS", "iops"), new("LAT", "latency"), new("STA", "status")];
 
     private static bool DefaultDescending(string column)
         => column is "CPU" or "MEM" or "IO" or "NET" or "IOPS" or "QD" or "LAT" or "SIZE" or "NODES" or "UP" or "THR" or "RX" or "TX" or "DROPS" or "DATE";
@@ -4526,6 +4850,7 @@ internal sealed class Tui
         },
         VmRow vm => column switch
         {
+            "HOST" => vm.HostName,
             "NAME" => vm.Name,
             "VER" => vm.Version,
             "UP" => vm.Uptime.TotalSeconds,
@@ -4540,6 +4865,7 @@ internal sealed class Tui
         },
         DiskRow disk => column switch
         {
+            "HOST" => disk.HostName,
             "NAME" => disk.Name,
             "SIZE" => ParseCapacity(disk.Size),
             "FREE" => disk.Free.Current,
@@ -4552,8 +4878,8 @@ internal sealed class Tui
         },
         NetworkSwitchRow network => column switch
         {
+            "HOST" => network.HostName,
             "NAME" => network.Name,
-            "TYPE" => network.SwitchType,
             "UPL" => network.Uplinks.Length,
             "LINK" => ParseLink(network.Link),
             "THR" => network.Throughput.Current,
@@ -4564,6 +4890,7 @@ internal sealed class Tui
         },
         NetworkRow net => column switch
         {
+            "HOST" => net.HostName,
             "NAME" => net.Name,
             "LINK" => ParseLink(net.Link),
             "THR" => net.Throughput.Current,
@@ -4778,20 +5105,20 @@ internal sealed class Tui
                 {
                     var nameWidth = TableNameWidth(TableKind.VmLike);
                     RenderRows(
-                        Row(Header("NAME", nameWidth), Header("VER", VmVersionWidth), HeaderRight("UP", UptimeWidth), CapacityMetricGroupHeader("CPU"), CapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
-                        Row(Header(string.Empty, nameWidth), Header(string.Empty, VmVersionWidth), Header(string.Empty, UptimeWidth), CapacityMetricSubHeader(), CapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
+                        Row(Header("HOST", HostColumnWidth), Header("NAME", nameWidth), Header("VER", VmVersionWidth), HeaderRight("UP", UptimeWidth), CapacityMetricGroupHeader("CPU"), CapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
+                        Row(Header(string.Empty, HostColumnWidth), Header(string.Empty, nameWidth), Header(string.Empty, VmVersionWidth), Header(string.Empty, UptimeWidth), CapacityMetricSubHeader(), CapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
                         CurrentRows().Cast<VmRow>().ToArray(),
-                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, VmVersionWidth), Cell(r.IsRunning ? UptimeFormatter.FormatShort(r.Uptime) : "OFF", UptimeWidth, true), FmtWithCapacity(r.Cpu, r.CpuCapacity), FmtWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
+                        r => Row(Cell(DisplayName(r.HostName, HostColumnWidth), HostColumnWidth), Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, VmVersionWidth), Cell(r.IsRunning ? UptimeFormatter.FormatShort(r.Uptime) : "OFF", UptimeWidth, true), FmtWithCapacity(r.Cpu, r.CpuCapacity), FmtWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
                 }
                 break;
             case Panel.Disks:
                 {
                     var nameWidth = TableNameWidth(TableKind.DiskLike);
                     RenderRows(
-                        Row(Header("NAME", nameWidth), HeaderRight("SIZE", SizeWidth), GroupHeader("FREE", MetricWidth), GroupHeader("I/O", MetricWidth), GroupHeader("IOPS", MetricWidth), GroupHeader("QD", ShortMetricWidth), GroupHeader("LAT", ShortMetricWidth), Header("STA", StatusWidth)),
-                        Row(Header(string.Empty, nameWidth), Header(string.Empty, SizeWidth), FreeMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), ShortMetricSubHeader(), ShortMetricSubHeader(), Header(string.Empty, StatusWidth)),
+                        Row(Header("HOST", HostColumnWidth), Header("NAME", nameWidth), HeaderRight("SIZE", SizeWidth), GroupHeader("FREE", MetricWidth), GroupHeader("I/O", MetricWidth), GroupHeader("IOPS", MetricWidth), GroupHeader("QD", ShortMetricWidth), GroupHeader("LAT", ShortMetricWidth), Header("STA", StatusWidth)),
+                        Row(Header(string.Empty, HostColumnWidth), Header(string.Empty, nameWidth), Header(string.Empty, SizeWidth), FreeMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), ShortMetricSubHeader(), ShortMetricSubHeader(), Header(string.Empty, StatusWidth)),
                         CurrentRows().Cast<DiskRow>().ToArray(),
-                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Size, SizeWidth, true), Fmt(r.Free), Fmt(r.Io), Fmt(r.Iops), FmtShort(r.QueueDepth), FmtShort(r.Latency), Cell(r.Status, StatusWidth)));
+                        r => Row(Cell(DisplayName(r.HostName, HostColumnWidth), HostColumnWidth), Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Size, SizeWidth, true), Fmt(r.Free), Fmt(r.Io), Fmt(r.Iops), FmtShort(r.QueueDepth), FmtShort(r.Latency), Cell(r.Status, StatusWidth)));
                 }
                 break;
             case Panel.Network:
@@ -4799,8 +5126,9 @@ internal sealed class Tui
                     if (drillView == DrillView.NetworkAdapters)
                     {
                         var nameWidth = TableNameWidth(TableKind.NetworkLike);
+                        var switchName = CurrentNetworkSwitchDisplayName();
                         RenderRows(
-                            Row(Header(DisplayName($"VSWITCH {selectedHostName} -> PNICS", nameWidth), nameWidth), Header("LINK", LinkWidth), GroupHeader("THR", MetricWidth), GroupHeader("RX", MetricWidth), GroupHeader("TX", MetricWidth), GroupHeader("DROPS", ShortMetricWidth), Header("STA", StatusWidth)),
+                            Row(Header(DisplayName($"HOST {selectedHostName} -> VSWITCH {switchName} -> PNICS", nameWidth), nameWidth), Header("LINK", LinkWidth), GroupHeader("THR", MetricWidth), GroupHeader("RX", MetricWidth), GroupHeader("TX", MetricWidth), GroupHeader("DROPS", ShortMetricWidth), Header("STA", StatusWidth)),
                             Row(Header(string.Empty, nameWidth), Header(string.Empty, LinkWidth), MetricSubHeader(), MetricSubHeader(), MetricSubHeader(), ShortMetricSubHeader(), Header(string.Empty, StatusWidth)),
                             CurrentRows().Cast<NetworkRow>().ToArray(),
                             r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Link, LinkWidth), Fmt(r.Throughput), Fmt(r.Rx), Fmt(r.Tx), FmtShort(r.Drops), Cell(r.Status, StatusWidth)));
@@ -4809,10 +5137,10 @@ internal sealed class Tui
                     {
                         var nameWidth = TableNameWidth(TableKind.NetworkSwitchLike);
                         RenderRows(
-                            Row(Header("VSWITCH", nameWidth), Header("TYPE", SwitchTypeWidth), Header("UPL", UplinkWidth), Header("LINK", LinkWidth), GroupHeader("THR", MetricWidth), GroupHeader("RX", MetricWidth), GroupHeader("TX", MetricWidth), Header("STA", StatusWidth)),
-                            Row(Header(string.Empty, nameWidth), Header(string.Empty, SwitchTypeWidth), Header(string.Empty, UplinkWidth), Header(string.Empty, LinkWidth), MetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
+                            Row(Header("HOST", HostColumnWidth), Header("VSWITCH", nameWidth), Header("UPL", UplinkWidth), Header("LINK", LinkWidth), GroupHeader("THR", MetricWidth), GroupHeader("RX", MetricWidth), GroupHeader("TX", MetricWidth), Header("STA", StatusWidth)),
+                            Row(Header(string.Empty, HostColumnWidth), Header(string.Empty, nameWidth), Header(string.Empty, UplinkWidth), Header(string.Empty, LinkWidth), MetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
                             CurrentRows().Cast<NetworkSwitchRow>().ToArray(),
-                            r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.SwitchType, SwitchTypeWidth), Cell(r.Uplinks.Length.ToString(), UplinkWidth, true), Cell(r.Link, LinkWidth), Fmt(r.Throughput), Fmt(r.Rx), Fmt(r.Tx), Cell(r.Status, StatusWidth)));
+                            r => Row(Cell(DisplayName(r.HostName, HostColumnWidth), HostColumnWidth), Cell(DisplayName(NetworkSwitchDisplayName(r), nameWidth), nameWidth), Cell(r.Uplinks.Length.ToString(), UplinkWidth, true), Cell(r.Link, LinkWidth), Fmt(r.Throughput), Fmt(r.Rx), Fmt(r.Tx), Cell(r.Status, StatusWidth)));
                     }
                 }
                 break;
@@ -4900,6 +5228,101 @@ internal sealed class Tui
             Cell(DisplayName(adapter.SwitchName, 26), 26),
             Cell(DisplayName(adapter.PhysicalAdapterName, 32), 32)
         });
+
+    private static string HostVmHeaderRow()
+        => "  " + string.Join("  ", new[]
+        {
+            Cell("VMs", 32),
+            Cell("UP", 4),
+            Cell("CPU", 10),
+            Cell("MEM", 10),
+            Cell("I/O", 10),
+            Cell("STA", 6)
+        });
+
+    private static string HostVmDataRow(VmRow vm)
+        => "  " + string.Join("  ", new[]
+        {
+            Cell(DisplayName(vm.Name, 32), 32),
+            Cell(vm.IsRunning ? UptimeFormatter.FormatShort(vm.Uptime) : "OFF", 4, true),
+            Cell(FmtValue(vm.Cpu.Current, vm.Cpu.Unit), 10),
+            Cell(FmtValue(vm.Mem.Current, vm.Mem.Unit), 10),
+            Cell(FmtValue(vm.Io.Current, vm.Io.Unit), 10),
+            Cell(vm.Status, 6)
+        });
+
+    private static string HostDiskHeaderRow()
+        => "  " + string.Join("  ", new[]
+        {
+            Cell("Storage", 32),
+            Cell("FREE", 10),
+            Cell("I/O", 10),
+            Cell("IOPS", 10),
+            Cell("LAT", 10),
+            Cell("STA", 6)
+        });
+
+    private static string HostDiskDataRow(DiskRow disk)
+        => "  " + string.Join("  ", new[]
+        {
+            Cell(DisplayName(disk.Name, 32), 32),
+            Cell(FmtValue(disk.Free.Current, disk.Free.Unit), 10),
+            Cell(FmtValue(disk.Io.Current, disk.Io.Unit), 10),
+            Cell(FmtValue(disk.Iops.Current, disk.Iops.Unit), 10),
+            Cell(FmtValue(disk.Latency.Current, disk.Latency.Unit), 10),
+            Cell(disk.Status, 6)
+        });
+
+    private static string HostNetworkHeaderRow()
+        => "  " + string.Join("  ", new[]
+        {
+            Cell("Network", 32),
+            Cell("LINK", 6),
+            Cell("THR", 10),
+            Cell("RX", 10),
+            Cell("TX", 10),
+            Cell("STA", 6)
+        });
+
+    private static string HostNetworkDataRow(NetworkSwitchRow network)
+        => "  " + string.Join("  ", new[]
+        {
+            Cell(DisplayName(NetworkSwitchDisplayName(network), 32), 32),
+            Cell(network.Link, 6),
+            Cell(FmtValue(network.Throughput.Current, network.Throughput.Unit), 10),
+            Cell(FmtValue(network.Rx.Current, network.Rx.Unit), 10),
+            Cell(FmtValue(network.Tx.Current, network.Tx.Unit), 10),
+            Cell(network.Status, 6)
+        });
+
+    private string CurrentNetworkSwitchDisplayName()
+    {
+        var snapshot = state.Read();
+        var row = snapshot.NetworkSwitches.FirstOrDefault(n => n.Name.Equals(selectedItemName ?? string.Empty, StringComparison.OrdinalIgnoreCase)
+            && n.HostName.Equals(selectedHostName ?? string.Empty, StringComparison.OrdinalIgnoreCase));
+        return row is null ? selectedItemName ?? string.Empty : NetworkSwitchDisplayName(row);
+    }
+
+    private static string NetworkSwitchDisplayName(NetworkSwitchRow network)
+    {
+        var type = ShortSwitchType(network.SwitchType);
+        if (string.IsNullOrWhiteSpace(type))
+            return network.Name;
+
+        if (string.IsNullOrWhiteSpace(network.TeamMode))
+            return $"{network.Name} ({type})";
+
+        return $"{network.Name} ({type}/{network.TeamMode})";
+    }
+
+    private static string ShortSwitchType(string switchType)
+        => switchType.Trim().ToUpperInvariant() switch
+        {
+            "EXTERNAL" => "External",
+            "INTERNAL" => "Internal",
+            "PRIVATE" => "Private",
+            _ => switchType.Trim()
+        };
 
     private void RenderRows<T>(string header, string subHeader, IReadOnlyList<T> rows, Func<T, string> formatter)
     {
@@ -4995,6 +5418,12 @@ internal sealed class Tui
                 }
                 break;
             case HostRow host:
+                var hostSnapshot = state.Read();
+                var hostVms = hostSnapshot.Vms.Where(v => v.HostName.Equals(host.Name, StringComparison.OrdinalIgnoreCase)).OrderBy(v => v.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+                var hostDisks = hostSnapshot.Disks.Where(d => d.HostName.Equals(host.Name, StringComparison.OrdinalIgnoreCase)).OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+                var hostNetworks = hostSnapshot.NetworkSwitches.Where(n => n.HostName.Equals(host.Name, StringComparison.OrdinalIgnoreCase)).OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+                var selectableRows = hostVms.Length + hostDisks.Length + hostNetworks.Length;
+                selected = Math.Min(selected, Math.Max(0, selectableRows - 1));
                 Detail(7, "Name", host.Name);
                 Detail(8, "Version", host.Version);
                 Detail(9, "Uptime", UptimeFormatter.FormatExact(host.Uptime));
@@ -5003,43 +5432,66 @@ internal sealed class Tui
                 DetailMetric(12, "I/O", host.Io);
                 DetailMetric(13, "Network", host.Net);
                 Detail(15, "Status", host.Status, StatusColor(host.Status));
+                var y = 18;
+                var absolute = 0;
+                WriteLine(y++, HostVmHeaderRow(), ConsoleColor.Yellow);
+                foreach (var vmRow in hostVms)
+                {
+                    WriteSelectableDetailLine(y++, absolute++, HostVmDataRow(vmRow), vmRow);
+                }
+
+                y++;
+                WriteLine(y++, HostDiskHeaderRow(), ConsoleColor.Yellow);
+                foreach (var diskRow in hostDisks)
+                {
+                    WriteSelectableDetailLine(y++, absolute++, HostDiskDataRow(diskRow), diskRow);
+                }
+
+                y++;
+                WriteLine(y++, HostNetworkHeaderRow(), ConsoleColor.Yellow);
+                foreach (var networkRow in hostNetworks)
+                {
+                    WriteSelectableDetailLine(y++, absolute++, HostNetworkDataRow(networkRow), networkRow);
+                }
                 break;
             case DiskRow disk:
                 Detail(7, "Name", disk.Name);
-                Detail(8, "Size", disk.Size);
-                DetailScalar(9, "  ├ Used space", disk.UsedSpace);
-                DetailScalar(10, "  └ Free space", disk.FreeSpace);
-                DetailScalar(11, string.Empty, string.Empty);
-                DetailMetricHeader(12, string.Empty, "cur", "min");
-                DetailMetric(13, "Free", disk.Free);
-                DetailScalar(14, string.Empty, string.Empty);
-                DetailMetricHeader(15, string.Empty, "cur", "max");
-                DetailMetric(16, "Total I/O", disk.Io);
-                DetailMetric(17, "    ├ Read I/O", disk.ReadIo);
-                DetailMetric(18, "    └ Write I/O", disk.WriteIo);
-                DetailScalar(19, string.Empty, string.Empty);
-                DetailMetricHeader(20, string.Empty, "cur", "max");
-                DetailMetric(21, "Total IOPS", disk.Iops);
-                DetailMetric(22, "    ├ Read IOPS", disk.ReadIops);
-                DetailMetric(23, "    └ Write IOPS", disk.WriteIops);
-                DetailScalar(24, string.Empty, string.Empty);
-                DetailMetricHeader(25, string.Empty, "cur", "max");
-                DetailMetric(26, "Queue depth", disk.QueueDepth);
-                DetailMetric(27, "Latency", disk.Latency);
-                Detail(29, "Status", disk.Status, StatusColor(disk.Status));
+                Detail(8, "Host", disk.HostName);
+                Detail(9, "Size", disk.Size);
+                DetailScalar(10, "  ├ Used space", disk.UsedSpace);
+                DetailScalar(11, "  └ Free space", disk.FreeSpace);
+                DetailScalar(12, string.Empty, string.Empty);
+                DetailMetricHeader(13, string.Empty, "cur", "min");
+                DetailMetric(14, "Free", disk.Free);
+                DetailScalar(15, string.Empty, string.Empty);
+                DetailMetricHeader(16, string.Empty, "cur", "max");
+                DetailMetric(17, "Total I/O", disk.Io);
+                DetailMetric(18, "    ├ Read I/O", disk.ReadIo);
+                DetailMetric(19, "    └ Write I/O", disk.WriteIo);
+                DetailScalar(20, string.Empty, string.Empty);
+                DetailMetricHeader(21, string.Empty, "cur", "max");
+                DetailMetric(22, "Total IOPS", disk.Iops);
+                DetailMetric(23, "    ├ Read IOPS", disk.ReadIops);
+                DetailMetric(24, "    └ Write IOPS", disk.WriteIops);
+                DetailScalar(25, string.Empty, string.Empty);
+                DetailMetricHeader(26, string.Empty, "cur", "max");
+                DetailMetric(27, "Queue depth", disk.QueueDepth);
+                DetailMetric(28, "Latency", disk.Latency);
+                Detail(30, "Status", disk.Status, StatusColor(disk.Status));
                 break;
             case NetworkRow net:
                 Detail(7, "Name", net.Name);
-                Detail(8, "Link", net.Link);
-                DetailScalar(9, string.Empty, string.Empty);
-                DetailMetricHeader(10, string.Empty, "cur", "max");
-                DetailMetric(11, "Throughput", net.Throughput);
-                DetailMetric(12, "    ├ Transmit", net.Tx);
-                DetailMetric(13, "    └ Receive", net.Rx);
-                DetailScalar(14, string.Empty, string.Empty);
-                DetailMetricHeader(15, string.Empty, "cur", "max");
-                DetailMetric(16, "Drops", net.Drops);
-                Detail(18, "Status", net.Status, StatusColor(net.Status));
+                Detail(8, "Host", net.HostName);
+                Detail(9, "Link", net.Link);
+                DetailScalar(10, string.Empty, string.Empty);
+                DetailMetricHeader(11, string.Empty, "cur", "max");
+                DetailMetric(12, "Throughput", net.Throughput);
+                DetailMetric(13, "    ├ Transmit", net.Tx);
+                DetailMetric(14, "    └ Receive", net.Rx);
+                DetailScalar(15, string.Empty, string.Empty);
+                DetailMetricHeader(16, string.Empty, "cur", "max");
+                DetailMetric(17, "Drops", net.Drops);
+                Detail(19, "Status", net.Status, StatusColor(net.Status));
                 break;
         }
     }
@@ -5064,6 +5516,27 @@ internal sealed class Tui
     private void DetailScalar(int y, string label, string value, ConsoleColor color = ConsoleColor.Gray)
         => WriteLine(y, $"  {label,-DetailLabelWidth} {value}", color);
 
+    private void WriteSelectableDetailLine(int y, int index, string text, object row)
+    {
+        var isSelected = index == selected;
+        WriteLine(y, text, isSelected ? ConsoleColor.White : RowColor(row), isSelected ? ConsoleColor.DarkCyan : ConsoleColor.Black);
+    }
+
+    private static object[] HostDetailRows(Snapshot snapshot, string hostName)
+    {
+        return snapshot.Vms
+            .Where(v => v.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(v => v.Name, StringComparer.OrdinalIgnoreCase)
+            .Cast<object>()
+            .Concat(snapshot.Disks
+                .Where(d => d.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase))
+            .Concat(snapshot.NetworkSwitches
+                .Where(n => n.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase))
+            .ToArray();
+    }
+
     private object? ResolveDetailTarget()
     {
         if (string.IsNullOrEmpty(selectedItemName)) return null;
@@ -5073,21 +5546,22 @@ internal sealed class Tui
             Panel.Cluster => s.Clusters.FirstOrDefault(r => r.Name == selectedItemName),
             Panel.Hosts => s.Hosts.FirstOrDefault(r => r.Name == selectedItemName),
             Panel.Vms => s.Vms.FirstOrDefault(r => r.Name == selectedItemName && (string.IsNullOrEmpty(selectedHostName) || r.HostName == selectedHostName)),
-            Panel.Disks => s.Disks.FirstOrDefault(r => r.Name == selectedItemName),
-            Panel.Network => GetSwitchUplinkRows(s, selectedHostName).FirstOrDefault(r => r.Name == selectedItemName)
-                ?? s.Networks.FirstOrDefault(r => r.Name == selectedItemName),
+            Panel.Disks => s.Disks.FirstOrDefault(r => r.Name == selectedItemName && (string.IsNullOrEmpty(selectedHostName) || r.HostName == selectedHostName)),
+            Panel.Network => s.Networks.FirstOrDefault(r => r.Name == selectedItemName && (string.IsNullOrEmpty(selectedHostName) || r.HostName == selectedHostName)),
             _ => null
         };
     }
 
     private string DetailTitle(object row)
     {
-        if (panel == Panel.Hosts && row is VmRow vm)
+        if (row is VmRow vm)
             return $"HOST {vm.HostName} -> VM {vm.Name}";
         if (panel == Panel.Cluster && row is HostRow host)
             return $"CLUSTER -> HOST {host.Name}";
         if (panel == Panel.Network && row is NetworkRow net && !string.IsNullOrWhiteSpace(selectedHostName))
-            return $"VSWITCH {selectedHostName} -> pNIC {net.Name}";
+            return $"HOST {net.HostName} -> pNIC {net.Name}";
+        if (row is DiskRow disk)
+            return $"HOST {disk.HostName} -> storage {disk.Name}";
         return $"{detailPanel} detail: {GetRowName(row)}";
     }
 
@@ -5105,26 +5579,27 @@ internal sealed class Tui
 
     private static VDiskRow[] GetVmDisks(VmRow vm, Snapshot snapshot)
     {
-        return snapshot.VmTopology.FirstOrDefault(t => t.VmName == vm.Name)?.Disks ?? [];
+        return snapshot.VmTopology.FirstOrDefault(t => t.VmName == vm.Name && (string.IsNullOrWhiteSpace(t.HostName) || t.HostName.Equals(vm.HostName, StringComparison.OrdinalIgnoreCase)))?.Disks ?? [];
     }
 
     private static VmNetworkPathRow[] GetVmNetworkAdapters(VmRow vm, Snapshot snapshot)
     {
-        return snapshot.VmTopology.FirstOrDefault(t => t.VmName == vm.Name)?.Networks ?? [];
+        return snapshot.VmTopology.FirstOrDefault(t => t.VmName == vm.Name && (string.IsNullOrWhiteSpace(t.HostName) || t.HostName.Equals(vm.HostName, StringComparison.OrdinalIgnoreCase)))?.Networks ?? [];
     }
 
-    private static NetworkRow[] GetSwitchUplinkRows(Snapshot snapshot, string? switchName)
+    private static NetworkRow[] GetSwitchUplinkRows(Snapshot snapshot, string? hostName, string? switchName)
     {
         if (string.IsNullOrWhiteSpace(switchName))
             return [];
 
-        var switchRow = snapshot.NetworkSwitches.FirstOrDefault(n => n.Name.Equals(switchName, StringComparison.OrdinalIgnoreCase));
+        var switchRow = snapshot.NetworkSwitches.FirstOrDefault(n => n.Name.Equals(switchName, StringComparison.OrdinalIgnoreCase)
+            && (string.IsNullOrWhiteSpace(hostName) || n.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase)));
         if (switchRow is null)
             return [];
 
         return switchRow.Uplinks
-            .Select(uplink => NetworkTopologyMatcher.MergeWithLive(snapshot.Networks, uplink))
-            .DistinctBy(adapter => adapter.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(uplink => NetworkTopologyMatcher.MergeWithLive(snapshot.Networks.Where(n => n.HostName.Equals(switchRow.HostName, StringComparison.OrdinalIgnoreCase)).ToArray(), uplink, switchRow.HostName))
+            .DistinctBy(adapter => $"{adapter.HostName}\0{adapter.Name}", StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }
 
@@ -5245,9 +5720,9 @@ internal sealed class Tui
         {
             TableKind.ClusterLike => CountWidth + CountWidth + OwnerWidth + QuorumWidth + StatusWidth,
             TableKind.HostLike => HostVersionWidth + UptimeWidth + CapacityMetricWidth + CapacityMetricWidth + MetricWidth + MetricWidth + StatusWidth,
-            TableKind.VmLike => VmVersionWidth + UptimeWidth + CapacityMetricWidth + CapacityMetricWidth + MetricWidth + MetricWidth + StatusWidth,
-            TableKind.DiskLike => SizeWidth + MetricWidth + MetricWidth + MetricWidth + ShortMetricWidth + ShortMetricWidth + StatusWidth,
-            TableKind.NetworkSwitchLike => SwitchTypeWidth + UplinkWidth + LinkWidth + MetricWidth + MetricWidth + MetricWidth + StatusWidth,
+            TableKind.VmLike => HostColumnWidth + VmVersionWidth + UptimeWidth + CapacityMetricWidth + CapacityMetricWidth + MetricWidth + MetricWidth + StatusWidth,
+            TableKind.DiskLike => HostColumnWidth + SizeWidth + MetricWidth + MetricWidth + MetricWidth + ShortMetricWidth + ShortMetricWidth + StatusWidth,
+            TableKind.NetworkSwitchLike => HostColumnWidth + UplinkWidth + LinkWidth + MetricWidth + MetricWidth + MetricWidth + StatusWidth,
             TableKind.NetworkLike => LinkWidth + MetricWidth + MetricWidth + MetricWidth + ShortMetricWidth + StatusWidth,
             _ => 0
         };
@@ -5256,9 +5731,10 @@ internal sealed class Tui
         {
             TableKind.ClusterLike => 6,
             TableKind.HostLike => 8,
-            TableKind.VmLike => 8,
-            TableKind.DiskLike => 8,
+            TableKind.VmLike => 9,
+            TableKind.DiskLike => 9,
             TableKind.NetworkLike => 6,
+            TableKind.NetworkSwitchLike => 8,
             _ => 2
         };
 
