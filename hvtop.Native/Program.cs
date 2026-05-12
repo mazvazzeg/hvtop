@@ -6,6 +6,7 @@ using System.Net.Http;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -14,11 +15,12 @@ namespace hvtop.Native;
 internal static class Program
 {
 #if RDC
-    public const string DisplayVersion = "0.5.1-rdc+20260511.0011";
+    public const string DisplayVersion = "0.5.2-rdc+20260511.0001";
     public const string AppName = "hvtop-rdc";
 
     public static async Task<int> Main(string[] args)
     {
+        ConfigureConsoleEncoding();
         var options = RdcOptions.Parse(args);
         if (options.ShowVersion)
         {
@@ -187,11 +189,12 @@ internal static class Program
     }
 
 #else
-    public const string DisplayVersion = "0.5.1+20260511.0011";
+    public const string DisplayVersion = "0.5.2+20260511.0001";
     public const string AppName = "hvtop";
 
     public static async Task<int> Main(string[] args)
     {
+        ConfigureConsoleEncoding();
         var options = Options.Parse(args);
         if (options.ShowVersion)
         {
@@ -287,6 +290,18 @@ internal static class Program
         return text.Length > 4 ? text[..4] : text.PadLeft(4);
     }
 #endif
+
+    private static void ConfigureConsoleEncoding()
+    {
+        try
+        {
+            Console.OutputEncoding = Encoding.UTF8;
+            Console.InputEncoding = Encoding.UTF8;
+        }
+        catch
+        {
+        }
+    }
 
     private static async Task RunSamplerAsync(Collector collector, AppState state, Options options, CancellationToken token)
     {
@@ -939,6 +954,7 @@ internal sealed class Collector : IDisposable
         if (liveTopology.Length > 0)
         {
             var mergedTopology = MergeVmTotalsIntoTopology(vms, liveTopology);
+            mergedTopology = mergedTopology.Select(t => history.Apply("vmtopo:" + t.HostName + ":" + t.VmName, t)).ToArray();
             disks = ApplyVmDiskLoadToStorage(disks, mergedTopology);
             vms = ApplyTopologyFallback(vms, mergedTopology);
             host = host with
@@ -957,6 +973,7 @@ internal sealed class Collector : IDisposable
 
         host = history.Apply("host:" + host.Name, host);
         hosts = BuildHosts(host, clusterResult.Nodes);
+        liveTopology = liveTopology.Select(t => history.Apply("vmtopo:" + t.HostName + ":" + t.VmName, t)).ToArray();
         disks = disks.Select(d => history.Apply("disk:" + d.HostName + ":" + d.Name, d)).ToArray();
         networkSwitches = networkSwitches.Select(n => history.Apply("vswitch:" + n.HostName + ":" + n.Name, n)).ToArray();
         adapters = adapters.Select(n => history.Apply("net:" + n.HostName + ":" + n.Name, n)).ToArray();
@@ -1173,18 +1190,28 @@ internal sealed class Collector : IDisposable
     private static VmTopologyRow[] EnrichTopologyWithLiveStats(VmTopologyRow[] topology)
     {
         if (topology.Length == 0) return topology;
-        var live = VirtualDiskCounterSampler.Read();
+        var liveDisks = VirtualDiskCounterSampler.Read();
+        var liveNetworks = VirtualNetworkCounterSampler.Read();
         return topology.Select(vm => vm with
         {
             Disks = vm.Disks.Select(disk =>
             {
-                var stats = HyperVNaming.ResolveDiskStats(live, disk.Path, disk.Name) ?? new VirtualDiskStats(0, 0, 0, 0);
+                var stats = HyperVNaming.ResolveDiskStats(liveDisks, disk.Path, disk.Name) ?? new VirtualDiskStats(0, 0, 0, 0);
                 return disk with
                 {
                     ReadMbps = stats.ReadMbps,
                     ReadIops = stats.ReadIops,
                     WriteMbps = stats.WriteMbps,
                     WriteIops = stats.WriteIops
+                };
+            }).ToArray(),
+            Networks = vm.Networks.Select(adapter =>
+            {
+                var stats = HyperVNaming.ResolveNetworkStats(liveNetworks, vm.VmName, adapter.Name, vm.Networks.Length == 1) ?? new VirtualNetworkStats(0, 0);
+                return adapter with
+                {
+                    RxMbps = stats.RxMbps,
+                    TxMbps = stats.TxMbps
                 };
             }).ToArray()
         }).ToArray();
@@ -3067,6 +3094,30 @@ internal static class VirtualDiskCounterSampler
 
 internal sealed record VirtualDiskStats(double ReadMbps, double ReadIops, double WriteMbps, double WriteIops);
 
+internal static class VirtualNetworkCounterSampler
+{
+    public static Dictionary<string, VirtualNetworkStats> Read()
+    {
+        var rx = PdhWildcardReader.Read(@"\Hyper-V Virtual Network Adapter(*)\Bytes Received/sec", NormalizeNetworkCounterInstance);
+        var tx = PdhWildcardReader.Read(@"\Hyper-V Virtual Network Adapter(*)\Bytes Sent/sec", NormalizeNetworkCounterInstance);
+        var keys = new HashSet<string>(rx.Keys.Concat(tx.Keys), StringComparer.OrdinalIgnoreCase);
+        return keys.ToDictionary(
+            key => key,
+            key => new VirtualNetworkStats(
+                ReadValue(rx, key) / 1024 / 1024,
+                ReadValue(tx, key) / 1024 / 1024),
+            StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static double ReadValue(Dictionary<string, double> values, string key)
+        => values.TryGetValue(key, out var value) && !double.IsNaN(value) ? value : 0;
+
+    private static string NormalizeNetworkCounterInstance(string instance)
+        => HyperVNaming.NormalizeStorageCounterIdentity(instance);
+}
+
+internal sealed record VirtualNetworkStats(double RxMbps, double TxMbps);
+
 internal static class HyperVNaming
 {
     public static string NormalizeDiskCounterKey(string? name)
@@ -3151,6 +3202,32 @@ internal static class HyperVNaming
         }
 
         return null;
+    }
+
+    public static VirtualNetworkStats? ResolveNetworkStats(Dictionary<string, VirtualNetworkStats> counters, string vmName, string adapterName, bool singleAdapter)
+    {
+        var vmKey = NormalizeVmIdentity(vmName);
+        var adapterKey = NormalizeVmIdentity(adapterName);
+        if (string.IsNullOrWhiteSpace(vmKey))
+            return null;
+
+        var matches = counters
+            .Where(pair => ContainsIdentityToken(pair.Key, vmKey))
+            .ToArray();
+        if (matches.Length == 0)
+            return null;
+
+        var exact = matches
+            .Where(pair => !string.IsNullOrWhiteSpace(adapterKey) && ContainsIdentityToken(pair.Key, adapterKey))
+            .ToArray();
+        if (exact.Length > 0)
+            matches = exact;
+        else if (!singleAdapter)
+            return null;
+
+        return new VirtualNetworkStats(
+            matches.Sum(pair => pair.Value.RxMbps),
+            matches.Sum(pair => pair.Value.TxMbps));
     }
 }
 
@@ -4168,6 +4245,38 @@ internal sealed class RollingHistory
         };
     }
 
+    public VmTopologyRow Apply(string key, VmTopologyRow row)
+    {
+        return row with
+        {
+            Disks = row.Disks.Select(disk =>
+            {
+                var diskKey = $"{key}:vdisk:{disk.Path}:{disk.Name}";
+                var values = Add(diskKey, disk.Metrics);
+                return disk with
+                {
+                    TotalMbpsMax = values[nameof(disk.TotalMbps)],
+                    TotalIopsMax = values[nameof(disk.TotalIops)],
+                    ReadMbpsMax = values[nameof(disk.ReadMbps)],
+                    ReadIopsMax = values[nameof(disk.ReadIops)],
+                    WriteMbpsMax = values[nameof(disk.WriteMbps)],
+                    WriteIopsMax = values[nameof(disk.WriteIops)]
+                };
+            }).ToArray(),
+            Networks = row.Networks.Select(adapter =>
+            {
+                var adapterKey = $"{key}:vnic:{adapter.Name}:{adapter.SwitchName}";
+                var values = Add(adapterKey, adapter.Metrics);
+                return adapter with
+                {
+                    ThroughputMbpsMax = values[nameof(adapter.ThroughputMbps)],
+                    RxMbpsMax = values[nameof(adapter.RxMbps)],
+                    TxMbpsMax = values[nameof(adapter.TxMbps)]
+                };
+            }).ToArray()
+        };
+    }
+
     private Dictionary<string, double> Add(string key, IReadOnlyDictionary<string, double> values)
     {
         var now = DateTime.UtcNow;
@@ -4307,12 +4416,49 @@ internal sealed record VDiskRow(
     double ReadMbps,
     double ReadIops,
     double WriteMbps,
-    double WriteIops);
+    double WriteIops,
+    double TotalMbpsMax = double.NaN,
+    double TotalIopsMax = double.NaN,
+    double ReadMbpsMax = double.NaN,
+    double ReadIopsMax = double.NaN,
+    double WriteMbpsMax = double.NaN,
+    double WriteIopsMax = double.NaN)
+{
+    public double TotalMbps => ReadMbps + WriteMbps;
+    public double TotalIops => ReadIops + WriteIops;
+    public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
+    {
+        [nameof(TotalMbps)] = TotalMbps,
+        [nameof(TotalIops)] = TotalIops,
+        [nameof(ReadMbps)] = ReadMbps,
+        [nameof(ReadIops)] = ReadIops,
+        [nameof(WriteMbps)] = WriteMbps,
+        [nameof(WriteIops)] = WriteIops
+    };
+}
 
 internal sealed record VmNetworkPathRow(
     string Name,
     string SwitchName,
-    string PhysicalAdapterName);
+    string PhysicalAdapterName,
+    double RxMbps = 0,
+    double TxMbps = 0,
+    double ThroughputMbpsMax = double.NaN,
+    double RxMbpsMax = double.NaN,
+    double TxMbpsMax = double.NaN)
+{
+    public double ThroughputMbps => RxMbps + TxMbps;
+    public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
+    {
+        [nameof(ThroughputMbps)] = ThroughputMbps,
+        [nameof(RxMbps)] = RxMbps,
+        [nameof(TxMbps)] = TxMbps
+    };
+}
+
+internal sealed record VDiskDetailRow(string HostName, string VmName, VDiskRow Disk);
+
+internal sealed record VmNetworkDetailRow(string HostName, string VmName, VmNetworkPathRow Adapter, NetworkSwitchRow? Switch);
 
 internal sealed record NetworkSwitchTopologyRow(
     string Name,
@@ -4659,33 +4805,43 @@ internal sealed class Tui
 
         if (selected < disks.Length)
         {
-            var storageIndex = FindStorageIndex(snapshot, disks[selected], vm.HostName);
-            if (storageIndex < 0)
-            {
-                PopView();
-                return;
-            }
-            panel = Panel.Disks;
-            drillView = DrillView.Overview;
+            panel = Panel.Vms;
+            detailPanel = Panel.Disks;
+            drillView = DrillView.Detail;
             selectedHostName = vm.HostName;
-            selectedItemName = null;
-            selected = storageIndex;
+            selectedItemName = EncodeVmChild(vm.Name, "vdisk", disks[selected].Name);
+            selected = 0;
             return;
         }
 
         var adapter = adapters[selected - disks.Length];
-        var networkIndex = FindNetworkSwitchIndex(snapshot, adapter.SwitchName, vm.HostName);
-        if (networkIndex < 0)
-        {
-            PopView();
-            return;
-        }
-
-        panel = Panel.Network;
-        drillView = DrillView.Overview;
+        panel = Panel.Vms;
+        detailPanel = Panel.Network;
+        drillView = DrillView.Detail;
         selectedHostName = vm.HostName;
-        selectedItemName = null;
-        selected = networkIndex;
+        selectedItemName = EncodeVmChild(vm.Name, "vnic", adapter.Name);
+        selected = 0;
+    }
+
+    private static string EncodeVmChild(string vmName, string childType, string childName)
+        => $"{vmName}\0{childType}\0{childName}";
+
+    private static bool TryDecodeVmChild(string? value, out string vmName, out string childType, out string childName)
+    {
+        vmName = string.Empty;
+        childType = string.Empty;
+        childName = string.Empty;
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        var parts = value.Split('\0');
+        if (parts.Length != 3)
+            return false;
+
+        vmName = parts[0];
+        childType = parts[1];
+        childName = parts[2];
+        return !string.IsNullOrWhiteSpace(vmName) && !string.IsNullOrWhiteSpace(childType) && !string.IsNullOrWhiteSpace(childName);
     }
 
     private static int FindStorageIndex(Snapshot snapshot, VDiskRow disk, string hostName)
@@ -4741,6 +4897,8 @@ internal sealed class Tui
             rows = HostDetailRows(s, host.Name);
         else if (drillView == DrillView.Detail && ResolveDetailTarget() is VmRow vm)
             rows = GetVmDisks(vm, s).Cast<object>().Concat(GetVmNetworkAdapters(vm, s)).ToArray();
+        else if (drillView == DrillView.Detail && ResolveDetailTarget() is VDiskDetailRow or VmNetworkDetailRow)
+            rows = [];
         else if (panel == Panel.Network && drillView == DrillView.NetworkAdapters)
             rows = GetSwitchUplinkRows(s, selectedHostName, selectedItemName).Cast<object>().ToArray();
         else
@@ -5454,6 +5612,42 @@ internal sealed class Tui
                     WriteSelectableDetailLine(y++, absolute++, HostNetworkDataRow(networkRow), networkRow);
                 }
                 break;
+            case VDiskDetailRow vdisk:
+                var virtualDisk = vdisk.Disk;
+                Detail(7, "Name", virtualDisk.Name);
+                Detail(8, "VM", vdisk.VmName);
+                Detail(9, "Host", vdisk.HostName);
+                Detail(10, "Storage/CSV", virtualDisk.StorageName);
+                Detail(11, "Path", virtualDisk.Path);
+                DetailScalar(12, string.Empty, string.Empty);
+                DetailMetricHeader(13, string.Empty, "cur", "max");
+                DetailMetric(14, "Total I/O", Metric.Mbps(virtualDisk.TotalMbps) with { Max = DetailMax(virtualDisk.TotalMbpsMax, virtualDisk.TotalMbps) });
+                DetailMetric(15, "    ├ Read I/O", Metric.Mbps(virtualDisk.ReadMbps) with { Max = DetailMax(virtualDisk.ReadMbpsMax, virtualDisk.ReadMbps) });
+                DetailMetric(16, "    └ Write I/O", Metric.Mbps(virtualDisk.WriteMbps) with { Max = DetailMax(virtualDisk.WriteMbpsMax, virtualDisk.WriteMbps) });
+                DetailScalar(17, string.Empty, string.Empty);
+                DetailMetricHeader(18, string.Empty, "cur", "max");
+                DetailMetric(19, "Total IOPS", Metric.Iops(virtualDisk.TotalIops) with { Max = DetailMax(virtualDisk.TotalIopsMax, virtualDisk.TotalIops) });
+                DetailMetric(20, "    ├ Read IOPS", Metric.Iops(virtualDisk.ReadIops) with { Max = DetailMax(virtualDisk.ReadIopsMax, virtualDisk.ReadIops) });
+                DetailMetric(21, "    └ Write IOPS", Metric.Iops(virtualDisk.WriteIops) with { Max = DetailMax(virtualDisk.WriteIopsMax, virtualDisk.WriteIops) });
+                Detail(23, "Status", virtualDisk.TotalMbps <= 0.01 && virtualDisk.TotalIops <= 0.01 ? "IDLE" : "OK", virtualDisk.TotalMbps <= 0.01 && virtualDisk.TotalIops <= 0.01 ? ConsoleColor.Green : ConsoleColor.Gray);
+                break;
+            case VmNetworkDetailRow vnic:
+                var virtualNic = vnic.Adapter;
+                var linkBits = vnic.Switch is null ? 0 : NetworkLinkFormatter.ParseBitsPerSecond(vnic.Switch.Link);
+                var vnicStatus = Status.FromNetwork(virtualNic.ThroughputMbps * 1024d * 1024d, linkBits, true);
+                Detail(7, "Name", virtualNic.Name);
+                Detail(8, "VM", vnic.VmName);
+                Detail(9, "Host", vnic.HostName);
+                Detail(10, "vSwitch", virtualNic.SwitchName);
+                Detail(11, "pNIC", virtualNic.PhysicalAdapterName);
+                Detail(12, "Link", vnic.Switch?.Link ?? "n/a");
+                DetailScalar(13, string.Empty, string.Empty);
+                DetailMetricHeader(14, string.Empty, "cur", "max");
+                DetailMetric(15, "Throughput", Metric.Mbps(virtualNic.ThroughputMbps) with { Max = DetailMax(virtualNic.ThroughputMbpsMax, virtualNic.ThroughputMbps) });
+                DetailMetric(16, "    ├ Transmit", Metric.Mbps(virtualNic.TxMbps) with { Max = DetailMax(virtualNic.TxMbpsMax, virtualNic.TxMbps) });
+                DetailMetric(17, "    └ Receive", Metric.Mbps(virtualNic.RxMbps) with { Max = DetailMax(virtualNic.RxMbpsMax, virtualNic.RxMbps) });
+                Detail(19, "Status", vnicStatus, StatusColor(vnicStatus));
+                break;
             case DiskRow disk:
                 Detail(7, "Name", disk.Name);
                 Detail(8, "Host", disk.HostName);
@@ -5513,6 +5707,9 @@ internal sealed class Tui
     private void DetailMetricSplit(int y, string label, Metric metric, double ratio)
         => DetailScalar(y, label, DetailSplitValue(metric, ratio));
 
+    private static double DetailMax(double max, double current)
+        => double.IsNaN(max) ? current : Math.Max(max, current);
+
     private void DetailScalar(int y, string label, string value, ConsoleColor color = ConsoleColor.Gray)
         => WriteLine(y, $"  {label,-DetailLabelWidth} {value}", color);
 
@@ -5541,6 +5738,31 @@ internal sealed class Tui
     {
         if (string.IsNullOrEmpty(selectedItemName)) return null;
         var s = state.Read();
+        if (TryDecodeVmChild(selectedItemName, out var vmName, out var childType, out var childName))
+        {
+            var vm = s.Vms.FirstOrDefault(r => r.Name.Equals(vmName, StringComparison.OrdinalIgnoreCase)
+                && (string.IsNullOrEmpty(selectedHostName) || r.HostName.Equals(selectedHostName, StringComparison.OrdinalIgnoreCase)));
+            if (vm is null)
+                return null;
+
+            if (childType.Equals("vdisk", StringComparison.OrdinalIgnoreCase))
+            {
+                var disk = GetVmDisks(vm, s).FirstOrDefault(r => r.Name.Equals(childName, StringComparison.OrdinalIgnoreCase));
+                return disk is null ? null : new VDiskDetailRow(vm.HostName, vm.Name, disk);
+            }
+
+            if (childType.Equals("vnic", StringComparison.OrdinalIgnoreCase))
+            {
+                var adapter = GetVmNetworkAdapters(vm, s).FirstOrDefault(r => r.Name.Equals(childName, StringComparison.OrdinalIgnoreCase));
+                if (adapter is null)
+                    return null;
+
+                var switchRow = s.NetworkSwitches.FirstOrDefault(n => n.HostName.Equals(vm.HostName, StringComparison.OrdinalIgnoreCase)
+                    && n.Name.Equals(adapter.SwitchName, StringComparison.OrdinalIgnoreCase));
+                return new VmNetworkDetailRow(vm.HostName, vm.Name, adapter, switchRow);
+            }
+        }
+
         return detailPanel switch
         {
             Panel.Cluster => s.Clusters.FirstOrDefault(r => r.Name == selectedItemName),
@@ -5560,6 +5782,10 @@ internal sealed class Tui
             return $"CLUSTER -> HOST {host.Name}";
         if (panel == Panel.Network && row is NetworkRow net && !string.IsNullOrWhiteSpace(selectedHostName))
             return $"HOST {net.HostName} -> pNIC {net.Name}";
+        if (row is VDiskDetailRow vdisk)
+            return $"HOST {vdisk.HostName} -> VM {vdisk.VmName} -> vDisk {vdisk.Disk.Name}";
+        if (row is VmNetworkDetailRow vnic)
+            return $"HOST {vnic.HostName} -> VM {vnic.VmName} -> vNIC {vnic.Adapter.Name}";
         if (row is DiskRow disk)
             return $"HOST {disk.HostName} -> storage {disk.Name}";
         return $"{detailPanel} detail: {GetRowName(row)}";
@@ -5573,6 +5799,10 @@ internal sealed class Tui
         DiskRow disk => disk.Name,
         NetworkSwitchRow networkSwitch => networkSwitch.Name,
         NetworkRow net => net.Name,
+        VDiskRow disk => disk.Name,
+        VmNetworkPathRow adapter => adapter.Name,
+        VDiskDetailRow disk => disk.Disk.Name,
+        VmNetworkDetailRow adapter => adapter.Adapter.Name,
         EventRow evt => evt.Message,
         _ => string.Empty
     };
