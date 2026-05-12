@@ -8,6 +8,30 @@ rolling history buffer for max/spike visibility.
 The native implementation is written in C# with native Windows counters and no
 PowerShell in the hot path.
 
+## Screenshots
+
+Click any thumbnail to open the full-size image.
+
+| Cluster | Cluster Hosts | Hosts |
+| --- | --- | --- |
+| <a href="docs/screenshots/hvtop-cluster.PNG"><img src="docs/screenshots/hvtop-cluster.PNG" alt="Cluster overview" width="260"></a> | <a href="docs/screenshots/hvtop-cluster-hosts.PNG"><img src="docs/screenshots/hvtop-cluster-hosts.PNG" alt="Cluster host list" width="260"></a> | <a href="docs/screenshots/hvtop-hosts.PNG"><img src="docs/screenshots/hvtop-hosts.PNG" alt="Hosts overview" width="260"></a> |
+
+| Host Detail | VMs | VM Detail |
+| --- | --- | --- |
+| <a href="docs/screenshots/hvtop-hosts-details.PNG"><img src="docs/screenshots/hvtop-hosts-details.PNG" alt="Host detail view" width="260"></a> | <a href="docs/screenshots/hvtop-vms.PNG"><img src="docs/screenshots/hvtop-vms.PNG" alt="VM overview" width="260"></a> | <a href="docs/screenshots/hvtop-vms-details.PNG"><img src="docs/screenshots/hvtop-vms-details.PNG" alt="VM detail view" width="260"></a> |
+
+| Storage | Storage Detail | vHDX Detail |
+| --- | --- | --- |
+| <a href="docs/screenshots/hvtop-storage.PNG"><img src="docs/screenshots/hvtop-storage.PNG" alt="Storage overview" width="260"></a> | <a href="docs/screenshots/hvtop-storage-details.PNG"><img src="docs/screenshots/hvtop-storage-details.PNG" alt="Storage detail view" width="260"></a> | <a href="docs/screenshots/hvtop-vhdx-details.PNG"><img src="docs/screenshots/hvtop-vhdx-details.PNG" alt="Virtual disk detail view" width="260"></a> |
+
+| Network | Physical NICs | pNIC Detail |
+| --- | --- | --- |
+| <a href="docs/screenshots/hvtop-network.PNG"><img src="docs/screenshots/hvtop-network.PNG" alt="Network overview" width="260"></a> | <a href="docs/screenshots/hvtop-network-pnics.PNG"><img src="docs/screenshots/hvtop-network-pnics.PNG" alt="Physical NIC list" width="260"></a> | <a href="docs/screenshots/hvtop-network-pnics-details.PNG"><img src="docs/screenshots/hvtop-network-pnics-details.PNG" alt="Physical NIC detail view" width="260"></a> |
+
+| vNIC Detail | Events |
+| --- | --- |
+| <a href="docs/screenshots/hvtop-vnic-details.PNG"><img src="docs/screenshots/hvtop-vnic-details.PNG" alt="Virtual NIC detail view" width="260"></a> | <a href="docs/screenshots/hvtop-events.PNG"><img src="docs/screenshots/hvtop-events.PNG" alt="Events view" width="260"></a> |
+
 ## Run Native
 
 ```powershell
