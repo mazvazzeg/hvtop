@@ -24,7 +24,7 @@ dotnet publish -c Release -r win-x64 --self-contained true /p:PublishSingleFile=
 Useful options:
 
 ```powershell
-dotnet run -- --refresh 0.5 --history 15
+dotnet run -- --refresh 1 --history 15
 dotnet run -- --rdc-disable
 dotnet run -- --debug-log
 dotnet run -- --smoke
@@ -35,7 +35,7 @@ dotnet run -- --smoke
 `hvtop.exe` accepts these options:
 
 ```text
---refresh <seconds>        Local UI/data refresh interval. Default: 1
+--refresh <seconds>        Local UI/data refresh interval. Default: 1, minimum: 1
 --history <minutes>        History window for max/min values. Default: 15
 --rdc-port <n>             Remote Data Collector TCP port. Default: 54321
 --rdc-refresh <seconds>    Remote Data Collector interval. Default: 1
