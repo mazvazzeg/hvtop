@@ -15,7 +15,7 @@ namespace hvtop.Native;
 internal static class Program
 {
 #if RDC
-    public const string DisplayVersion = "0.5.3-rdc+20260512.0007";
+    public const string DisplayVersion = "0.5.4-rdc+20260512.0001";
     public const string AppName = "hvtop-rdc";
 
     public static async Task<int> Main(string[] args)
@@ -189,7 +189,7 @@ internal static class Program
     }
 
 #else
-    public const string DisplayVersion = "0.5.3+20260512.0007";
+    public const string DisplayVersion = "0.5.4+20260512.0001";
     public const string AppName = "hvtop";
 
     public static async Task<int> Main(string[] args)
@@ -255,6 +255,7 @@ internal static class Program
             Unit.Mbps => FormatRate(metric.Current),
             Unit.Iops => FormatCompact(metric.Current, suffix: string.Empty, kiloSuffix: "k"),
             Unit.Milliseconds => $"{FormatNumber4(metric.Current)} ms",
+            Unit.QueueDepth => FormatInteger(metric.Current),
             _ => FormatNumber4(metric.Current)
         };
     }
@@ -289,6 +290,9 @@ internal static class Program
         else text = value.ToString("0.00");
         return text.Length > 4 ? text[..4] : text.PadLeft(4);
     }
+
+    private static string FormatInteger(double value)
+        => double.IsNaN(value) ? "n/a" : Math.Max(0, (int)Math.Round(value, MidpointRounding.AwayFromZero)).ToString(CultureInfo.CurrentCulture);
 #endif
 
     private static void ConfigureConsoleEncoding()
@@ -932,7 +936,7 @@ internal sealed class Collector : IDisposable
                     Metric.Iops(diskIopsValue),
                     Metric.Iops(diskReadIopsValue),
                     Metric.Iops(diskWriteIopsValue),
-                    Metric.Plain(diskQueueDepth),
+                    Metric.QueueDepth(diskQueueDepth),
                     Metric.Milliseconds(diskLatencyMs),
                     Status.From(10, 100 - free, diskLatencyMs, diskQueueDepth));
                 return row;
@@ -4643,10 +4647,11 @@ internal sealed record Metric(double Current, double Max, Unit Unit)
     public static Metric Mbps(double value) => new(value, value, Unit.Mbps);
     public static Metric Iops(double value) => new(value, value, Unit.Iops);
     public static Metric Milliseconds(double value) => new(value, value, Unit.Milliseconds);
+    public static Metric QueueDepth(double value) => new(value, value, Unit.QueueDepth);
     public static Metric Plain(double value) => new(value, value, Unit.Plain);
 }
 
-internal enum Unit { Plain, Percent, Mbps, Iops, Milliseconds }
+internal enum Unit { Plain, Percent, Mbps, Iops, Milliseconds, QueueDepth }
 
 internal sealed record ClusterRow(string Name, int NodeCount, int UpNodeCount, string OwnerNode, string Quorum, string FunctionalLevel, string Status);
 
@@ -4825,6 +4830,7 @@ internal sealed class Tui
     private readonly AppState state;
     private readonly Options options;
     private const string ColGap = "    ";
+    private const string KeyboardTipsText = "Arrows/j/k move  PgUp/PgDn page  Home/End top/bottom  Enter drill  s sort  S dir  f refresh  r rescan  q quit";
     private const int MaxNameWidth = 32;
     private const int MinNameWidth = 20;
     private const int CapacityMetricWidth = 25;
@@ -5469,7 +5475,7 @@ internal sealed class Tui
         var sort = CurrentSortLabel();
         WriteLine(0, $"{Program.AppName} {Program.DisplayVersion}  Sample: {s.At:HH:mm:ss}  Refresh: {state.Refresh.TotalSeconds:N1}s  History: {options.History.TotalMinutes:N0}m  Sort: {sort}", ConsoleColor.White);
         WriteLine(1, Nav(), ConsoleColor.Yellow);
-        WriteLine(2, "Arrows/j/k move  PgUp/PgDn page  Home/End top/bottom  Enter drill  s sort  S dir  f refresh  r rescan  q quit", ConsoleColor.DarkGray);
+        WriteLine(2, KeyboardTipsText, ConsoleColor.DarkGray);
 
         if (IsLoading(s))
         {
@@ -5675,19 +5681,30 @@ internal sealed class Tui
             Cell("Read", 10),
             Cell("Read IOPS", 10),
             Cell("Write", 10),
-            Cell("Write IOPS", 10)
+            Cell("Write IOPS", 10),
+            Cell("QD", 6),
+            Cell("LAT", 10)
         });
 
-    private static string VmDiskDataRow(VDiskRow disk)
-        => "  " + string.Join("  ", new[]
+    private static string VmDiskDataRow(VDiskRow disk, Snapshot snapshot, string hostName)
+    {
+        var storage = FindStorageRow(snapshot, hostName, disk.StorageName);
+        return "  " + string.Join("  ", new[]
         {
             Cell(DisplayName(disk.Name, 32), 32),
             Cell(DisplayName(disk.StorageName, 26), 26),
             Cell(FmtValue(disk.ReadMbps, Unit.Mbps), 10),
             Cell(FmtValue(disk.ReadIops, Unit.Iops), 10),
             Cell(FmtValue(disk.WriteMbps, Unit.Mbps), 10),
-            Cell(FmtValue(disk.WriteIops, Unit.Iops), 10)
+            Cell(FmtValue(disk.WriteIops, Unit.Iops), 10),
+            Cell(storage is null ? "n/a" : FmtValue(storage.QueueDepth.Current, storage.QueueDepth.Unit), 6),
+            Cell(storage is null ? "n/a" : FmtValue(storage.Latency.Current, storage.Latency.Unit), 10)
         });
+    }
+
+    private static DiskRow? FindStorageRow(Snapshot snapshot, string hostName, string storageName)
+        => snapshot.Disks.FirstOrDefault(d => d.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase)
+            && d.Name.Equals(storageName, StringComparison.OrdinalIgnoreCase));
 
     private static string VmNetworkHeaderRow()
         => "  " + string.Join("  ", new[]
@@ -5861,7 +5878,7 @@ internal sealed class Tui
         }
 
         WriteLine(4, DetailTitle(detailTarget), ConsoleColor.Cyan);
-        WriteLine(5, new string('-', Math.Min(90, Console.WindowWidth)), ConsoleColor.DarkGray);
+        WriteLine(5, new string('-', Math.Min(KeyboardTipsText.Length, Console.WindowWidth)), ConsoleColor.DarkGray);
 
         switch (detailTarget)
         {
@@ -5876,34 +5893,40 @@ internal sealed class Tui
             case VmRow vm:
                 var vmDisks = GetVmDisks(vm, snapshot);
                 var vmAdapters = GetVmNetworkAdapters(vm, snapshot);
+                var vmReadIo = DetailAggregateMetric(vmDisks, d => d.ReadMbps, d => d.ReadMbpsMax, Unit.Mbps);
+                var vmWriteIo = DetailAggregateMetric(vmDisks, d => d.WriteMbps, d => d.WriteMbpsMax, Unit.Mbps);
+                var vmReadIops = DetailAggregateMetric(vmDisks, d => d.ReadIops, d => d.ReadIopsMax, Unit.Iops);
+                var vmWriteIops = DetailAggregateMetric(vmDisks, d => d.WriteIops, d => d.WriteIopsMax, Unit.Iops);
                 selected = Math.Min(selected, Math.Max(0, vmDisks.Length + vmAdapters.Length - 1));
                 Detail(7, "Name", vm.Name);
                 Detail(8, "Uptime", vm.IsRunning ? UptimeFormatter.FormatExact(vm.Uptime) : "Powered off");
-                Detail(9, "Replication status", vm.Replication, ReplicationColor(vm.ReplicationStatus));
-                DetailScalar(10, string.Empty, string.Empty);
+                DetailScalar(9, string.Empty, string.Empty);
+                DetailCapacityMetricHeader(10, string.Empty);
                 DetailMetricWithCapacity(11, "CPU", vm.Cpu, vm.CpuCapacity);
                 DetailMetricWithCapacity(12, "Memory", vm.Mem, vm.MemCapacity);
                 DetailScalar(13, string.Empty, string.Empty);
-                DetailMetric(14, "Total IO", vm.Io);
-                DetailMetricSplit(15, "  Read", vm.Io, 0.25);
-                DetailMetricSplit(16, "  Write", vm.Io, 0.75);
-                DetailScalar(17, string.Empty, string.Empty);
-                DetailMetric(18, "Total IOPS", vm.Iops);
-                DetailMetricSplit(19, "  Read IOPS", vm.Iops, 0.25);
-                DetailMetricSplit(20, "  Write IOPS", vm.Iops, 0.75);
-                DetailScalar(21, string.Empty, string.Empty);
-                DetailMetric(22, "Latency", vm.Latency);
-                Detail(24, "Status", vm.Status, StatusColor(vm.Status));
-                WriteLine(27, VmDiskHeaderRow(), ConsoleColor.Yellow);
+                DetailMetricHeader(14, string.Empty, "cur", "max");
+                DetailMetric(15, "Total I/O", vm.Io);
+                DetailMetric(16, Branch(false, "Read I/O"), vmReadIo);
+                DetailMetric(17, Branch(true, "Write I/O"), vmWriteIo);
+                DetailScalar(18, string.Empty, string.Empty);
+                DetailMetric(19, "Total IOPS", vm.Iops);
+                DetailMetric(20, Branch(false, "Read IOPS"), vmReadIops);
+                DetailMetric(21, Branch(true, "Write IOPS"), vmWriteIops);
+                DetailMetric(22, "Network", vm.Net);
+                DetailScalar(23, string.Empty, string.Empty);
+                Detail(24, "Replication status", vm.Replication, ReplicationColor(vm.ReplicationStatus));
+                Detail(25, "Status", vm.Status, StatusColor(vm.Status));
+                WriteLine(28, VmDiskHeaderRow(), ConsoleColor.Yellow);
                 for (var i = 0; i < vmDisks.Length; i++)
                 {
                     var disk = vmDisks[i];
-                    var row = VmDiskDataRow(disk);
+                    var row = VmDiskDataRow(disk, snapshot, vm.HostName);
                     var bg = i == selected ? ConsoleColor.DarkCyan : ConsoleColor.Black;
                     var fg = i == selected ? ConsoleColor.White : ConsoleColor.Gray;
-                    WriteLine(28 + i, row, fg, bg);
+                    WriteLine(29 + i, row, fg, bg);
                 }
-                var networkTop = 30 + vmDisks.Length;
+                var networkTop = 31 + vmDisks.Length;
                 WriteLine(networkTop, VmNetworkHeaderRow(), ConsoleColor.Yellow);
                 for (var i = 0; i < vmAdapters.Length; i++)
                 {
@@ -5924,12 +5947,17 @@ internal sealed class Tui
                 Detail(7, "Name", host.Name);
                 Detail(8, "Version", host.Version);
                 Detail(9, "Uptime", UptimeFormatter.FormatExact(host.Uptime));
-                DetailMetricWithCapacity(10, "CPU", host.Cpu, host.CpuCapacity);
-                DetailMetricWithCapacity(11, "Memory", host.Mem, host.MemCapacity);
-                DetailMetric(12, "I/O", host.Io);
-                DetailMetric(13, "Network", host.Net);
-                Detail(15, "Status", host.Status, StatusColor(host.Status));
-                var y = 18;
+                DetailScalar(10, string.Empty, string.Empty);
+                DetailCapacityMetricHeader(11, string.Empty);
+                DetailMetricWithCapacity(12, "CPU", host.Cpu, host.CpuCapacity);
+                DetailMetricWithCapacity(13, "Memory", host.Mem, host.MemCapacity);
+                DetailScalar(14, string.Empty, string.Empty);
+                DetailMetricHeader(15, string.Empty, "cur", "max");
+                DetailMetric(16, "I/O", host.Io);
+                DetailMetric(17, "Network", host.Net);
+                DetailScalar(18, string.Empty, string.Empty);
+                Detail(19, "Status", host.Status, StatusColor(host.Status));
+                var y = 22;
                 var absolute = 0;
                 WriteLine(y++, HostVmHeaderRow(), ConsoleColor.Yellow);
                 foreach (var vmRow in hostVms)
@@ -5961,13 +5989,13 @@ internal sealed class Tui
                 DetailScalar(12, string.Empty, string.Empty);
                 DetailMetricHeader(13, string.Empty, "cur", "max");
                 DetailMetric(14, "Total I/O", Metric.Mbps(virtualDisk.TotalMbps) with { Max = DetailMax(virtualDisk.TotalMbpsMax, virtualDisk.TotalMbps) });
-                DetailMetric(15, "    ├ Read I/O", Metric.Mbps(virtualDisk.ReadMbps) with { Max = DetailMax(virtualDisk.ReadMbpsMax, virtualDisk.ReadMbps) });
-                DetailMetric(16, "    └ Write I/O", Metric.Mbps(virtualDisk.WriteMbps) with { Max = DetailMax(virtualDisk.WriteMbpsMax, virtualDisk.WriteMbps) });
+                DetailMetric(15, Branch(false, "Read I/O"), Metric.Mbps(virtualDisk.ReadMbps) with { Max = DetailMax(virtualDisk.ReadMbpsMax, virtualDisk.ReadMbps) });
+                DetailMetric(16, Branch(true, "Write I/O"), Metric.Mbps(virtualDisk.WriteMbps) with { Max = DetailMax(virtualDisk.WriteMbpsMax, virtualDisk.WriteMbps) });
                 DetailScalar(17, string.Empty, string.Empty);
                 DetailMetricHeader(18, string.Empty, "cur", "max");
                 DetailMetric(19, "Total IOPS", Metric.Iops(virtualDisk.TotalIops) with { Max = DetailMax(virtualDisk.TotalIopsMax, virtualDisk.TotalIops) });
-                DetailMetric(20, "    ├ Read IOPS", Metric.Iops(virtualDisk.ReadIops) with { Max = DetailMax(virtualDisk.ReadIopsMax, virtualDisk.ReadIops) });
-                DetailMetric(21, "    └ Write IOPS", Metric.Iops(virtualDisk.WriteIops) with { Max = DetailMax(virtualDisk.WriteIopsMax, virtualDisk.WriteIops) });
+                DetailMetric(20, Branch(false, "Read IOPS"), Metric.Iops(virtualDisk.ReadIops) with { Max = DetailMax(virtualDisk.ReadIopsMax, virtualDisk.ReadIops) });
+                DetailMetric(21, Branch(true, "Write IOPS"), Metric.Iops(virtualDisk.WriteIops) with { Max = DetailMax(virtualDisk.WriteIopsMax, virtualDisk.WriteIops) });
                 Detail(23, "Status", virtualDisk.TotalMbps <= 0.01 && virtualDisk.TotalIops <= 0.01 ? "IDLE" : "OK", virtualDisk.TotalMbps <= 0.01 && virtualDisk.TotalIops <= 0.01 ? ConsoleColor.Green : ConsoleColor.Gray);
                 break;
             case VmNetworkDetailRow vnic:
@@ -5983,29 +6011,29 @@ internal sealed class Tui
                 DetailScalar(13, string.Empty, string.Empty);
                 DetailMetricHeader(14, string.Empty, "cur", "max");
                 DetailMetric(15, "Throughput", Metric.Mbps(virtualNic.ThroughputMbps) with { Max = DetailMax(virtualNic.ThroughputMbpsMax, virtualNic.ThroughputMbps) });
-                DetailMetric(16, "    ├ Transmit", Metric.Mbps(virtualNic.TxMbps) with { Max = DetailMax(virtualNic.TxMbpsMax, virtualNic.TxMbps) });
-                DetailMetric(17, "    └ Receive", Metric.Mbps(virtualNic.RxMbps) with { Max = DetailMax(virtualNic.RxMbpsMax, virtualNic.RxMbps) });
+                DetailMetric(16, Branch(false, "Receive"), Metric.Mbps(virtualNic.RxMbps) with { Max = DetailMax(virtualNic.RxMbpsMax, virtualNic.RxMbps) });
+                DetailMetric(17, Branch(true, "Transmit"), Metric.Mbps(virtualNic.TxMbps) with { Max = DetailMax(virtualNic.TxMbpsMax, virtualNic.TxMbps) });
                 Detail(19, "Status", vnicStatus, StatusColor(vnicStatus));
                 break;
             case DiskRow disk:
                 Detail(7, "Name", disk.Name);
                 Detail(8, "Host", disk.HostName);
                 Detail(9, "Size", disk.Size);
-                DetailScalar(10, "  ├ Used space", disk.UsedSpace);
-                DetailScalar(11, "  └ Free space", disk.FreeSpace);
+                DetailScalar(10, Branch(false, "Used space"), disk.UsedSpace);
+                DetailScalar(11, Branch(true, "Free space"), disk.FreeSpace);
                 DetailScalar(12, string.Empty, string.Empty);
                 DetailMetricHeader(13, string.Empty, "cur", "min");
                 DetailMetric(14, "Free", disk.Free);
                 DetailScalar(15, string.Empty, string.Empty);
                 DetailMetricHeader(16, string.Empty, "cur", "max");
                 DetailMetric(17, "Total I/O", disk.Io);
-                DetailMetric(18, "    ├ Read I/O", disk.ReadIo);
-                DetailMetric(19, "    └ Write I/O", disk.WriteIo);
+                DetailMetric(18, Branch(false, "Read I/O"), disk.ReadIo);
+                DetailMetric(19, Branch(true, "Write I/O"), disk.WriteIo);
                 DetailScalar(20, string.Empty, string.Empty);
                 DetailMetricHeader(21, string.Empty, "cur", "max");
                 DetailMetric(22, "Total IOPS", disk.Iops);
-                DetailMetric(23, "    ├ Read IOPS", disk.ReadIops);
-                DetailMetric(24, "    └ Write IOPS", disk.WriteIops);
+                DetailMetric(23, Branch(false, "Read IOPS"), disk.ReadIops);
+                DetailMetric(24, Branch(true, "Write IOPS"), disk.WriteIops);
                 DetailScalar(25, string.Empty, string.Empty);
                 DetailMetricHeader(26, string.Empty, "cur", "max");
                 DetailMetric(27, "Queue depth", disk.QueueDepth);
@@ -6019,10 +6047,10 @@ internal sealed class Tui
                 DetailScalar(10, string.Empty, string.Empty);
                 DetailMetricHeader(11, string.Empty, "cur", "max");
                 DetailMetric(12, "Throughput", net.Throughput);
-                DetailMetric(13, "    ├ Transmit", net.Tx);
-                DetailMetric(14, "    ├ Receive", net.Rx);
-                DetailMetric(15, "    ├ RDMA TX", net.RdmaTx);
-                DetailMetric(16, "    └ RDMA RX", net.RdmaRx);
+                DetailMetric(13, Branch(false, "Receive"), net.Rx);
+                DetailMetric(14, Branch(false, "Transmit"), net.Tx);
+                DetailMetric(15, Branch(false, "RDMA RX"), net.RdmaRx);
+                DetailMetric(16, Branch(true, "RDMA TX"), net.RdmaTx);
                 DetailScalar(17, string.Empty, string.Empty);
                 DetailMetricHeader(18, string.Empty, "cur", "max");
                 DetailMetric(19, "Drops", net.Drops);
@@ -6033,6 +6061,15 @@ internal sealed class Tui
 
     private const int DetailLabelWidth = 19;
 
+    private static string Branch(bool last, string label) => $"  {(last ? "└" : "├")} {label}";
+
+    private static Metric DetailAggregateMetric(VDiskRow[] disks, Func<VDiskRow, double> currentSelector, Func<VDiskRow, double> maxSelector, Unit unit)
+    {
+        var current = disks.Sum(currentSelector);
+        var max = disks.Sum(disk => DetailMax(maxSelector(disk), currentSelector(disk)));
+        return new Metric(current, max, unit);
+    }
+
     private void Detail(int y, string label, string value, ConsoleColor color = ConsoleColor.Gray)
         => WriteLine(y, $"  {label,-DetailLabelWidth} {value}", color);
 
@@ -6041,6 +6078,9 @@ internal sealed class Tui
 
     private void DetailMetricHeader(int y, string label, string currentLabel, string maxLabel)
         => DetailScalar(y, label, DetailMetricHeaderValue(currentLabel, maxLabel), ConsoleColor.DarkCyan);
+
+    private void DetailCapacityMetricHeader(int y, string label)
+        => DetailScalar(y, label, DetailCapacityMetricHeaderValue(), ConsoleColor.DarkCyan);
 
     private void DetailMetricWithCapacity(int y, string label, Metric metric, string capacity)
         => DetailScalar(y, label, DetailMetricWithCapacityValue(metric, capacity));
@@ -6191,6 +6231,9 @@ internal sealed class Tui
     private static string DetailMetricWithCapacityValue(Metric metric, string capacity)
         => $"{Cell(FmtValue(metric.Current, metric.Unit), 4, true)} | {Cell(FmtValue(metric.Max, metric.Unit), 4, true)} | {Cell($"({capacity})", 12)}";
 
+    private static string DetailCapacityMetricHeaderValue()
+        => $"{Cell("cur", 4, true)} | {Cell("max", 4, true)} | {Cell("cfg", 12)}";
+
     private static string DetailSplitValue(Metric metric, double ratio)
         => $"{Cell(FmtValue(metric.Current * ratio, metric.Unit), 9, true)} | {Cell(FmtValue(metric.Max * ratio, metric.Unit), 9)}";
 
@@ -6215,6 +6258,7 @@ internal sealed class Tui
             Unit.Mbps => FormatRate(value),
             Unit.Iops => FormatCompact(value, suffix: string.Empty, kiloSuffix: "k"),
             Unit.Milliseconds => $"{FormatNumber4(value)} ms",
+            Unit.QueueDepth => FormatInteger(value),
             _ => FormatNumber4(value)
         };
     }
@@ -6247,6 +6291,9 @@ internal sealed class Tui
         else text = value.ToString("0.00");
         return text.Length > 4 ? text[..4] : text.PadLeft(4);
     }
+
+    private static string FormatInteger(double value)
+        => double.IsNaN(value) ? "n/a" : Math.Max(0, (int)Math.Round(value, MidpointRounding.AwayFromZero)).ToString(CultureInfo.CurrentCulture);
 
     private static ConsoleColor StatusColor(string status)
     {
