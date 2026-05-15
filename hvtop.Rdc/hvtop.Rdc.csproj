@@ -12,10 +12,10 @@
     <Authors>ZeroTime Services</Authors>
     <Copyright>Copyright (c) 2026 ZeroTime Services</Copyright>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <Version>0.5.4</Version>
-    <AssemblyVersion>0.5.4.0</AssemblyVersion>
-    <FileVersion>0.5.4.1</FileVersion>
-    <InformationalVersion>0.5.4-rdc+20260512.0001</InformationalVersion>
+    <Version>0.6.0</Version>
+    <AssemblyVersion>0.6.0.0</AssemblyVersion>
+    <FileVersion>0.6.0.20</FileVersion>
+    <InformationalVersion>0.6.0-rdc+20260515.0003</InformationalVersion>
     <ApplicationIcon>..\hvtop.Native\assets\hvtop.ico</ApplicationIcon>
     <PublishSingleFile>true</PublishSingleFile>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
@@ -27,6 +27,6 @@
     <DefineConstants>$(DefineConstants);RDC</DefineConstants>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="..\hvtop.Native\Program.cs" Link="Program.cs" />
+    <Compile Include="..\hvtop.Native\**\*.cs" Exclude="..\hvtop.Native\bin\**;..\hvtop.Native\obj\**" Link="Shared\%(RecursiveDir)%(Filename)%(Extension)" />
   </ItemGroup>
 </Project>

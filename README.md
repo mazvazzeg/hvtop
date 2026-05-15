@@ -45,6 +45,27 @@ Publish a single executable:
 dotnet publish -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true /p:EnableCompressionInSingleFile=true
 ```
 
+Build release zip packages:
+
+```powershell
+.\scripts\build-release.ps1
+```
+
+This creates both release variants under `artifacts\release`:
+
+```text
+hvtop-<version>-win-x64.zip
+  hvtop.exe
+  hvtop-rdc.exe
+
+hvtop-<version>-win-x64-portable.zip
+  hvtop.exe
+  hvtop-rdc.exe
+```
+
+The non-portable `win-x64` package is framework-dependent and requires the .NET
+8 runtime on the target host. The `win-x64-portable` package is self-contained.
+
 Useful options:
 
 ```powershell
@@ -138,9 +159,11 @@ so values continue updating live while you are drilled in.
 Each metric shows current and max-in-history values as `current | max`. The history
 window defaults to 15 minutes.
 
-Throughput values scale as `KB/s`, `MB/s`, then `GB/s` with compact three-digit
-numbers, for example `999 KB/s`, `1.32 MB/s`, `11.3 MB/s`, `111 MB/s`,
-`1.33 GB/s`, and `32.2 GB/s`.
+Metric values use a compact four-character numeric display where the unit is
+outside the number. Examples: `999 KB/s`, `1.00 MB/s`, `1.32 GB/s`, `32.2 GB/s`.
+Throughput values scale on binary boundaries: `1024 KB/s` becomes `1.00 MB/s`,
+`1024 MB/s` becomes `1.00 GB/s`, and the same 1024-based rule is used for
+capacity values such as `MB`, `GB`, and `TB`.
 
 ## Remote Data Collector
 

@@ -26,6 +26,7 @@ obj/
 *.pdb
 *.deps.json
 *.runtimeconfig.json
+artifacts/
 
 # Keep source assets explicit, not generated publish artifacts.
 !hvtop.Native/assets/*.ico
