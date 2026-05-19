@@ -81,11 +81,24 @@ function New-HvtopZip {
     Copy-Item -LiteralPath (Join-Path $nativeOut "hvtop.exe") -Destination (Join-Path $zipStage "hvtop.exe") -Force
     Copy-Item -LiteralPath (Join-Path $rdcOut "hvtop-rdc.exe") -Destination (Join-Path $zipStage "hvtop-rdc.exe") -Force
 
+    $hvtopExe = Join-Path $zipStage "hvtop.exe"
+    $rdcExe = Join-Path $zipStage "hvtop-rdc.exe"
+    $hashText = @(
+        "$zipBase`:",
+        "hvtop.exe SHA256: $((Get-FileHash -LiteralPath $hvtopExe -Algorithm SHA256).Hash)",
+        "hvtop-rdc.exe SHA256: $((Get-FileHash -LiteralPath $rdcExe -Algorithm SHA256).Hash)"
+    )
+    $hashPath = Join-Path $zipStage "SHA256SUMS.txt"
+    $hashText | Set-Content -LiteralPath $hashPath -Encoding ascii
+    Write-Host ""
+    $hashText | ForEach-Object { Write-Host $_ }
+    Write-Host ""
+
     if (Test-Path -LiteralPath $zipPath) {
         Remove-Item -LiteralPath $zipPath -Force
     }
 
-    Compress-Archive -LiteralPath (Join-Path $zipStage "hvtop.exe"), (Join-Path $zipStage "hvtop-rdc.exe") -DestinationPath $zipPath -Force
+    Compress-Archive -LiteralPath $hvtopExe, $rdcExe, $hashPath -DestinationPath $zipPath -Force
     Write-Host "Created $zipPath"
 }
 

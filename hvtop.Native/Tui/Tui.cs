@@ -12,6 +12,10 @@ internal sealed class Tui
     private const int MetricWidth = 21;
     private const int ShortMetricWidth = 13;
     private const int HostVersionWidth = 28;
+    private const int DashboardNameWidth = 20;
+    private const int HostDashboardVersionWidth = 7;
+    private const int DashboardCapacityMetricWidth = 22;
+    private const int DashboardCapacityConfigWidth = 8;
     private const int VmVersionWidth = 7;
     private const int HostColumnWidth = 14;
     private const int UptimeWidth = 4;
@@ -741,48 +745,48 @@ internal sealed class Tui
             case Panel.Hosts:
                 if (drillView == DrillView.HostVms)
                 {
-                    var nameWidth = TableNameWidth(TableKind.VmLike);
+                    var nameWidth = DashboardNameWidth;
                     RenderRows(
-                        Row(Header(DisplayName($"HOST {selectedHostName} -> VMS", nameWidth), nameWidth), Header("VER", VmVersionWidth), HeaderRight("UP", UptimeWidth), CapacityMetricGroupHeader("CPU"), CapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
-                        Row(Header(string.Empty, nameWidth), Header(string.Empty, VmVersionWidth), Header(string.Empty, UptimeWidth), CapacityMetricSubHeader(), CapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
+                        Row(Header(DisplayName($"HOST {selectedHostName} -> VMS", nameWidth), nameWidth), Header("VER", VmVersionWidth), HeaderRight("UP", UptimeWidth), DashboardCapacityMetricGroupHeader("CPU"), DashboardCapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
+                        Row(Header(string.Empty, nameWidth), Header(string.Empty, VmVersionWidth), Header(string.Empty, UptimeWidth), DashboardCapacityMetricSubHeader(), DashboardCapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
                         CurrentRows().Cast<VmRow>().ToArray(),
-                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, VmVersionWidth), Cell(r.IsRunning ? UptimeFormatter.FormatShort(r.Uptime) : "OFF", UptimeWidth, true), FmtWithCapacity(r.Cpu, r.CpuCapacity), FmtWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
+                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, VmVersionWidth), Cell(r.IsRunning ? UptimeFormatter.FormatShort(r.Uptime) : "OFF", UptimeWidth, true), FmtDashboardWithCapacity(r.Cpu, r.CpuCapacity), FmtDashboardWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
                 }
                 else
                 {
-                    var nameWidth = TableNameWidth(TableKind.HostLike);
+                    var nameWidth = DashboardNameWidth;
                     RenderRows(
-                        Row(Header("HOSTNAME", nameWidth), Header("VER", HostVersionWidth), HeaderRight("UP", UptimeWidth), CapacityMetricGroupHeader("CPU"), CapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
-                        Row(Header(string.Empty, nameWidth), Header(string.Empty, HostVersionWidth), Header(string.Empty, UptimeWidth), CapacityMetricSubHeader(), CapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
+                        Row(Header("HOSTNAME", nameWidth), Header("VER", HostDashboardVersionWidth), HeaderRight("UP", UptimeWidth), DashboardCapacityMetricGroupHeader("CPU"), DashboardCapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
+                        Row(Header(string.Empty, nameWidth), Header(string.Empty, HostDashboardVersionWidth), Header(string.Empty, UptimeWidth), DashboardCapacityMetricSubHeader(), DashboardCapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
                         CurrentRows().Cast<HostRow>().ToArray(),
-                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, HostVersionWidth), Cell(UptimeFormatter.FormatShort(r.Uptime), UptimeWidth, true), FmtWithCapacity(r.Cpu, r.CpuCapacity), FmtWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
+                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(ShortHostVersion(r.Version), HostDashboardVersionWidth), Cell(UptimeFormatter.FormatShort(r.Uptime), UptimeWidth, true), FmtDashboardWithCapacity(r.Cpu, r.CpuCapacity), FmtDashboardWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
                 }
                 break;
             case Panel.Vms:
                 {
-                    var nameWidth = TableNameWidth(TableKind.VmLike);
+                    var nameWidth = DashboardNameWidth;
                     RenderRows(
-                        Row(Header("HOST", HostColumnWidth), Header("NAME", nameWidth), Header("VER", VmVersionWidth), HeaderRight("UP", UptimeWidth), CapacityMetricGroupHeader("CPU"), CapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
-                        Row(Header(string.Empty, HostColumnWidth), Header(string.Empty, nameWidth), Header(string.Empty, VmVersionWidth), Header(string.Empty, UptimeWidth), CapacityMetricSubHeader(), CapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
+                        Row(Header("HOST", HostColumnWidth), Header("NAME", nameWidth), Header("VER", VmVersionWidth), HeaderRight("UP", UptimeWidth), DashboardCapacityMetricGroupHeader("CPU"), DashboardCapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
+                        Row(Header(string.Empty, HostColumnWidth), Header(string.Empty, nameWidth), Header(string.Empty, VmVersionWidth), Header(string.Empty, UptimeWidth), DashboardCapacityMetricSubHeader(), DashboardCapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
                         CurrentRows().Cast<VmRow>().ToArray(),
-                        r => Row(Cell(DisplayName(r.HostName, HostColumnWidth), HostColumnWidth), Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, VmVersionWidth), Cell(r.IsRunning ? UptimeFormatter.FormatShort(r.Uptime) : "OFF", UptimeWidth, true), FmtWithCapacity(r.Cpu, r.CpuCapacity), FmtWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
+                        r => Row(Cell(DisplayName(r.HostName, HostColumnWidth), HostColumnWidth), Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, VmVersionWidth), Cell(r.IsRunning ? UptimeFormatter.FormatShort(r.Uptime) : "OFF", UptimeWidth, true), FmtDashboardWithCapacity(r.Cpu, r.CpuCapacity), FmtDashboardWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
                 }
                 break;
             case Panel.Disks:
                 {
-                    var nameWidth = TableNameWidth(TableKind.DiskLike);
+                    var nameWidth = DashboardNameWidth;
                     RenderRows(
-                        Row(Header("HOST", HostColumnWidth), Header("NAME", nameWidth), HeaderRight("SIZE", SizeWidth), GroupHeader("FREE", MetricWidth), GroupHeader("I/O", MetricWidth), GroupHeader("IOPS", MetricWidth), GroupHeader("QD", ShortMetricWidth), GroupHeader("LAT", ShortMetricWidth), Header("STA", StatusWidth)),
-                        Row(Header(string.Empty, HostColumnWidth), Header(string.Empty, nameWidth), Header(string.Empty, SizeWidth), FreeMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), ShortMetricSubHeader(), ShortMetricSubHeader(), Header(string.Empty, StatusWidth)),
+                        Row(Header("HOST", HostColumnWidth), Header("NAME", nameWidth), HeaderRight("SIZE", SizeWidth), GroupHeader("FREE", ShortMetricWidth), GroupHeader("I/O", MetricWidth), GroupHeader("IOPS", ShortMetricWidth), GroupHeader("QD", ShortMetricWidth), GroupHeader("LAT", ShortMetricWidth), Header("STA", StatusWidth)),
+                        Row(Header(string.Empty, HostColumnWidth), Header(string.Empty, nameWidth), Header(string.Empty, SizeWidth), FreeShortMetricSubHeader(), MetricSubHeader(), ShortMetricSubHeader(), ShortMetricSubHeader(), ShortMetricSubHeader(), Header(string.Empty, StatusWidth)),
                         CurrentRows().Cast<DiskRow>().ToArray(),
-                        r => Row(Cell(DisplayName(r.HostName, HostColumnWidth), HostColumnWidth), Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Size, SizeWidth, true), Fmt(r.Free), Fmt(r.Io), Fmt(r.Iops), FmtShort(r.QueueDepth), FmtShort(r.Latency), Cell(r.Status, StatusWidth)));
+                        r => Row(Cell(DisplayName(r.HostName, HostColumnWidth), HostColumnWidth), Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Size, SizeWidth, true), FmtShort(r.Free), Fmt(r.Io), FmtShort(r.Iops), FmtShort(r.QueueDepth), FmtShort(r.Latency), Cell(r.Status, StatusWidth)));
                 }
                 break;
             case Panel.Network:
                 {
                     if (drillView == DrillView.NetworkAdapters)
                     {
-                        var nameWidth = TableNameWidth(TableKind.NetworkLike);
+                        var nameWidth = DashboardNameWidth;
                         var switchName = CurrentNetworkSwitchDisplayName();
                         RenderRows(
                             Row(Header(DisplayName($"HOST {selectedHostName} -> VSWITCH {switchName} -> PNICS", nameWidth), nameWidth), Header("LINK", LinkWidth), GroupHeader("THR", MetricWidth), GroupHeader("RX", MetricWidth), GroupHeader("TX", MetricWidth), GroupHeader("DROPS", ShortMetricWidth), Header("STA", StatusWidth)),
@@ -792,7 +796,7 @@ internal sealed class Tui
                     }
                     else
                     {
-                        var nameWidth = TableNameWidth(TableKind.NetworkSwitchLike);
+                        var nameWidth = DashboardNameWidth;
                         RenderRows(
                             Row(Header("HOST", HostColumnWidth), Header("VSWITCH", nameWidth), Header("UPL", UplinkWidth), Header("LINK", LinkWidth), GroupHeader("THR", MetricWidth), GroupHeader("RX", MetricWidth), GroupHeader("TX", MetricWidth), Header("STA", StatusWidth)),
                             Row(Header(string.Empty, HostColumnWidth), Header(string.Empty, nameWidth), Header(string.Empty, UplinkWidth), Header(string.Empty, LinkWidth), MetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
@@ -825,13 +829,21 @@ internal sealed class Tui
     private static string CapacityMetricGroupHeader(string label)
         => Cell(new string(' ', 7) + Cell(label, 4), CapacityMetricWidth);
 
+    private static string DashboardCapacityMetricGroupHeader(string label)
+        => GroupHeader(label, DashboardCapacityMetricWidth);
+
     private static string MetricSubHeader() => FixedMetricHeaderCell("cur", "max", valueWidth: 9, width: MetricWidth);
 
     private static string FreeMetricSubHeader() => FixedMetricHeaderCell("cur", "min", valueWidth: 9, width: MetricWidth);
 
+    private static string FreeShortMetricSubHeader() => FixedMetricHeaderCell("cur", "min", valueWidth: 5, width: ShortMetricWidth);
+
     private static string ShortMetricSubHeader() => FixedMetricHeaderCell("cur", "max", valueWidth: 5, width: ShortMetricWidth);
 
     private static string CapacityMetricSubHeader() => FixedMetricHeaderCell("cur", "max", "cfg", currentWidth: 4, maxWidth: 4, configWidth: 11, width: CapacityMetricWidth);
+
+    private static string DashboardCapacityMetricSubHeader()
+        => Cell($"{Cell("cur", 4, true)} | {Cell("max", 4)} | {Cell("cfg", DashboardCapacityConfigWidth)}", DashboardCapacityMetricWidth);
 
     private static string Cell(string text, int width, bool alignRight = false)
     {
@@ -846,6 +858,16 @@ internal sealed class Tui
         if (width < 12) return name[..width];
         var edge = Math.Max(4, (width - 4) / 2);
         return $"{name[..edge]}....{name[^edge..]}";
+    }
+
+    private static string ShortHostVersion(string version)
+    {
+        if (string.IsNullOrWhiteSpace(version))
+            return string.Empty;
+
+        var paren = version.IndexOf('(');
+        var text = paren > 0 ? version[..paren] : version;
+        return text.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? string.Empty;
     }
 
     private static string VmDiskHeaderRow()
@@ -1631,6 +1653,9 @@ internal sealed class Tui
     private static string FmtShort(Metric metric) => FixedMetricCell(FmtValue(metric.Current, metric.Unit), FmtValue(metric.Max, metric.Unit), valueWidth: 5, width: ShortMetricWidth);
 
     private static string FmtWithCapacity(Metric metric, string capacity) => FixedMetricCell(FmtValue(metric.Current, metric.Unit), FmtValue(metric.Max, metric.Unit), $"({capacity})", valueWidth: 4, configWidth: 11, width: CapacityMetricWidth);
+
+    private static string FmtDashboardWithCapacity(Metric metric, string capacity)
+        => Cell($"{Cell(FmtValue(metric.Current, metric.Unit), 4, true)} | {Cell(FmtValue(metric.Max, metric.Unit), 4, true)} | {Cell($"({capacity})", DashboardCapacityConfigWidth)}", DashboardCapacityMetricWidth);
 
     private static string DetailMetricValue(Metric metric)
         => $"{Cell(FmtValue(metric.Current, metric.Unit), 9, true)} | {Cell(FmtValue(metric.Max, metric.Unit), 9)}";
