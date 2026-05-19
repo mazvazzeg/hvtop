@@ -48,6 +48,9 @@ internal sealed class Collector : IDisposable
 
     public Snapshot Collect(bool refreshRequested = false)
     {
+        if (!options.LocalCollectors)
+            return CollectRemoteOnly();
+
         var sampleStarted = Stopwatch.GetTimestamp();
         var timings = options.DebugCounters ? new List<(string Name, double Ms)>() : null;
         void Mark(string name, long started)
@@ -242,7 +245,7 @@ internal sealed class Collector : IDisposable
             MaybeAddSpikeEvent(host, disks);
             Mark("remote-events", stepStarted);
             MaybeAddCounterTiming(timings, sampleStarted);
-            return new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, networkSwitches, adapters, events, mergedTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery);
+            return new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, networkSwitches, adapters, events, mergedTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery, remote.StatusSummary);
         }
 
         stepStarted = Stopwatch.GetTimestamp();
@@ -259,7 +262,7 @@ internal sealed class Collector : IDisposable
         MaybeAddSpikeEvent(host, disks);
         Mark("remote-events", stepStarted);
         MaybeAddCounterTiming(timings, sampleStarted);
-        return new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, networkSwitches, adapters, events, liveTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery);
+        return new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, networkSwitches, adapters, events, liveTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery, remote.StatusSummary);
     }
 
     private void MaybeAddCounterTiming(List<(string Name, double Ms)>? timings, long sampleStarted)
@@ -291,6 +294,33 @@ internal sealed class Collector : IDisposable
         networkSwitches = RemoteCollectorManager.MergeNetworkSwitches(networkSwitches, snapshots);
         networks = RemoteCollectorManager.MergeNetworks(networks, snapshots);
         topology = RemoteCollectorManager.MergeTopology(topology, snapshots);
+    }
+
+    private Snapshot CollectRemoteOnly()
+    {
+        remote.UpdateTargets([], Environment.MachineName);
+        foreach (var evt in remote.DrainEvents())
+            AddEvent(evt.Severity, evt.Message);
+
+        var snapshots = remote.ReadSnapshots();
+        if (snapshots.Length == 0)
+        {
+            if (remote.HasTerminalFailure)
+                throw new InvalidOperationException($"RDC failed and local collection is disabled: {remote.TerminalFailureSummary}");
+
+            var waiting = new DiscoveryProgress(false, false, false, false, false, 0, 0, 0, 0);
+            return new Snapshot(DateTime.Now, [], [], [], [], [], [], events, [], true, false, false, waiting, remote.StatusSummary);
+        }
+
+        var hosts = RemoteCollectorManager.MergeHosts([], snapshots);
+        var vms = RemoteCollectorManager.MergeVms([], snapshots);
+        var disks = RemoteCollectorManager.MergeDisks([], snapshots);
+        var networkSwitches = RemoteCollectorManager.MergeNetworkSwitches([], snapshots);
+        var networks = RemoteCollectorManager.MergeNetworks([], snapshots);
+        var topology = RemoteCollectorManager.MergeTopology([], snapshots);
+        var discovery = new DiscoveryProgress(hosts.Length > 0, true, disks.Length > 0, true, true, vms.Length, disks.Length, networks.Count(n => n.IsUp), networkSwitches.Length);
+        initialDiscoveryComplete = true;
+        return new Snapshot(DateTime.Now, [], hosts, vms, disks, networkSwitches, networks, events, topology, false, false, false, discovery, remote.StatusSummary);
     }
 
     private static HostRow[] BuildHosts(HostRow localHost, ClusterNodeRow[] clusterNodes)

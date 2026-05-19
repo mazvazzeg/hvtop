@@ -140,6 +140,7 @@ internal sealed class HyperVTopology
     {
         var diskMap = TryReadPowerShellDisks(disks);
         var checkpointMap = TryReadPowerShellCheckpoints(diskMap);
+        diskMap = AddCheckpointDiskFallback(diskMap, checkpointMap, disks);
         var switches = TryReadPowerShellSwitches();
         var netMap = TryReadPowerShellNetworks(switches).ToDictionary(vm => vm.VmName, StringComparer.OrdinalIgnoreCase);
         var names = new HashSet<string>(diskMap.Keys.Concat(netMap.Keys).Concat(checkpointMap.Keys), StringComparer.OrdinalIgnoreCase);
@@ -157,33 +158,49 @@ internal sealed class HyperVTopology
 
     private static Dictionary<string, VDiskRow[]> TryReadPowerShellDisks(DiskRow[] disks)
     {
-        if (!PowerShellRunner.TryRun("Import-Module Hyper-V -ErrorAction Stop; Get-VM | Get-VMHardDiskDrive | Select-Object VMName,Path | ConvertTo-Csv -NoTypeInformation", 5000, out var output))
+        const string script = "$ErrorActionPreference='Stop'; Import-Module Hyper-V -ErrorAction Stop | Out-Null; " +
+            "$rows=@(); " +
+            "foreach ($vm in @(Get-VM -ErrorAction Stop)) { " +
+            "  foreach ($drive in @($vm | Get-VMHardDiskDrive -ErrorAction SilentlyContinue)) { " +
+            "    if ($drive.Path) { $rows += [pscustomobject]@{ VMName=[string]$vm.Name; Path=[string]$drive.Path } } " +
+            "  } " +
+            "} ; @($rows) | ConvertTo-Json -Compress -Depth 3";
+        if (!PowerShellRunner.TryRun(script, 20000, out var output))
             return new(StringComparer.OrdinalIgnoreCase);
 
         var storageCounters = VirtualDiskCounterSampler.Read();
-        return output
-            .Split(["\r\n", "\n"], StringSplitOptions.RemoveEmptyEntries)
-            .Skip(1)
-            .Select(HyperVInventory.ParseCsvLine)
-            .Where(parts => parts.Length >= 2 && IsVirtualDiskPath(parts[1]))
-            .GroupBy(parts => parts[0].Trim(), StringComparer.OrdinalIgnoreCase)
+        return ParseVmDiskJson(output, disks, storageCounters);
+    }
+
+    private static Dictionary<string, VDiskRow[]> AddCheckpointDiskFallback(
+        Dictionary<string, VDiskRow[]> diskMap,
+        Dictionary<string, VmCheckpointRow[]> checkpointMap,
+        DiskRow[] disks)
+    {
+        var missingPaths = checkpointMap
+            .SelectMany(kvp => kvp.Value
+                .Where(checkpoint => IsVirtualDiskPath(checkpoint.Path)
+                    && (!diskMap.TryGetValue(kvp.Key, out var existing)
+                        || !existing.Any(disk => disk.Path.Equals(checkpoint.Path, StringComparison.OrdinalIgnoreCase))))
+                .Select(checkpoint => new { VmName = kvp.Key, checkpoint.Path }))
+            .ToArray();
+        if (missingPaths.Length == 0)
+            return diskMap;
+
+        var storageCounters = VirtualDiskCounterSampler.Read();
+        return diskMap
+            .Concat(missingPaths
+                .GroupBy(item => item.VmName, StringComparer.OrdinalIgnoreCase)
+                .Select(group => new KeyValuePair<string, VDiskRow[]>(
+                    group.Key,
+                    group.Select(item => BuildVDiskRow(item.Path, disks, storageCounters)).ToArray())))
+            .GroupBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(
                 g => g.Key,
-                g => g.Select(parts =>
-                {
-                    var path = parts[1]?.Trim() ?? string.Empty;
-                    var diskName = Path.GetFileName(path);
-                    var stats = HyperVNaming.ResolveDiskStats(storageCounters, path, diskName);
-                    stats ??= new VirtualDiskStats(0, 0, 0, 0);
-                    return new VDiskRow(
-                        string.IsNullOrWhiteSpace(diskName) ? path : diskName,
-                        path,
-                        ResolveStorageName(path, disks),
-                        stats.ReadMbps,
-                        stats.ReadIops,
-                        stats.WriteMbps,
-                        stats.WriteIops);
-                }).OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase).ToArray(),
+                g => g.SelectMany(kvp => kvp.Value)
+                    .DistinctBy(disk => string.IsNullOrWhiteSpace(disk.Path) ? disk.Name : disk.Path, StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase)
+                    .ToArray(),
                 StringComparer.OrdinalIgnoreCase);
     }
 
@@ -338,6 +355,59 @@ internal sealed class HyperVTopology
         {
             return [];
         }
+    }
+
+    private static Dictionary<string, VDiskRow[]> ParseVmDiskJson(string json, DiskRow[] disks, Dictionary<string, VirtualDiskStats> storageCounters)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return new(StringComparer.OrdinalIgnoreCase);
+
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            var rows = document.RootElement.ValueKind switch
+            {
+                JsonValueKind.Array => document.RootElement.EnumerateArray().ToArray(),
+                JsonValueKind.Object => [document.RootElement],
+                _ => []
+            };
+
+            return rows
+                .Select(element => new
+                {
+                    VmName = HyperVInventory.ReadJsonString(element, "VMName"),
+                    Path = HyperVInventory.ReadJsonString(element, "Path")
+                })
+                .Where(row => !string.IsNullOrWhiteSpace(row.VmName) && IsVirtualDiskPath(row.Path))
+                .GroupBy(row => row.VmName, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group
+                        .Select(row => BuildVDiskRow(row.Path, disks, storageCounters))
+                        .DistinctBy(row => string.IsNullOrWhiteSpace(row.Path) ? row.Name : row.Path, StringComparer.OrdinalIgnoreCase)
+                        .OrderBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
+                        .ToArray(),
+                    StringComparer.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return new(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    private static VDiskRow BuildVDiskRow(string path, DiskRow[] disks, Dictionary<string, VirtualDiskStats> storageCounters)
+    {
+        var diskName = Path.GetFileName(path);
+        var stats = HyperVNaming.ResolveDiskStats(storageCounters, path, diskName);
+        stats ??= new VirtualDiskStats(0, 0, 0, 0);
+        return new VDiskRow(
+            string.IsNullOrWhiteSpace(diskName) ? path : diskName,
+            path,
+            ResolveStorageName(path, disks),
+            stats.ReadMbps,
+            stats.ReadIops,
+            stats.WriteMbps,
+            stats.WriteIops);
     }
 
     private static Dictionary<string, VmCheckpointRow[]> ParseCheckpointJson(string json)

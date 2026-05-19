@@ -12,10 +12,10 @@
     <Authors>ZeroTime Services</Authors>
     <Copyright>Copyright (c) 2026 ZeroTime Services</Copyright>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <Version>0.6.1</Version>
-    <AssemblyVersion>0.6.1.0</AssemblyVersion>
-    <FileVersion>0.6.1.128</FileVersion>
-    <InformationalVersion>0.6.1+20260519.0128</InformationalVersion>
+    <Version>0.6.2</Version>
+    <AssemblyVersion>0.6.2.0</AssemblyVersion>
+    <FileVersion>0.6.2.137</FileVersion>
+    <InformationalVersion>0.6.2+20260520.0137</InformationalVersion>
     <ApplicationIcon>assets\hvtop.ico</ApplicationIcon>
     <PublishSingleFile>true</PublishSingleFile>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>

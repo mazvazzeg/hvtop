@@ -13,9 +13,10 @@ internal sealed record Snapshot(
     bool Loading,
     bool InventoryRefreshing,
     bool TopologyRefreshing,
-    DiscoveryProgress Discovery)
+    DiscoveryProgress Discovery,
+    string RdcStatus)
 {
-    public static Snapshot Empty { get; } = new(DateTime.Now, [], [], [], [], [], [], [], [], true, false, false, DiscoveryProgress.Empty);
+    public static Snapshot Empty { get; } = new(DateTime.Now, [], [], [], [], [], [], [], [], true, false, false, DiscoveryProgress.Empty, "idle");
 }
 
 internal sealed record DiscoveryProgress(

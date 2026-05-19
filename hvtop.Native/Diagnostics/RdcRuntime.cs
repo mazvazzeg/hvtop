@@ -44,7 +44,9 @@ internal static class RdcLog
         var copy = args.ToArray();
         for (var i = 0; i < copy.Length; i++)
         {
-            if (copy[i].Equals("--token", StringComparison.OrdinalIgnoreCase) && i + 1 < copy.Length)
+            if ((copy[i].Equals("--token", StringComparison.OrdinalIgnoreCase)
+                 || copy[i].Equals("--rdc-password", StringComparison.OrdinalIgnoreCase))
+                && i + 1 < copy.Length)
                 copy[i + 1] = "<redacted>";
         }
 

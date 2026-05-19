@@ -52,11 +52,59 @@ internal static class PowerShellRunner
         }
 
         Task.WaitAll([stdoutTask, stderrTask], 500);
-        output = stdoutTask.IsCompletedSuccessfully ? stdoutTask.Result : string.Empty;
-        error = stderrTask.IsCompletedSuccessfully ? stderrTask.Result : string.Empty;
+        output = stdoutTask.IsCompletedSuccessfully ? DecodePowerShellStream(stdoutTask.Result) : string.Empty;
+        error = stderrTask.IsCompletedSuccessfully ? DecodePowerShellStream(stderrTask.Result) : string.Empty;
         exitCode = process.ExitCode;
         timedOut = false;
         return process.ExitCode == 0;
     }
+
+    private static string DecodePowerShellStream(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return string.Empty;
+
+        var text = value.Trim();
+        if (!text.StartsWith("#< CLIXML", StringComparison.OrdinalIgnoreCase))
+            return text;
+
+        var xmlStart = text.IndexOf("<Objs", StringComparison.OrdinalIgnoreCase);
+        if (xmlStart < 0)
+            return DecodePowerShellEscapes(text);
+
+        var xml = text[xmlStart..];
+        var messages = new List<string>();
+        var searchFrom = 0;
+        const string openMarker = "<S S=\"Error\">";
+        const string closeMarker = "</S>";
+        while (true)
+        {
+            var open = xml.IndexOf(openMarker, searchFrom, StringComparison.OrdinalIgnoreCase);
+            if (open < 0)
+                break;
+
+            open += openMarker.Length;
+            var close = xml.IndexOf(closeMarker, open, StringComparison.OrdinalIgnoreCase);
+            if (close < 0)
+                break;
+
+            var message = WebUtility.HtmlDecode(xml[open..close]);
+            message = DecodePowerShellEscapes(message).Trim();
+            if (!string.IsNullOrWhiteSpace(message))
+                messages.Add(message);
+            searchFrom = close + closeMarker.Length;
+        }
+
+        return messages.Count == 0 ? DecodePowerShellEscapes(xml) : string.Join(" ", messages);
+    }
+
+    private static string DecodePowerShellEscapes(string value)
+        => value
+            .Replace("_x000D__x000A_", " ")
+            .Replace("_x000D_", " ")
+            .Replace("_x000A_", " ")
+            .Replace("_x0009_", " ")
+            .ReplaceLineEndings(" ")
+            .Trim();
 }
 

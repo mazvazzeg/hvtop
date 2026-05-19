@@ -15,7 +15,7 @@ namespace hvtop.Native;
 internal static class Program
 {
 #if RDC
-    public const string DisplayVersion = "0.6.1-rdc+20260519.0128";
+    public const string DisplayVersion = "0.6.2-rdc+20260520.0137";
     public const string AppName = "hvtop-rdc";
 
     public static async Task<int> Main(string[] args)
@@ -41,7 +41,7 @@ internal static class Program
             RdcLog.Info($"parsed options listen='{options.ListenPrefix}' port={options.Port} refresh={options.Refresh.TotalSeconds:N1}s history={options.History.TotalMinutes:N0}m token={(string.IsNullOrWhiteSpace(options.Token) ? "none" : "set")}");
             using var cts = new CancellationTokenSource();
             using var firewallRule = RdcFirewallRule.Ensure(options.Port);
-            using var collector = new Collector(new Options(options.Refresh, options.History, false, false, options.Port, options.Refresh, options.DebugLog, options.DebugCounters, false, false, null));
+                    using var collector = new Collector(new Options(options.Refresh, options.History, false, true, false, options.Port, options.Refresh, null, null, null, options.DebugLog, options.DebugCounters, false, false, null));
             var current = Snapshot.Empty;
             var firstSample = true;
             var sampler = Task.Run(async () =>
@@ -189,7 +189,7 @@ internal static class Program
     }
 
 #else
-    public const string DisplayVersion = "0.6.1+20260519.0128";
+    public const string DisplayVersion = "0.6.2+20260520.0137";
     public const string AppName = "hvtop";
 
     public static async Task<int> Main(string[] args)
@@ -229,7 +229,7 @@ internal static class Program
         }
 
         var state = new AppState(options.Refresh);
-        var sampler = Task.Run(() => RunSamplerAsync(collector, state, options, cts.Token));
+        var sampler = Task.Run(() => RunSamplerAsync(collector, state, options, cts));
 
         try
         {
@@ -307,8 +307,9 @@ internal static class Program
         }
     }
 
-    private static async Task RunSamplerAsync(Collector collector, AppState state, Options options, CancellationToken token)
+    private static async Task RunSamplerAsync(Collector collector, AppState state, Options options, CancellationTokenSource cts)
     {
+        var token = cts.Token;
         while (!token.IsCancellationRequested)
         {
             var started = Stopwatch.GetTimestamp();
@@ -319,7 +320,14 @@ internal static class Program
             }
             catch (Exception ex)
             {
-                state.AddEvent("ERR", $"Collector failed: {ex.Message}");
+                var message = $"Collector failed: {ex.Message}";
+                state.AddEvent("ERR", message);
+                if (!options.LocalCollectors)
+                {
+                    state.SetFatalError(message);
+                    Console.Error.WriteLine($"hvtop fatal: {ex.Message}");
+                    break;
+                }
             }
 
             var elapsed = Stopwatch.GetElapsedTime(started);

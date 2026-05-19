@@ -6,6 +6,7 @@ internal sealed class AppState
     private Snapshot snapshot = Snapshot.Empty;
     private bool refreshRequested = true;
     private TimeSpan refresh;
+    private string fatalError = string.Empty;
 
     public AppState(TimeSpan refresh)
     {
@@ -47,6 +48,18 @@ internal sealed class AppState
                 Events = snapshot.Events.Prepend(new EventRow(DateTime.Now, severity, message)).Take(200).ToArray()
             };
         }
+    }
+
+    public void SetFatalError(string message)
+    {
+        lock (gate)
+            fatalError = message;
+    }
+
+    public string ReadFatalError()
+    {
+        lock (gate)
+            return fatalError;
     }
 
     public void RequestRefresh()

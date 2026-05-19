@@ -70,6 +70,7 @@ Useful options:
 
 ```powershell
 dotnet run -- --refresh 1 --history 15
+dotnet run -- --rdc-host HV01 --rdc-user DOMAIN\AdminUser --rdc-password "secret"
 dotnet run -- --rdc-disable
 dotnet run -- --debug-log
 dotnet run -- --smoke
@@ -84,7 +85,11 @@ dotnet run -- --smoke
 --history <minutes>        History window for max/min values. Default: 15
 --rdc-port <n>             Remote Data Collector TCP port. Default: 54321
 --rdc-refresh <seconds>    Remote Data Collector interval. Default: 1
---rdc-disable              Disable remote data collection on cluster peers.
+--rdc-host <host>          Deploy/poll hvtop-rdc on an explicit remote host.
+--rdc-user <user>          Username for remote ADMIN$/CIM access.
+--rdc-password <password>  Password for remote ADMIN$/CIM access.
+--rdc-disable              Disable remote data collection.
+--local-disable            Disable local data collection; requires --rdc-host.
 --debug-log                Write hvtop.log; also enables remote hvtop-rdc.log.
 --smoke                    Print one sample and exit.
 --help                     Show help.
@@ -173,6 +178,24 @@ logged-in user. `hvtop-rdc.exe` reports the same metrics to the local `hvtop.exe
 process through a small HTTP interface. The main `hvtop.exe` process polls those
 remote collectors and merges the returned host/VM/storage/network telemetry into
 the local view.
+
+Outside a cluster, an admin workstation can target one remote host explicitly:
+
+```powershell
+hvtop.exe --rdc-host HV01 --rdc-user DOMAIN\AdminUser --rdc-password "secret"
+```
+
+When `--rdc-host` is used, hvtop deploys `hvtop-rdc.exe` to that host through
+`ADMIN$`, starts it through CIM or a legacy WMI/DCOM fallback, and merges the
+remote telemetry with the local host view once data arrives. If `--rdc-user` and
+`--rdc-password` are omitted, hvtop uses the current Windows logon context.
+
+Local collection remains enabled by default even when `--rdc-host` is specified,
+so the local host still has useful data if the remote target is unavailable. Use
+`--local-disable` for remote-only workstation mode. In that mode `--rdc-host` is
+required. If the remote collector cannot be deployed or polled, hvtop keeps the
+TUI open, shows the terminal RDC error in the bottom status line, and leaves the
+Events pane available for the detailed failure trail.
 
 ## Native Collection Direction
 

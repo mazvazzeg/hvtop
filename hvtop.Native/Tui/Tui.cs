@@ -656,7 +656,8 @@ internal sealed class Tui
         WriteLine(1, Nav(), ConsoleColor.Yellow);
         WriteLine(2, KeyboardTipsText, ConsoleColor.DarkGray);
 
-        if (IsLoading(s))
+        var fatalError = state.ReadFatalError();
+        if (IsLoading(s) && string.IsNullOrWhiteSpace(fatalError))
         {
             RenderLoadingOverlay(s);
             RenderDiscoveryStatus(s);
@@ -721,7 +722,14 @@ internal sealed class Tui
         if (snapshot.InventoryRefreshing || snapshot.TopologyRefreshing)
             text += $"  ({(snapshot.InventoryRefreshing ? "inventory " : string.Empty)}{(snapshot.TopologyRefreshing ? "topology " : string.Empty)}refreshing)";
 
-        WriteLine(frameHeight - 1, text.TrimEnd(), discovery.Complete ? ConsoleColor.DarkGray : ConsoleColor.Yellow);
+        if (!string.IsNullOrWhiteSpace(snapshot.RdcStatus))
+            text += $"  RDC: {snapshot.RdcStatus}";
+
+        var fatalError = state.ReadFatalError();
+        if (!string.IsNullOrWhiteSpace(fatalError))
+            text += $"  ERROR: {DisplayName(fatalError, Math.Max(20, frameWidth / 3))}";
+
+        WriteLine(frameHeight - 1, text.TrimEnd(), !string.IsNullOrWhiteSpace(fatalError) ? ConsoleColor.Red : discovery.Complete ? ConsoleColor.DarkGray : ConsoleColor.Yellow);
     }
 
     private static string StatusPart(string label, bool ready, string? detail = null)

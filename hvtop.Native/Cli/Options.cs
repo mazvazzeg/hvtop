@@ -90,7 +90,7 @@ internal sealed record RdcOptions(TimeSpan Refresh, TimeSpan History, int Port, 
     }
 }
 
-internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, bool RemoteCollectors, int RdcPort, TimeSpan RemoteRefresh, bool DebugLog, bool DebugCounters, bool ShowHelp, bool ShowVersion, string? ParseError)
+internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, bool LocalCollectors, bool RemoteCollectors, int RdcPort, TimeSpan RemoteRefresh, string? RdcHost, string? RdcUser, string? RdcPassword, bool DebugLog, bool DebugCounters, bool ShowHelp, bool ShowVersion, string? ParseError)
 {
     public static string HelpText =>
         """
@@ -104,7 +104,11 @@ internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, b
           --history <minutes>        History window for max/min values. Default: 15
           --rdc-port <n>             Remote Data Collector TCP port. Default: 54321
           --rdc-refresh <seconds>    Remote Data Collector interval. Default: 1
-          --rdc-disable              Disable remote data collection on cluster peers.
+          --rdc-host <host>          Deploy/poll hvtop-rdc on an explicit remote host.
+          --rdc-user <user>          Username for remote ADMIN$/CIM access.
+          --rdc-password <password>  Password for remote ADMIN$/CIM access.
+          --rdc-disable              Disable remote data collection.
+          --local-disable            Disable local data collection; requires --rdc-host.
           --debug-log                Write hvtop.log; also enables remote hvtop-rdc.log.
           --smoke                    Print one sample and exit.
           --help                     Show this help.
@@ -116,9 +120,13 @@ internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, b
         var refresh = TimeSpan.FromSeconds(1);
         var history = TimeSpan.FromMinutes(15);
         var smoke = false;
+        var localCollectors = true;
         var remoteCollectors = true;
         var rdcPort = 54321;
         var remoteRefresh = TimeSpan.FromSeconds(1);
+        string? rdcHost = null;
+        string? rdcUser = null;
+        string? rdcPassword = null;
         var debugLog = false;
         var debugCounters = false;
         var showHelp = false;
@@ -150,6 +158,8 @@ internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, b
             }
             else if (arg.Equals("--smoke", StringComparison.OrdinalIgnoreCase))
                 smoke = true;
+            else if (arg.Equals("--local-disable", StringComparison.OrdinalIgnoreCase))
+                localCollectors = false;
             else if (arg.Equals("--rdc-disable", StringComparison.OrdinalIgnoreCase))
                 remoteCollectors = false;
             else if (arg.Equals("--rdc-port", StringComparison.OrdinalIgnoreCase))
@@ -161,6 +171,21 @@ internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, b
             {
                 if (!ArgumentHelper.TryReadDouble(args, ref i, arg, out var value, out error)) break;
                 remoteRefresh = TimeSpan.FromSeconds(Math.Max(1, value));
+            }
+            else if (arg.Equals("--rdc-host", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!ArgumentHelper.TryReadString(args, ref i, arg, out var value, out error)) break;
+                rdcHost = value;
+            }
+            else if (arg.Equals("--rdc-user", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!ArgumentHelper.TryReadString(args, ref i, arg, out var value, out error)) break;
+                rdcUser = value;
+            }
+            else if (arg.Equals("--rdc-password", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!ArgumentHelper.TryReadString(args, ref i, arg, out var value, out error)) break;
+                rdcPassword = value;
             }
             else if (arg.Equals("--debug-log", StringComparison.OrdinalIgnoreCase))
                 debugLog = true;
@@ -176,7 +201,16 @@ internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, b
         if (smoke)
             remoteCollectors = false;
 
-        return new Options(refresh, history, smoke, remoteCollectors, rdcPort, remoteRefresh, debugLog, debugCounters, showHelp, showVersion, error);
+        if (error is null && !localCollectors && string.IsNullOrWhiteSpace(rdcHost))
+            error = "--local-disable requires --rdc-host";
+        if (error is null && !localCollectors && !remoteCollectors)
+            error = "--local-disable cannot be combined with --rdc-disable";
+        if (error is null && !string.IsNullOrWhiteSpace(rdcPassword) && string.IsNullOrWhiteSpace(rdcUser))
+            error = "--rdc-password requires --rdc-user";
+        if (error is null && !string.IsNullOrWhiteSpace(rdcHost) && !remoteCollectors)
+            error = "--rdc-host cannot be combined with --rdc-disable";
+
+        return new Options(refresh, history, smoke, localCollectors, remoteCollectors, rdcPort, remoteRefresh, rdcHost, rdcUser, rdcPassword, debugLog, debugCounters, showHelp, showVersion, error);
     }
 }
 
