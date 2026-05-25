@@ -19,7 +19,7 @@ internal sealed class RemoteCollectorManager : IDisposable
     {
         Timeout = TimeSpan.FromSeconds(10)
     };
-    private readonly string token = Guid.NewGuid().ToString("N");
+    private readonly string token;
     private bool clusterDetectedLogged;
     private bool explicitTargetLogged;
     private string lastTargetSummary = string.Empty;
@@ -27,6 +27,9 @@ internal sealed class RemoteCollectorManager : IDisposable
     public RemoteCollectorManager(Options options)
     {
         this.options = options;
+        token = string.IsNullOrWhiteSpace(options.RdcToken)
+            ? Guid.NewGuid().ToString("N")
+            : options.RdcToken;
     }
 
     public void UpdateTargets(ClusterNodeRow[] nodes, string localHost)
@@ -335,7 +338,7 @@ internal sealed class RemoteCollectorManager : IDisposable
             throw new FileNotFoundException("hvtop-rdc.exe not found next to hvtop.exe", localExe);
 
         var remoteShareDir = $@"\\{session.NodeName}\ADMIN$\{RemoteInstallRelative}";
-        SetState(session, "stopping");
+        SetState(session, "checking");
         StopRemoteProcess(session.NodeName);
 
         SetState(session, "copying");
@@ -347,7 +350,7 @@ internal sealed class RemoteCollectorManager : IDisposable
         var history = options.History.TotalMinutes.ToString("0.###", CultureInfo.InvariantCulture);
         var logging = options.DebugLog ? " --debug-log" : string.Empty;
         var counterDebug = options.DebugCounters ? " --debug-counters" : string.Empty;
-        var commandLine = $"\"{RemoteExePath}\" --port {options.RdcPort} --refresh {refresh} --history {history} --token {token}{logging}{counterDebug}";
+        var commandLine = $"\"{RemoteExePath}\" --port {options.RdcPort} --refresh {refresh} --history {history} --token {WinArg(token)}{logging}{counterDebug}";
         var cimScript =
             "$ErrorActionPreference='Stop'; " +
             $"$node={PsSingle(session.NodeName)}; $cmd={PsSingle(commandLine)}; " +
@@ -568,7 +571,7 @@ internal sealed class RemoteCollectorManager : IDisposable
         var message = state switch
         {
             "deploying" => $"RDC {session.NodeName}: deploying hvtop-rdc",
-            "stopping" => $"RDC {session.NodeName}: testing CIM access and stopping old hvtop-rdc process if present using {CredentialMode()}",
+            "checking" => $"RDC {session.NodeName}: checking CIM access and stopping old hvtop-rdc process if present using {CredentialMode()}",
             "copying" => $"RDC {session.NodeName}: testing ADMIN$ access and copying hvtop-rdc.exe using {CredentialMode()}",
             "starting" => $"RDC {session.NodeName}: starting remote collector through CIM using {CredentialMode()}",
             "started" => $"RDC {session.NodeName}: deployed hvtop-rdc on TCP/{options.RdcPort}",
@@ -588,6 +591,9 @@ internal sealed class RemoteCollectorManager : IDisposable
     }
 
     private static string PsSingle(string value) => "'" + value.Replace("'", "''") + "'";
+
+    private static string WinArg(string value)
+        => "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
 
     private string CredentialScript()
     {

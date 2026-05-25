@@ -15,7 +15,7 @@ namespace hvtop.Native;
 internal static class Program
 {
 #if RDC
-    public const string DisplayVersion = "0.6.2-rdc+20260520.0137";
+    public const string DisplayVersion = "0.7.0-rdc+20260524.0138";
     public const string AppName = "hvtop-rdc";
 
     public static async Task<int> Main(string[] args)
@@ -41,7 +41,7 @@ internal static class Program
             RdcLog.Info($"parsed options listen='{options.ListenPrefix}' port={options.Port} refresh={options.Refresh.TotalSeconds:N1}s history={options.History.TotalMinutes:N0}m token={(string.IsNullOrWhiteSpace(options.Token) ? "none" : "set")}");
             using var cts = new CancellationTokenSource();
             using var firewallRule = RdcFirewallRule.Ensure(options.Port);
-                    using var collector = new Collector(new Options(options.Refresh, options.History, false, true, false, options.Port, options.Refresh, null, null, null, options.DebugLog, options.DebugCounters, false, false, null));
+                    using var collector = new Collector(new Options(options.Refresh, options.History, false, true, false, options.Port, options.Refresh, null, null, null, null, options.DebugLog, options.DebugCounters, false, false, null));
             var current = Snapshot.Empty;
             var firstSample = true;
             var sampler = Task.Run(async () =>
@@ -189,7 +189,7 @@ internal static class Program
     }
 
 #else
-    public const string DisplayVersion = "0.6.2+20260520.0137";
+    public const string DisplayVersion = "0.7.0+20260524.0138";
     public const string AppName = "hvtop";
 
     public static async Task<int> Main(string[] args)
@@ -238,6 +238,12 @@ internal static class Program
         }
         finally
         {
+            if (options.RemoteCollectors)
+            {
+                state.SetRdcStatus("stopping");
+                try { new Tui(state, options).RenderOnce(); } catch { }
+            }
+
             cts.Cancel();
             try { await Task.WhenAny(sampler, Task.Delay(1500)).ConfigureAwait(false); } catch (OperationCanceledException) { }
             RdcLog.Info("hvtop stopped");

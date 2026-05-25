@@ -5,7 +5,7 @@ internal sealed class Tui
     private readonly AppState state;
     private readonly Options options;
     private const string ColGap = "    ";
-    private const string KeyboardTipsText = "Arrows/j/k move  PgUp/PgDn page  Home/End top/bottom  Enter drill  s sort  S dir  f refresh  r rescan  q quit";
+    private const string KeyboardTipsText = "Arrows move  PgUp/PgDn/Home/End page nav  Enter drill  s sort  S dir  w new pane  W close  Tab cycle  f refresh  r rescan  q quit";
     private const int MaxNameWidth = 32;
     private const int MinNameWidth = 20;
     private const int CapacityMetricWidth = 25;
@@ -33,8 +33,10 @@ internal sealed class Tui
     private Panel detailPanel;
     private string? selectedHostName;
     private string? selectedItemName;
-    private readonly Stack<ViewState> backStack = new();
-    private readonly Dictionary<string, SortState> sortStates = new(StringComparer.OrdinalIgnoreCase);
+    private Stack<ViewState> backStack = new();
+    private Dictionary<string, SortState> sortStates = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<PaneState> panes = [];
+    private int activePaneIndex;
     private string[] previousLines = [];
     private ConsoleColor[] previousForegrounds = [];
     private ConsoleColor[] previousBackgrounds = [];
@@ -43,11 +45,16 @@ internal sealed class Tui
     private int previousHeight;
     private int frameWidth;
     private int frameHeight;
+    private bool mapContentLines;
+    private int mappedContentTop;
+    private int mappedContentHeight;
+    private int activePaneContentHeight;
 
     public Tui(AppState state, Options options)
     {
         this.state = state;
         this.options = options;
+        panes.Add(CapturePaneState());
     }
 
     public void Run(CancellationTokenSource cts)
@@ -76,6 +83,12 @@ internal sealed class Tui
             Console.CursorVisible = true;
             Console.Clear();
         }
+    }
+
+    public void RenderOnce()
+    {
+        Render();
+        Console.ResetColor();
     }
 
     private void Handle(ConsoleKeyInfo key, CancellationTokenSource cts)
@@ -111,6 +124,15 @@ internal sealed class Tui
                 var refresh = state.CycleRefresh((key.Modifiers & ConsoleModifiers.Shift) != 0);
                 state.AddEvent("INFO", $"Refresh delay set to {refresh.TotalSeconds:N1}s");
                 return;
+            case ConsoleKey.Tab:
+                SwitchPane((key.Modifiers & ConsoleModifiers.Shift) != 0);
+                return;
+            case ConsoleKey.W:
+                if ((key.Modifiers & ConsoleModifiers.Shift) != 0)
+                    ClosePane();
+                else
+                    OpenPane();
+                return;
             case ConsoleKey.S:
                 CycleSort((key.Modifiers & ConsoleModifiers.Shift) != 0);
                 return;
@@ -144,11 +166,53 @@ internal sealed class Tui
                 return;
         }
 
-        if (key.KeyChar == 'j') selected++;
-        if (key.KeyChar == 'k') selected = Math.Max(0, selected - 1);
     }
 
-    private int PageSize() => Math.Max(1, Console.WindowHeight - 8);
+    private int PageSize()
+    {
+        var height = activePaneContentHeight > 0 ? activePaneContentHeight : Math.Max(0, Console.WindowHeight - 6);
+        return Math.Max(1, height - 2);
+    }
+
+    private void OpenPane()
+    {
+        EnsurePanes();
+        if (panes.Count >= 4)
+        {
+            state.AddEvent("WARN", "Maximum pane count reached");
+            return;
+        }
+
+        SaveActivePane();
+        panes.Add(CapturePaneState());
+        activePaneIndex = panes.Count - 1;
+        LoadPane(activePaneIndex);
+    }
+
+    private void ClosePane()
+    {
+        EnsurePanes();
+        if (panes.Count <= 1)
+            return;
+
+        SaveActivePane();
+        panes.RemoveAt(activePaneIndex);
+        activePaneIndex = Math.Clamp(activePaneIndex, 0, panes.Count - 1);
+        LoadPane(activePaneIndex);
+    }
+
+    private void SwitchPane(bool reverse)
+    {
+        EnsurePanes();
+        if (panes.Count <= 1)
+            return;
+
+        SaveActivePane();
+        activePaneIndex = reverse
+            ? (activePaneIndex + panes.Count - 1) % panes.Count
+            : (activePaneIndex + 1) % panes.Count;
+        LoadPane(activePaneIndex);
+    }
 
     private void SetPanel(Panel next)
     {
@@ -163,6 +227,12 @@ internal sealed class Tui
 
     private void CycleSort(bool reverse)
     {
+        if (panel == Panel.Events)
+        {
+            state.AddEvent("INFO", "Events view is fixed to date desc");
+            return;
+        }
+
         var columns = SortColumns().ToArray();
         if (columns.Length == 0) return;
 
@@ -392,6 +462,50 @@ internal sealed class Tui
         return true;
     }
 
+    private void EnsurePanes()
+    {
+        if (panes.Count == 0)
+            panes.Add(CapturePaneState());
+
+        activePaneIndex = Math.Clamp(activePaneIndex, 0, panes.Count - 1);
+    }
+
+    private void SaveActivePane()
+    {
+        EnsurePanes();
+        panes[activePaneIndex] = CapturePaneState();
+    }
+
+    private PaneState CapturePaneState()
+        => new(
+            panel,
+            selected,
+            tableScrollOffset,
+            drillView,
+            detailPanel,
+            selectedHostName,
+            selectedItemName,
+            CloneStack(backStack),
+            new Dictionary<string, SortState>(sortStates, StringComparer.OrdinalIgnoreCase));
+
+    private void LoadPane(int index)
+    {
+        EnsurePanes();
+        var pane = panes[Math.Clamp(index, 0, panes.Count - 1)];
+        panel = pane.Panel;
+        selected = pane.Selected;
+        tableScrollOffset = pane.TableScrollOffset;
+        drillView = pane.DrillView;
+        detailPanel = pane.DetailPanel;
+        selectedHostName = pane.SelectedHostName;
+        selectedItemName = pane.SelectedItemName;
+        backStack = CloneStack(pane.BackStack);
+        sortStates = new Dictionary<string, SortState>(pane.SortStates, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static Stack<ViewState> CloneStack(Stack<ViewState> source)
+        => new(source.Reverse());
+
     private IReadOnlyList<object> CurrentRows()
     {
         var s = state.Read();
@@ -423,6 +537,12 @@ internal sealed class Tui
 
     private IEnumerable<object> ApplySort(IReadOnlyList<object> rows)
     {
+        if (panel == Panel.Events)
+            return rows
+                .Cast<EventRow>()
+                .OrderByDescending(evt => evt.At)
+                .Cast<object>();
+
         var columns = SortColumns().ToArray();
         if (columns.Length == 0 || rows.Count <= 1)
             return rows;
@@ -474,7 +594,7 @@ internal sealed class Tui
             Panel.Vms => VmSortColumns(),
             Panel.Disks => [new("HOST", "host"), new("NAME", "name"), new("SIZE", "size"), new("FREE", "free"), new("IO", "i/o"), new("IOPS", "iops"), new("QD", "queue"), new("LAT", "latency"), new("STA", "status")],
             Panel.Network => [new("HOST", "host"), new("NAME", "name"), new("UPL", "uplinks"), new("LINK", "link"), new("THR", "throughput"), new("RX", "rx"), new("TX", "tx"), new("STA", "status")],
-            Panel.Events => [new("DATE", "date"), new("SEV", "severity"), new("WHAT", "message")],
+            Panel.Events => [new("DATE", "date")],
             _ => []
         };
     }
@@ -651,6 +771,9 @@ internal sealed class Tui
     {
         var s = state.Read();
         BeginFrame();
+        EnsurePanes();
+        SaveActivePane();
+        LoadPane(activePaneIndex);
         var sort = CurrentSortLabel();
         WriteLine(0, $"{Program.AppName} {Program.DisplayVersion}  Sample: {s.At:HH:mm:ss}  Refresh: {state.Refresh.TotalSeconds:N1}s  History: {options.History.TotalMinutes:N0}m  Sort: {sort}", ConsoleColor.White);
         WriteLine(1, Nav(), ConsoleColor.Yellow);
@@ -666,11 +789,89 @@ internal sealed class Tui
             return;
         }
 
-        if (drillView == DrillView.Detail) RenderDetail();
-        else RenderTable();
+        RenderPanes();
+        LoadPane(activePaneIndex);
         RenderDiscoveryStatus(s);
         EndFrame();
         Console.ResetColor();
+    }
+
+    private void RenderPanes()
+    {
+        EnsurePanes();
+        if (frameHeight <= 5 || frameWidth <= 1)
+            return;
+
+        const int top = 3;
+        const int bottomReserved = 1;
+        var height = Math.Max(0, frameHeight - top - bottomReserved);
+        if (height <= 0)
+            return;
+
+        RenderPaneBorder(top, height);
+        var contentHeight = Math.Max(0, height - 2);
+        activePaneContentHeight = contentHeight;
+        if (contentHeight <= 0)
+            return;
+
+        LoadPane(activePaneIndex);
+        mapContentLines = true;
+        mappedContentTop = top + 1;
+        mappedContentHeight = contentHeight;
+        try
+        {
+            if (drillView == DrillView.Detail) RenderDetail();
+            else RenderTable();
+        }
+        finally
+        {
+            mapContentLines = false;
+            panes[activePaneIndex] = CapturePaneState();
+        }
+
+        FillPaneInterior(top, height);
+    }
+
+    private void RenderPaneBorder(int top, int height)
+    {
+        var topText = PaneBorderText(topBorder: true);
+        WriteLine(top, topText, ConsoleColor.Cyan);
+        if (height > 1)
+            WriteLine(top + height - 1, PaneBorderText(topBorder: false), ConsoleColor.Cyan);
+    }
+
+    private string PaneBorderText(bool topBorder)
+    {
+        var width = Math.Max(0, frameWidth - 1);
+        if (width <= 0)
+            return string.Empty;
+
+        if (!topBorder)
+            return width == 1
+                ? "\u2514"
+                : "\u2514" + new string('\u2500', Math.Max(0, width - 2)) + "\u2518";
+
+        var labels = Enumerable.Range(0, panes.Count)
+            .Select(i => i == activePaneIndex ? $"[{i + 1}]" : $"{i + 1}");
+        var label = $" {string.Join(" ", labels)} ";
+        var text = "\u250c\u2500" + label;
+        if (text.Length >= width)
+            return width == 1 ? "\u250c" : text[..(width - 1)] + "\u2510";
+
+        return text + new string('\u2500', width - text.Length - 1) + "\u2510";
+    }
+
+    private void FillPaneInterior(int top, int height)
+    {
+        if (height <= 2)
+            return;
+
+        var bottom = Math.Min(frameHeight - 1, top + height - 1);
+        for (var y = top + 1; y < bottom; y++)
+        {
+            if (!touchedLines[y])
+                WritePaneContentLine(y, string.Empty, ConsoleColor.Gray, ConsoleColor.Black);
+        }
     }
 
     private string Nav()
@@ -729,7 +930,11 @@ internal sealed class Tui
         if (!string.IsNullOrWhiteSpace(fatalError))
             text += $"  ERROR: {DisplayName(fatalError, Math.Max(20, frameWidth / 3))}";
 
-        WriteLine(frameHeight - 1, text.TrimEnd(), !string.IsNullOrWhiteSpace(fatalError) ? ConsoleColor.Red : discovery.Complete ? ConsoleColor.DarkGray : ConsoleColor.Yellow);
+        var activeRdcStatus = snapshot.RdcStatus.Equals("stopping", StringComparison.OrdinalIgnoreCase)
+                              || snapshot.RdcStatus.Equals("checking", StringComparison.OrdinalIgnoreCase)
+                              || snapshot.RdcStatus.StartsWith("deploy", StringComparison.OrdinalIgnoreCase)
+                              || snapshot.RdcStatus.StartsWith("poll", StringComparison.OrdinalIgnoreCase);
+        WriteLine(frameHeight - 1, text.TrimEnd(), !string.IsNullOrWhiteSpace(fatalError) ? ConsoleColor.Red : activeRdcStatus || !discovery.Complete ? ConsoleColor.Yellow : ConsoleColor.DarkGray);
     }
 
     private static string StatusPart(string label, bool ready, string? detail = null)
@@ -1027,7 +1232,7 @@ internal sealed class Tui
         WriteLine(4, header, ConsoleColor.Cyan);
         WriteLine(5, subHeader, ConsoleColor.DarkCyan);
         selected = Math.Min(selected, Math.Max(0, rows.Count - 1));
-        var maxRows = Math.Max(0, Console.WindowHeight - 8);
+        var maxRows = Math.Max(0, ContentWindowHeight - 2);
         KeepSelectionVisible(rows.Count, maxRows);
         var visibleRows = rows.Skip(tableScrollOffset).Take(maxRows).ToArray();
         for (var i = 0; i < visibleRows.Length; i++)
@@ -1044,7 +1249,7 @@ internal sealed class Tui
     {
         WriteLine(4, header, ConsoleColor.Cyan);
         selected = Math.Min(selected, Math.Max(0, rows.Count - 1));
-        var maxRows = Math.Max(0, Console.WindowHeight - 7);
+        var maxRows = Math.Max(0, ContentWindowHeight - 1);
         KeepSelectionVisible(rows.Count, maxRows);
         var visibleRows = rows.Skip(tableScrollOffset).Take(maxRows).ToArray();
         for (var i = 0; i < visibleRows.Length; i++)
@@ -1072,6 +1277,11 @@ internal sealed class Tui
             tableScrollOffset = selected - maxRows + 1;
     }
 
+    private int ContentWindowHeight
+        => mapContentLines
+            ? Math.Max(0, mappedContentHeight)
+            : Math.Max(0, frameHeight - 5);
+
     private void RenderDetail()
     {
         var snapshot = state.Read();
@@ -1083,7 +1293,7 @@ internal sealed class Tui
         }
 
         WriteLine(4, DetailTitle(detailTarget), ConsoleColor.Cyan);
-        WriteLine(5, new string('-', Math.Min(KeyboardTipsText.Length, Console.WindowWidth)), ConsoleColor.DarkGray);
+        WriteLine(5, string.Empty);
 
         switch (detailTarget)
         {
@@ -1485,7 +1695,7 @@ internal sealed class Tui
 
     private void RenderDetailLines(int top, IReadOnlyList<DetailLine> lines)
     {
-        var maxLines = Math.Max(0, frameHeight - top - 1);
+        var maxLines = Math.Max(0, ContentWindowHeight - (top - 4));
         if (maxLines <= 0)
         {
             tableScrollOffset = 0;
@@ -1869,37 +2079,50 @@ internal sealed class Tui
 
     private void EndFrame()
     {
+        var priorMapContentLines = mapContentLines;
+        mapContentLines = false;
         var lines = Math.Min(previousLines.Length, touchedLines.Length);
         for (var y = 0; y < lines; y++)
         {
             if (!touchedLines[y] && !string.IsNullOrEmpty(previousLines[y]))
                 WriteLine(y, string.Empty);
         }
+        mapContentLines = priorMapContentLines;
     }
 
     private void WriteLine(int y, string text, ConsoleColor foreground = ConsoleColor.Gray, ConsoleColor background = ConsoleColor.Black)
     {
+        var x = 0;
+        if (mapContentLines && y >= 4)
+        {
+            var mappedY = mappedContentTop + (y - 4);
+            if (mappedY < mappedContentTop || mappedY >= mappedContentTop + mappedContentHeight)
+                return;
+            WritePaneContentLine(mappedY, text, foreground, background);
+            return;
+        }
+
         if (y < 0 || y >= frameHeight || y >= touchedLines.Length || y >= previousLines.Length) return;
         touchedLines[y] = true;
 
         var width = Math.Min(frameWidth, Math.Max(0, Console.WindowWidth));
         if (width <= 1) return;
         width--;
+        if (width <= 0) return;
         if (text.Length > width)
             text = text[..width];
-        else if (text.Length < width)
-            text = text.PadRight(width);
+        var compareText = text.Length < width ? text.PadRight(width) : text;
 
-        if (previousLines[y] == text && previousForegrounds[y] == foreground && previousBackgrounds[y] == background)
+        if (previousLines[y] == compareText && previousForegrounds[y] == foreground && previousBackgrounds[y] == background)
             return;
 
         try
         {
             if (y >= Console.WindowHeight) return;
-            Console.SetCursorPosition(0, y);
+            Console.SetCursorPosition(x, y);
             Console.ForegroundColor = foreground;
             Console.BackgroundColor = background;
-            Console.Write(text);
+            Console.Write(compareText);
         }
         catch (ArgumentOutOfRangeException)
         {
@@ -1914,7 +2137,75 @@ internal sealed class Tui
             return;
         }
 
-        previousLines[y] = text;
+        previousLines[y] = compareText;
+        previousForegrounds[y] = foreground;
+        previousBackgrounds[y] = background;
+    }
+
+    private void WritePaneContentLine(int y, string text, ConsoleColor foreground = ConsoleColor.Gray, ConsoleColor background = ConsoleColor.Black)
+    {
+        if (y < 0 || y >= frameHeight || y >= touchedLines.Length || y >= previousLines.Length) return;
+        touchedLines[y] = true;
+
+        var width = Math.Min(frameWidth, Math.Max(0, Console.WindowWidth));
+        if (width <= 3) return;
+        width--;
+        var contentWidth = Math.Max(0, width - 2);
+        if (text.Length > contentWidth)
+            text = text[..contentWidth];
+        var contentText = text.Length < contentWidth ? text.PadRight(contentWidth) : text;
+        var compareText = "\u2502" + contentText + "\u2502";
+
+        if (previousLines[y] == compareText && previousForegrounds[y] == foreground && previousBackgrounds[y] == background)
+            return;
+
+        try
+        {
+            if (y >= Console.WindowHeight) return;
+            Console.SetCursorPosition(0, y);
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.BackgroundColor = ConsoleColor.Black;
+            Console.Write('\u2502');
+
+            if (background != ConsoleColor.Black)
+            {
+                var highlighted = text.TrimEnd();
+                Console.ForegroundColor = foreground;
+                Console.BackgroundColor = background;
+                Console.Write(highlighted);
+                var remaining = contentWidth - highlighted.Length;
+                if (remaining > 0)
+                {
+                    Console.ForegroundColor = ConsoleColor.Gray;
+                    Console.BackgroundColor = ConsoleColor.Black;
+                    Console.Write(new string(' ', remaining));
+                }
+            }
+            else
+            {
+                Console.ForegroundColor = foreground;
+                Console.BackgroundColor = background;
+                Console.Write(contentText);
+            }
+
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.BackgroundColor = ConsoleColor.Black;
+            Console.Write('\u2502');
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            previousWidth = -1;
+            previousHeight = -1;
+            return;
+        }
+        catch (IOException)
+        {
+            previousWidth = -1;
+            previousHeight = -1;
+            return;
+        }
+
+        previousLines[y] = compareText;
         previousForegrounds[y] = foreground;
         previousBackgrounds[y] = background;
     }
@@ -1959,6 +2250,17 @@ internal sealed record ViewState(
     Panel DetailPanel,
     string? SelectedHostName,
     string? SelectedItemName);
+
+internal sealed record PaneState(
+    Panel Panel,
+    int Selected,
+    int TableScrollOffset,
+    DrillView DrillView,
+    Panel DetailPanel,
+    string? SelectedHostName,
+    string? SelectedItemName,
+    Stack<ViewState> BackStack,
+    Dictionary<string, SortState> SortStates);
 
 internal sealed record SortState(string Column, bool Descending);
 

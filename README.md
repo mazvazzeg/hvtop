@@ -71,6 +71,7 @@ Useful options:
 ```powershell
 dotnet run -- --refresh 1 --history 15
 dotnet run -- --rdc-host HV01 --rdc-user DOMAIN\AdminUser --rdc-password "secret"
+dotnet run -- --rdc-host HV01 --rdc-token "shared-secret"
 dotnet run -- --rdc-disable
 dotnet run -- --debug-log
 dotnet run -- --smoke
@@ -88,6 +89,7 @@ dotnet run -- --smoke
 --rdc-host <host>          Deploy/poll hvtop-rdc on an explicit remote host.
 --rdc-user <user>          Username for remote ADMIN$/CIM access.
 --rdc-password <password>  Password for remote ADMIN$/CIM access.
+--rdc-token <value>        Token passed to hvtop-rdc. Default: generated per run.
 --rdc-disable              Disable remote data collection.
 --local-disable            Disable local data collection; requires --rdc-host.
 --debug-log                Write hvtop.log; also enables remote hvtop-rdc.log.
@@ -123,12 +125,14 @@ panes remain useful on standard Windows servers.
 - `D`: CSV/storage
 - `N`: Network
 - `E`: Events
-- `Up/Down` or `k/j`: move selection
-- `PgUp/PgDn`: move selection by one page
-- `Home/End`: move selection to top or bottom
+- `Up/Down`: move selection
+- `PgUp/PgDn/Home/End`: page navigation
 - `Enter`: drill down
 - `s`: select sort column
 - `S`: toggle sort direction
+- `w`: open a new pane
+- `W`: close the active pane
+- `Tab`: cycle panes
 - `f`: cycle refresh delay
 - `r`: rescan inventory/topology
 - `Backspace` or `Esc`: back
@@ -189,6 +193,15 @@ When `--rdc-host` is used, hvtop deploys `hvtop-rdc.exe` to that host through
 `ADMIN$`, starts it through CIM or a legacy WMI/DCOM fallback, and merges the
 remote telemetry with the local host view once data arrives. If `--rdc-user` and
 `--rdc-password` are omitted, hvtop uses the current Windows logon context.
+
+By default hvtop generates a per-run RDC token and passes it to `hvtop-rdc.exe`.
+Use `--rdc-token` to set a known token manually, for example when checking the
+remote collector endpoint with curl:
+
+```powershell
+hvtop.exe --rdc-host HV01 --rdc-token "shared-secret"
+curl "http://HV01:54321/snapshot?token=shared-secret"
+```
 
 Local collection remains enabled by default even when `--rdc-host` is specified,
 so the local host still has useful data if the remote target is unavailable. Use

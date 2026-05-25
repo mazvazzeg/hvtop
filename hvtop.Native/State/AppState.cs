@@ -4,6 +4,7 @@ internal sealed class AppState
 {
     private readonly object gate = new();
     private Snapshot snapshot = Snapshot.Empty;
+    private EventRow[] localEvents = [];
     private bool refreshRequested = true;
     private TimeSpan refresh;
     private string fatalError = string.Empty;
@@ -26,7 +27,7 @@ internal sealed class AppState
     {
         lock (gate)
         {
-            snapshot = next;
+            snapshot = next with { Events = MergeEvents(localEvents, next.Events) };
         }
     }
 
@@ -43,10 +44,28 @@ internal sealed class AppState
         RdcLog.Info($"{severity} {message}");
         lock (gate)
         {
+            localEvents = localEvents.Prepend(new EventRow(DateTime.Now, severity, message)).Take(200).ToArray();
             snapshot = snapshot with
             {
-                Events = snapshot.Events.Prepend(new EventRow(DateTime.Now, severity, message)).Take(200).ToArray()
+                Events = MergeEvents(localEvents, snapshot.Events)
             };
+        }
+    }
+
+    private static EventRow[] MergeEvents(EventRow[] local, EventRow[] published)
+        => local
+            .Concat(published)
+            .GroupBy(evt => $"{evt.At:O}\0{evt.Severity}\0{evt.Message}", StringComparer.Ordinal)
+            .Select(group => group.First())
+            .OrderByDescending(evt => evt.At)
+            .Take(200)
+            .ToArray();
+
+    public void SetRdcStatus(string status)
+    {
+        lock (gate)
+        {
+            snapshot = snapshot with { RdcStatus = status };
         }
     }
 
