@@ -12,9 +12,9 @@ PowerShell in the hot path.
 
 Click any thumbnail to open the full-size image.
 
-| Cluster | Cluster Hosts | Cluster Detail |
-| --- | --- | --- |
-| <a href="docs/screenshots/hvtop-cluster.PNG"><img src="docs/screenshots/hvtop-cluster.PNG" alt="Cluster overview" width="260"></a> | <a href="docs/screenshots/hvtop-cluster-hosts.PNG"><img src="docs/screenshots/hvtop-cluster-hosts.PNG" alt="Cluster host list" width="260"></a> | <a href="docs/screenshots/hvtop-cluster-details.PNG"><img src="docs/screenshots/hvtop-cluster-details.PNG" alt="Cluster detail view" width="260"></a> |
+| Cluster | Cluster Detail |
+| --- | --- |
+| <a href="docs/screenshots/hvtop-cluster.PNG"><img src="docs/screenshots/hvtop-cluster.PNG" alt="Cluster overview" width="260"></a> | <a href="docs/screenshots/hvtop-cluster-details.PNG"><img src="docs/screenshots/hvtop-cluster-details.PNG" alt="Cluster detail view" width="260"></a> |
 
 | Hosts | Host Detail | VMs |
 | --- | --- | --- |
