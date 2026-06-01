@@ -37,6 +37,43 @@ internal static class CapacityFormatter
         return $"{Math.Round(gib, MidpointRounding.AwayFromZero):0} GB";
     }
 
+    public static string FormatPhysicalDiskCapacity(double bytes)
+    {
+        if (bytes <= 0) return "n/a";
+
+        return $"{FormatMarketingCapacity(bytes)} ({FormatBinaryCapacity(bytes)})";
+    }
+
+    private static string FormatMarketingCapacity(double bytes)
+    {
+        var tb = bytes / 1_000_000_000_000d;
+        if (tb >= 1)
+            return $"{FormatMarketingNumber(tb)} TB";
+
+        var gb = bytes / 1_000_000_000d;
+        return $"{FormatMarketingNumber(gb)} GB";
+    }
+
+    private static string FormatBinaryCapacity(double bytes)
+    {
+        var tib = bytes / 1024d / 1024d / 1024d / 1024d;
+        if (tib >= 1)
+            return $"{tib:0.00} TiB";
+
+        var gib = bytes / 1024d / 1024d / 1024d;
+        return gib >= 100 ? $"{gib:0} GiB" : $"{gib:0.0} GiB";
+    }
+
+    private static string FormatMarketingNumber(double value)
+    {
+        var roundedWhole = Math.Round(value, MidpointRounding.AwayFromZero);
+        var wholeTolerance = value >= 100 ? 0.5 : 0.15;
+        if (Math.Abs(value - roundedWhole) < wholeTolerance)
+            return $"{roundedWhole:0}";
+
+        return value >= 10 ? $"{value:0.#}" : $"{value:0.##}";
+    }
+
 }
 
 internal static class UptimeFormatter
@@ -193,6 +230,22 @@ internal sealed class RollingHistory
         return row with
         {
             Free = row.Free with { Max = freeMin },
+            Io = row.Io with { Max = values[nameof(row.Io)] },
+            ReadIo = row.ReadIo with { Max = values[nameof(row.ReadIo)] },
+            WriteIo = row.WriteIo with { Max = values[nameof(row.WriteIo)] },
+            Iops = row.Iops with { Max = values[nameof(row.Iops)] },
+            ReadIops = row.ReadIops with { Max = values[nameof(row.ReadIops)] },
+            WriteIops = row.WriteIops with { Max = values[nameof(row.WriteIops)] },
+            QueueDepth = row.QueueDepth with { Max = values[nameof(row.QueueDepth)] },
+            Latency = row.Latency with { Max = values[nameof(row.Latency)] }
+        };
+    }
+
+    public PhysicalDiskRow Apply(string key, PhysicalDiskRow row)
+    {
+        var values = Add(key, row.Metrics);
+        return row with
+        {
             Io = row.Io with { Max = values[nameof(row.Io)] },
             ReadIo = row.ReadIo with { Max = values[nameof(row.ReadIo)] },
             WriteIo = row.WriteIo with { Max = values[nameof(row.WriteIo)] },

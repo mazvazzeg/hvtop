@@ -19,6 +19,7 @@ internal sealed class Collector : IDisposable
     private readonly Counter diskLatencySeconds;
     private EventRow[] events = [new(DateTime.Now, "INFO", "hvtop native collector started")];
     private bool networkDiagnosticsLogged;
+    private bool physicalDiskDiagnosticsLogged;
     private bool initialDiscoveryComplete;
     private bool discoveryBannerLogged;
     private bool hostsDiscoveryLogged;
@@ -85,6 +86,7 @@ internal sealed class Collector : IDisposable
             clusterInventory.RequestRefresh();
             topologyRefreshRequested = true;
             networkDiagnosticsLogged = false;
+            physicalDiskDiagnosticsLogged = false;
             Mark("refresh-request", stepStarted);
         }
 
@@ -97,6 +99,10 @@ internal sealed class Collector : IDisposable
         stepStarted = Stopwatch.GetTimestamp();
         LogicalDiskSampler.Refresh();
         Mark("logical-disk-refresh", stepStarted);
+
+        stepStarted = Stopwatch.GetTimestamp();
+        var physicalDisks = PhysicalDiskSampler.Read(Environment.MachineName);
+        Mark("physical-disk-refresh", stepStarted);
 
         stepStarted = Stopwatch.GetTimestamp();
         foreach (var evt in inventoryResult.Events)
@@ -213,6 +219,7 @@ internal sealed class Collector : IDisposable
 
         stepStarted = Stopwatch.GetTimestamp();
         MaybeLogNetworkDiagnostics(refreshRequested, adapterRates, adapters, vmTopologyResult.Switches);
+        MaybeLogPhysicalDiskDiagnostics(refreshRequested, physicalDisks);
         var discovery = BuildDiscoveryProgress(host, vms, disks, adapters, networkSwitches);
         MaybeLogDiscoveryProgress(discovery, host, vms, disks, adapters, networkSwitches);
         Mark("diagnostics-discovery", stepStarted);
@@ -241,11 +248,12 @@ internal sealed class Collector : IDisposable
             Mark("history-topology", stepStarted);
 
             stepStarted = Stopwatch.GetTimestamp();
-            MergeRemoteTelemetry(ref hosts, ref vms, ref disks, ref networkSwitches, ref adapters, ref mergedTopology);
+            physicalDisks = physicalDisks.Select(d => history.Apply("pdisk:" + d.HostName + ":" + d.Name, d)).ToArray();
+            MergeRemoteTelemetry(ref hosts, ref vms, ref disks, ref physicalDisks, ref networkSwitches, ref adapters, ref mergedTopology);
             MaybeAddSpikeEvent(host, disks);
             Mark("remote-events", stepStarted);
             MaybeAddCounterTiming(timings, sampleStarted);
-            return new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, networkSwitches, adapters, events, mergedTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery, remote.StatusSummary);
+            return new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, physicalDisks, networkSwitches, adapters, events, mergedTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery, remote.StatusSummary);
         }
 
         stepStarted = Stopwatch.GetTimestamp();
@@ -253,16 +261,17 @@ internal sealed class Collector : IDisposable
         hosts = BuildHosts(host, clusterResult.Nodes);
         liveTopology = liveTopology.Select(t => history.Apply("vmtopo:" + t.HostName + ":" + t.VmName, t)).ToArray();
         disks = disks.Select(d => history.Apply("disk:" + d.HostName + ":" + d.Name, d)).ToArray();
+        physicalDisks = physicalDisks.Select(d => history.Apply("pdisk:" + d.HostName + ":" + d.Name, d)).ToArray();
         networkSwitches = networkSwitches.Select(n => history.Apply("vswitch:" + n.HostName + ":" + n.Name, n)).ToArray();
         adapters = adapters.Select(n => history.Apply("net:" + n.HostName + ":" + n.Name, n)).ToArray();
         Mark("history", stepStarted);
 
         stepStarted = Stopwatch.GetTimestamp();
-        MergeRemoteTelemetry(ref hosts, ref vms, ref disks, ref networkSwitches, ref adapters, ref liveTopology);
+        MergeRemoteTelemetry(ref hosts, ref vms, ref disks, ref physicalDisks, ref networkSwitches, ref adapters, ref liveTopology);
         MaybeAddSpikeEvent(host, disks);
         Mark("remote-events", stepStarted);
         MaybeAddCounterTiming(timings, sampleStarted);
-        return new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, networkSwitches, adapters, events, liveTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery, remote.StatusSummary);
+        return new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, physicalDisks, networkSwitches, adapters, events, liveTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery, remote.StatusSummary);
     }
 
     private void MaybeAddCounterTiming(List<(string Name, double Ms)>? timings, long sampleStarted)
@@ -279,7 +288,7 @@ internal sealed class Collector : IDisposable
         AddEvent("INFO", $"COUNTERS total={total:N0}ms {string.Join(" ", slow)}");
     }
 
-    private void MergeRemoteTelemetry(ref HostRow[] hosts, ref VmRow[] vms, ref DiskRow[] disks, ref NetworkSwitchRow[] networkSwitches, ref NetworkRow[] networks, ref VmTopologyRow[] topology)
+    private void MergeRemoteTelemetry(ref HostRow[] hosts, ref VmRow[] vms, ref DiskRow[] disks, ref PhysicalDiskRow[] physicalDisks, ref NetworkSwitchRow[] networkSwitches, ref NetworkRow[] networks, ref VmTopologyRow[] topology)
     {
         foreach (var evt in remote.DrainEvents())
             AddEvent(evt.Severity, evt.Message);
@@ -291,6 +300,7 @@ internal sealed class Collector : IDisposable
         hosts = RemoteCollectorManager.MergeHosts(hosts, snapshots);
         vms = RemoteCollectorManager.MergeVms(vms, snapshots);
         disks = RemoteCollectorManager.MergeDisks(disks, snapshots);
+        physicalDisks = RemoteCollectorManager.MergePhysicalDisks(physicalDisks, snapshots);
         networkSwitches = RemoteCollectorManager.MergeNetworkSwitches(networkSwitches, snapshots);
         networks = RemoteCollectorManager.MergeNetworks(networks, snapshots);
         topology = RemoteCollectorManager.MergeTopology(topology, snapshots);
@@ -309,18 +319,19 @@ internal sealed class Collector : IDisposable
                 throw new InvalidOperationException($"RDC failed and local collection is disabled: {remote.TerminalFailureSummary}");
 
             var waiting = new DiscoveryProgress(false, false, false, false, false, 0, 0, 0, 0);
-            return new Snapshot(DateTime.Now, [], [], [], [], [], [], events, [], true, false, false, waiting, remote.StatusSummary);
+            return new Snapshot(DateTime.Now, [], [], [], [], [], [], [], events, [], true, false, false, waiting, remote.StatusSummary);
         }
 
         var hosts = RemoteCollectorManager.MergeHosts([], snapshots);
         var vms = RemoteCollectorManager.MergeVms([], snapshots);
         var disks = RemoteCollectorManager.MergeDisks([], snapshots);
+        var physicalDisks = RemoteCollectorManager.MergePhysicalDisks([], snapshots);
         var networkSwitches = RemoteCollectorManager.MergeNetworkSwitches([], snapshots);
         var networks = RemoteCollectorManager.MergeNetworks([], snapshots);
         var topology = RemoteCollectorManager.MergeTopology([], snapshots);
         var discovery = new DiscoveryProgress(hosts.Length > 0, true, disks.Length > 0, true, true, vms.Length, disks.Length, networks.Count(n => n.IsUp), networkSwitches.Length);
         initialDiscoveryComplete = true;
-        return new Snapshot(DateTime.Now, [], hosts, vms, disks, networkSwitches, networks, events, topology, false, false, false, discovery, remote.StatusSummary);
+        return new Snapshot(DateTime.Now, [], hosts, vms, disks, physicalDisks, networkSwitches, networks, events, topology, false, false, false, discovery, remote.StatusSummary);
     }
 
     private static HostRow[] BuildHosts(HostRow localHost, ClusterNodeRow[] clusterNodes)
@@ -764,6 +775,16 @@ internal sealed class Collector : IDisposable
                     $"NETMAP sw='{TrimForEvent(switchRow.Name, 18)}' uplink='{TrimForEvent(uplink.Name, 28)}' desc='{TrimForEvent(uplink.Description, 36)}' -> {(match is null ? "NO MATCH" : $"'{TrimForEvent(match.Name, 28)}' rx={match.Rx.Current:0.00} tx={match.Tx.Current:0.00} pdh='{TrimForEvent(match.PdhInstance, 28)}'")}");
             }
         }
+    }
+
+    private void MaybeLogPhysicalDiskDiagnostics(bool refreshRequested, PhysicalDiskRow[] disks)
+    {
+        if (!refreshRequested && (physicalDiskDiagnosticsLogged || disks.Length == 0))
+            return;
+
+        physicalDiskDiagnosticsLogged = true;
+        foreach (var evt in PhysicalDiskInventory.BuildDiagnostics(disks))
+            AddEvent(evt.Severity, evt.Message);
     }
 
     private static string TrimForEvent(string value, int max)

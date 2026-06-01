@@ -15,7 +15,7 @@ namespace hvtop.Native;
 internal static class Program
 {
 #if RDC
-    public const string DisplayVersion = "0.7.0-rdc+20260524.0138";
+    public const string DisplayVersion = "0.8.0-rdc+20260601.0139";
     public const string AppName = "hvtop-rdc";
 
     public static async Task<int> Main(string[] args)
@@ -41,7 +41,7 @@ internal static class Program
             RdcLog.Info($"parsed options listen='{options.ListenPrefix}' port={options.Port} refresh={options.Refresh.TotalSeconds:N1}s history={options.History.TotalMinutes:N0}m token={(string.IsNullOrWhiteSpace(options.Token) ? "none" : "set")}");
             using var cts = new CancellationTokenSource();
             using var firewallRule = RdcFirewallRule.Ensure(options.Port);
-                    using var collector = new Collector(new Options(options.Refresh, options.History, false, true, false, options.Port, options.Refresh, null, null, null, null, options.DebugLog, options.DebugCounters, false, false, null));
+            using var collector = new Collector(new Options(options.Refresh, options.History, false, true, false, options.Port, options.Refresh, null, null, null, null, options.DebugLog, options.DebugCounters, false, false, null));
             var current = Snapshot.Empty;
             var firstSample = true;
             var sampler = Task.Run(async () =>
@@ -54,7 +54,7 @@ internal static class Program
                         RdcLog.Info($"sample start first={firstSample}");
                         current = collector.Collect(firstSample);
                         firstSample = false;
-                        RdcLog.Info($"sample complete in {Stopwatch.GetElapsedTime(started).TotalMilliseconds:N0} ms hosts={current.Hosts.Length} vms={current.Vms.Length} disks={current.Disks.Length} networks={current.Networks.Length} switches={current.NetworkSwitches.Length}");
+                        RdcLog.Info($"sample complete in {Stopwatch.GetElapsedTime(started).TotalMilliseconds:N0} ms hosts={current.Hosts.Length} vms={current.Vms.Length} disks={current.Disks.Length} physicalDisks={current.PhysicalDisks.Length} networks={current.Networks.Length} switches={current.NetworkSwitches.Length}");
                     }
                     catch (Exception ex)
                     {
@@ -189,7 +189,7 @@ internal static class Program
     }
 
 #else
-    public const string DisplayVersion = "0.7.0+20260524.0138";
+    public const string DisplayVersion = "0.8.0+20260601.0139";
     public const string AppName = "hvtop";
 
     public static async Task<int> Main(string[] args)
@@ -223,6 +223,8 @@ internal static class Program
                 Console.WriteLine($"HOST {host.Name} VER {host.Version} CPU {FormatSmoke(host.Cpu)} | {FormatSmokeMax(host.Cpu)} | ({host.CpuCapacity}) MEM {FormatSmoke(host.Mem)} | {FormatSmokeMax(host.Mem)} | ({host.MemCapacity}) IO {FormatSmoke(host.Io)} NET {FormatSmoke(host.Net)} STA {host.Status}");
             foreach (var disk in snapshot.Disks.Take(5))
                 Console.WriteLine($"DISK {disk.HostName} {disk.Name} SIZE {disk.Size} FREE {FormatSmoke(disk.Free)} IO {FormatSmoke(disk.Io)} IOPS {FormatSmoke(disk.Iops)} QD {FormatSmoke(disk.QueueDepth)} LAT {FormatSmoke(disk.Latency)} STA {disk.Status}");
+            foreach (var disk in snapshot.PhysicalDisks.Take(5))
+                Console.WriteLine($"PDISK {disk.HostName} PDID {disk.PhysicalDiskId} TYPE {disk.Type} SIZE {disk.Size} MAP {disk.Mapping} FRIENDLY {disk.FriendlyName} MODEL {disk.Model} FW {disk.FirmwareVersion} SN {disk.SerialNumber} NAME {disk.Name} IO {FormatSmoke(disk.Io)} IOPS {FormatSmoke(disk.Iops)} QD {FormatSmoke(disk.QueueDepth)} LAT {FormatSmoke(disk.Latency)} STA {disk.Status}");
             foreach (var net in snapshot.Networks.Take(5))
                 Console.WriteLine($"NET  {net.HostName} {net.Name} THR {FormatSmoke(net.Throughput)} RX {FormatSmoke(net.Rx)} TX {FormatSmoke(net.Tx)} RDMA {FormatSmoke(net.RdmaThroughput)} STA {net.Status}");
             return 0;

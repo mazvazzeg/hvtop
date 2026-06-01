@@ -19,6 +19,8 @@ internal sealed class Tui
     private const int VmVersionWidth = 7;
     private const int HostColumnWidth = 14;
     private const int UptimeWidth = 4;
+    private const int PdidWidth = 4;
+    private const int TypeWidth = 9;
     private const int CountWidth = 5;
     private const int OwnerWidth = 18;
     private const int QuorumWidth = 14;
@@ -109,6 +111,9 @@ internal sealed class Tui
                 return;
             case ConsoleKey.D:
                 SetPanel(Panel.Disks);
+                return;
+            case ConsoleKey.P:
+                SetPanel(Panel.PhysicalDisks);
                 return;
             case ConsoleKey.N:
                 SetPanel(Panel.Network);
@@ -312,6 +317,7 @@ internal sealed class Tui
         {
             VmRow vmRow => vmRow.HostName,
             DiskRow diskRow => diskRow.HostName,
+            PhysicalDiskRow physicalDiskRow => physicalDiskRow.HostName,
             NetworkSwitchRow switchRow => switchRow.HostName,
             NetworkRow networkRow => networkRow.HostName,
             _ => selectedHostName
@@ -349,6 +355,14 @@ internal sealed class Tui
                     drillView = DrillView.Detail;
                     selectedHostName = diskRow.HostName;
                     selectedItemName = diskRow.Name;
+                    selected = 0;
+                    return;
+                case PhysicalDiskRow physicalDiskRow:
+                    panel = Panel.PhysicalDisks;
+                    detailPanel = Panel.PhysicalDisks;
+                    drillView = DrillView.Detail;
+                    selectedHostName = physicalDiskRow.HostName;
+                    selectedItemName = physicalDiskRow.Name;
                     selected = 0;
                     return;
                 case NetworkSwitchRow switchRow:
@@ -526,6 +540,7 @@ internal sealed class Tui
                 Panel.Hosts => s.Hosts,
                 Panel.Vms => s.Vms,
                 Panel.Disks => s.Disks,
+                Panel.PhysicalDisks => s.PhysicalDisks,
                 Panel.Network => s.NetworkSwitches,
                 Panel.Events => s.Events,
                 _ => []
@@ -593,6 +608,7 @@ internal sealed class Tui
             Panel.Hosts => [new("NAME", "name"), new("VER", "version"), new("UP", "uptime"), new("CPU", "cpu"), new("MEM", "memory"), new("IO", "i/o"), new("NET", "network"), new("STA", "status")],
             Panel.Vms => VmSortColumns(),
             Panel.Disks => [new("HOST", "host"), new("NAME", "name"), new("SIZE", "size"), new("FREE", "free"), new("IO", "i/o"), new("IOPS", "iops"), new("QD", "queue"), new("LAT", "latency"), new("STA", "status")],
+            Panel.PhysicalDisks => [new("HOST", "host"), new("PDID", "pdid"), new("TYPE", "type"), new("SIZE", "size"), new("IO", "i/o"), new("IOPS", "iops"), new("QD", "queue"), new("LAT", "latency"), new("STA", "status")],
             Panel.Network => [new("HOST", "host"), new("NAME", "name"), new("UPL", "uplinks"), new("LINK", "link"), new("THR", "throughput"), new("RX", "rx"), new("TX", "tx"), new("STA", "status")],
             Panel.Events => [new("DATE", "date")],
             _ => []
@@ -650,6 +666,20 @@ internal sealed class Tui
             "NAME" => disk.Name,
             "SIZE" => ParseCapacity(disk.Size),
             "FREE" => disk.Free.Current,
+            "IO" => disk.Io.Current,
+            "IOPS" => disk.Iops.Current,
+            "QD" => disk.QueueDepth.Current,
+            "LAT" => disk.Latency.Current,
+            "STA" => StatusRank(disk.Status),
+            _ => disk.Name
+        },
+        PhysicalDiskRow disk => column switch
+        {
+            "HOST" => disk.HostName,
+            "PDID" => ParsePhysicalDiskId(disk.PhysicalDiskId),
+            "NAME" => disk.Name,
+            "TYPE" => disk.Type,
+            "SIZE" => ParseCapacity(disk.Size),
             "IO" => disk.Io.Current,
             "IOPS" => disk.Iops.Current,
             "QD" => disk.QueueDepth.Current,
@@ -728,6 +758,9 @@ internal sealed class Tui
         } : 1d;
         return number * multiplier;
     }
+
+    private static double ParsePhysicalDiskId(string value)
+        => double.TryParse(value, out var number) ? number : double.NaN;
 
     private static double ParseLink(string value)
     {
@@ -882,6 +915,7 @@ internal sealed class Tui
             panel == Panel.Hosts ? "[H] HOSTS" : " H  HOSTS",
             panel == Panel.Vms ? "[V] VMS" : " V  VMS",
             panel == Panel.Disks ? "[D] CSV / STORAGE" : " D  CSV / STORAGE",
+            panel == Panel.PhysicalDisks ? "[P] PHYSICAL" : " P  PHYSICAL",
             panel == Panel.Network ? "[N] NETWORK" : " N  NETWORK",
             panel == Panel.Events ? "[E] EVENTS" : " E  EVENTS"
         });
@@ -995,6 +1029,15 @@ internal sealed class Tui
                         r => Row(Cell(DisplayName(r.HostName, HostColumnWidth), HostColumnWidth), Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Size, SizeWidth, true), FmtShort(r.Free), Fmt(r.Io), FmtShort(r.Iops), FmtShort(r.QueueDepth), FmtShort(r.Latency), Cell(r.Status, StatusWidth)));
                 }
                 break;
+            case Panel.PhysicalDisks:
+                {
+                    RenderRows(
+                        Row(Header("HOST", HostColumnWidth), Header("PDID", PdidWidth), Header("TYPE", TypeWidth), HeaderRight("SIZE", SizeWidth), GroupHeader("I/O", MetricWidth), GroupHeader("IOPS", ShortMetricWidth), GroupHeader("QD", ShortMetricWidth), GroupHeader("LAT", ShortMetricWidth), Header("STA", StatusWidth)),
+                        Row(Header(string.Empty, HostColumnWidth), Header(string.Empty, PdidWidth), Header(string.Empty, TypeWidth), Header(string.Empty, SizeWidth), MetricSubHeader(), ShortMetricSubHeader(), ShortMetricSubHeader(), ShortMetricSubHeader(), Header(string.Empty, StatusWidth)),
+                        CurrentRows().Cast<PhysicalDiskRow>().ToArray(),
+                        r => Row(Cell(DisplayName(r.HostName, HostColumnWidth), HostColumnWidth), Cell(r.PhysicalDiskId, PdidWidth, true), Cell(DisplayName(r.Type, TypeWidth), TypeWidth), Cell(PhysicalDiskSizeSummary(r.Size), SizeWidth, true), Fmt(r.Io), FmtShort(r.Iops), FmtShort(r.QueueDepth), FmtShort(r.Latency), Cell(r.Status, StatusWidth)));
+                }
+                break;
             case Panel.Network:
                 {
                     if (drillView == DrillView.NetworkAdapters)
@@ -1071,6 +1114,12 @@ internal sealed class Tui
         if (width < 12) return name[..width];
         var edge = Math.Max(4, (width - 4) / 2);
         return $"{name[..edge]}....{name[^edge..]}";
+    }
+
+    private static string PhysicalDiskSizeSummary(string size)
+    {
+        var paren = size.IndexOf('(');
+        return paren > 0 ? size[..paren].TrimEnd() : size;
     }
 
     private static string ShortHostVersion(string version)
@@ -1172,6 +1221,34 @@ internal sealed class Tui
             Cell(FmtValue(disk.Free.Current, disk.Free.Unit), 10),
             Cell(FmtValue(disk.Io.Current, disk.Io.Unit), 10),
             Cell(FmtValue(disk.Iops.Current, disk.Iops.Unit), 10),
+            Cell(FmtValue(disk.Latency.Current, disk.Latency.Unit), 10),
+            Cell(disk.Status, 6)
+        });
+
+    private static string HostPhysicalDiskHeaderRow()
+        => "  " + string.Join("  ", new[]
+        {
+            Cell("PDID", PdidWidth),
+            Cell("TYPE", TypeWidth),
+            Cell("SIZE", SizeWidth),
+            Cell("Instance", 24),
+            Cell("I/O", 10),
+            Cell("IOPS", 10),
+            Cell("QD", 6),
+            Cell("LAT", 10),
+            Cell("STA", 6)
+        });
+
+    private static string HostPhysicalDiskDataRow(PhysicalDiskRow disk)
+        => "  " + string.Join("  ", new[]
+        {
+            Cell(disk.PhysicalDiskId, PdidWidth, true),
+            Cell(DisplayName(disk.Type, TypeWidth), TypeWidth),
+            Cell(PhysicalDiskSizeSummary(disk.Size), SizeWidth, true),
+            Cell(DisplayName(disk.Name, 24), 24),
+            Cell(FmtValue(disk.Io.Current, disk.Io.Unit), 10),
+            Cell(FmtValue(disk.Iops.Current, disk.Iops.Unit), 10),
+            Cell(FmtValue(disk.QueueDepth.Current, disk.QueueDepth.Unit), 6),
             Cell(FmtValue(disk.Latency.Current, disk.Latency.Unit), 10),
             Cell(disk.Status, 6)
         });
@@ -1366,8 +1443,9 @@ internal sealed class Tui
             case HostRow host:
                 var hostVms = snapshot.Vms.Where(v => v.HostName.Equals(host.Name, StringComparison.OrdinalIgnoreCase)).OrderBy(v => v.Name, StringComparer.OrdinalIgnoreCase).ToArray();
                 var hostDisks = snapshot.Disks.Where(d => d.HostName.Equals(host.Name, StringComparison.OrdinalIgnoreCase)).OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+                var hostPhysicalDisks = snapshot.PhysicalDisks.Where(d => d.HostName.Equals(host.Name, StringComparison.OrdinalIgnoreCase)).OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase).ToArray();
                 var hostNetworks = snapshot.NetworkSwitches.Where(n => n.HostName.Equals(host.Name, StringComparison.OrdinalIgnoreCase)).OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase).ToArray();
-                var selectableRows = hostVms.Length + hostDisks.Length + hostNetworks.Length;
+                var selectableRows = hostVms.Length + hostDisks.Length + hostPhysicalDisks.Length + hostNetworks.Length;
                 selected = Math.Min(selected, Math.Max(0, selectableRows - 1));
                 Detail(7, "Name", host.Name);
                 Detail(8, "Version", host.Version);
@@ -1394,6 +1472,11 @@ internal sealed class Tui
                 hostDetailLines.Add(DetailLine.Header(HostDiskHeaderRow()));
                 foreach (var diskRow in hostDisks)
                     hostDetailLines.Add(DetailLine.Selectable(HostDiskDataRow(diskRow), diskRow, absolute++));
+
+                hostDetailLines.Add(DetailLine.Blank());
+                hostDetailLines.Add(DetailLine.Header(HostPhysicalDiskHeaderRow()));
+                foreach (var diskRow in hostPhysicalDisks)
+                    hostDetailLines.Add(DetailLine.Selectable(HostPhysicalDiskDataRow(diskRow), diskRow, absolute++));
 
                 hostDetailLines.Add(DetailLine.Blank());
                 hostDetailLines.Add(DetailLine.Header(HostNetworkHeaderRow()));
@@ -1461,6 +1544,34 @@ internal sealed class Tui
                 DetailMetric(27, "Queue depth", disk.QueueDepth);
                 DetailMetric(28, "Latency", disk.Latency);
                 Detail(30, "Status", disk.Status, StatusColor(disk.Status));
+                break;
+            case PhysicalDiskRow disk:
+                Detail(7, "PDID", disk.PhysicalDiskId);
+                Detail(8, "Host", disk.HostName);
+                Detail(9, "Instance", disk.Name);
+                Detail(10, "Mapping", DetailValue(disk.Mapping), disk.Mapping.StartsWith("Inferred", StringComparison.OrdinalIgnoreCase) ? ConsoleColor.Yellow : ConsoleColor.Gray);
+                Detail(11, "Friendly name", DetailValue(disk.FriendlyName));
+                Detail(12, "Manufacturer", DetailValue(disk.Manufacturer));
+                Detail(13, "Model", DetailValue(disk.Model));
+                Detail(14, "Firmware", DetailValue(disk.FirmwareVersion));
+                Detail(15, "Serial", DetailValue(disk.SerialNumber));
+                Detail(16, "Type", disk.Type);
+                Detail(17, "Size", disk.Size);
+                DetailScalar(18, string.Empty, string.Empty);
+                DetailMetricHeader(19, string.Empty, "cur", "max");
+                DetailMetric(20, "Total I/O", disk.Io);
+                DetailMetric(21, Branch(false, "Read I/O"), disk.ReadIo);
+                DetailMetric(22, Branch(true, "Write I/O"), disk.WriteIo);
+                DetailScalar(23, string.Empty, string.Empty);
+                DetailMetricHeader(24, string.Empty, "cur", "max");
+                DetailMetric(25, "Total IOPS", disk.Iops);
+                DetailMetric(26, Branch(false, "Read IOPS"), disk.ReadIops);
+                DetailMetric(27, Branch(true, "Write IOPS"), disk.WriteIops);
+                DetailScalar(28, string.Empty, string.Empty);
+                DetailMetricHeader(29, string.Empty, "cur", "max");
+                DetailMetric(30, "Queue depth", disk.QueueDepth);
+                DetailMetric(31, "Latency", disk.Latency);
+                Detail(33, "Status", disk.Status, StatusColor(disk.Status));
                 break;
             case NetworkRow net:
                 Detail(7, "Name", net.Name);
@@ -1666,6 +1777,9 @@ internal sealed class Tui
     private void Detail(int y, string label, string value, ConsoleColor color = ConsoleColor.Gray)
         => WriteLine(y, $"  {label,-DetailLabelWidth} {value}", color);
 
+    private static string DetailValue(string value)
+        => string.IsNullOrWhiteSpace(value) ? "n/a" : value;
+
     private void DetailMetric(int y, string label, Metric metric)
         => DetailScalar(y, label, DetailMetricValue(metric));
 
@@ -1754,6 +1868,9 @@ internal sealed class Tui
             .Concat(snapshot.Disks
                 .Where(d => d.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase))
                 .OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase))
+            .Concat(snapshot.PhysicalDisks
+                .Where(d => d.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase))
             .Concat(snapshot.NetworkSwitches
                 .Where(n => n.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase))
                 .OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase))
@@ -1797,6 +1914,7 @@ internal sealed class Tui
             Panel.Hosts => s.Hosts.FirstOrDefault(r => r.Name == selectedItemName),
             Panel.Vms => s.Vms.FirstOrDefault(r => r.Name == selectedItemName && (string.IsNullOrEmpty(selectedHostName) || r.HostName == selectedHostName)),
             Panel.Disks => s.Disks.FirstOrDefault(r => r.Name == selectedItemName && (string.IsNullOrEmpty(selectedHostName) || r.HostName == selectedHostName)),
+            Panel.PhysicalDisks => s.PhysicalDisks.FirstOrDefault(r => r.Name == selectedItemName && (string.IsNullOrEmpty(selectedHostName) || r.HostName == selectedHostName)),
             Panel.Network => s.Networks.FirstOrDefault(r => r.Name == selectedItemName && (string.IsNullOrEmpty(selectedHostName) || r.HostName == selectedHostName)),
             _ => null
         };
@@ -1816,6 +1934,8 @@ internal sealed class Tui
             return $"HOST {vnic.HostName} -> VM {vnic.VmName} -> vNIC {vnic.Adapter.Name}";
         if (row is DiskRow disk)
             return $"HOST {disk.HostName} -> storage {disk.Name}";
+        if (row is PhysicalDiskRow physicalDisk)
+            return $"HOST {physicalDisk.HostName} -> physical disk {physicalDisk.Name}";
         return $"{detailPanel} detail: {GetRowName(row)}";
     }
 
@@ -1825,6 +1945,7 @@ internal sealed class Tui
         HostRow host => host.Name,
         VmRow vm => vm.Name,
         DiskRow disk => disk.Name,
+        PhysicalDiskRow disk => disk.Name,
         NetworkSwitchRow networkSwitch => networkSwitch.Name,
         NetworkRow net => net.Name,
         VDiskRow disk => disk.Name,
@@ -2007,6 +2128,7 @@ internal sealed class Tui
         HostRow host => StatusColor(host.Status),
         VmRow vm => StatusColor(vm.Status),
         DiskRow disk => StatusColor(disk.Status),
+        PhysicalDiskRow disk => StatusColor(disk.Status),
         NetworkSwitchRow networkSwitch => StatusColor(networkSwitch.Status),
         NetworkRow net => StatusColor(net.Status),
         EventRow evt => evt.Severity switch
@@ -2022,6 +2144,7 @@ internal sealed class Tui
         => snapshot.Hosts.Length == 0
            && snapshot.Vms.Length == 0
            && snapshot.Disks.Length == 0
+           && snapshot.PhysicalDisks.Length == 0
            && snapshot.Networks.Length == 0
            && snapshot.Events.Length == 0;
 
@@ -2033,6 +2156,7 @@ internal sealed class Tui
             TableKind.HostLike => HostVersionWidth + UptimeWidth + CapacityMetricWidth + CapacityMetricWidth + MetricWidth + MetricWidth + StatusWidth,
             TableKind.VmLike => HostColumnWidth + VmVersionWidth + UptimeWidth + CapacityMetricWidth + CapacityMetricWidth + MetricWidth + MetricWidth + StatusWidth,
             TableKind.DiskLike => HostColumnWidth + SizeWidth + MetricWidth + MetricWidth + MetricWidth + ShortMetricWidth + ShortMetricWidth + StatusWidth,
+            TableKind.PhysicalDiskLike => HostColumnWidth + PdidWidth + TypeWidth + SizeWidth + MetricWidth + ShortMetricWidth + ShortMetricWidth + ShortMetricWidth + StatusWidth,
             TableKind.NetworkSwitchLike => HostColumnWidth + UplinkWidth + LinkWidth + MetricWidth + MetricWidth + MetricWidth + StatusWidth,
             TableKind.NetworkLike => LinkWidth + MetricWidth + MetricWidth + MetricWidth + ShortMetricWidth + StatusWidth,
             _ => 0
@@ -2044,6 +2168,7 @@ internal sealed class Tui
             TableKind.HostLike => 8,
             TableKind.VmLike => 9,
             TableKind.DiskLike => 9,
+            TableKind.PhysicalDiskLike => 9,
             TableKind.NetworkLike => 6,
             TableKind.NetworkSwitchLike => 8,
             _ => 2
@@ -2225,11 +2350,11 @@ internal sealed class Tui
     }
 }
 
-internal enum Panel { Cluster, Hosts, Vms, Disks, Network, Events }
+internal enum Panel { Cluster, Hosts, Vms, Disks, PhysicalDisks, Network, Events }
 
 internal enum DrillView { Overview, HostVms, NetworkAdapters, Detail }
 
-internal enum TableKind { ClusterLike, HostLike, VmLike, DiskLike, NetworkLike, NetworkSwitchLike }
+internal enum TableKind { ClusterLike, HostLike, VmLike, DiskLike, PhysicalDiskLike, NetworkLike, NetworkSwitchLike }
 
 internal enum DetailLineKind { Header, Selectable, Blank }
 

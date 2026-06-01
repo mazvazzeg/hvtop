@@ -6,6 +6,7 @@ internal sealed record Snapshot(
     HostRow[] Hosts,
     VmRow[] Vms,
     DiskRow[] Disks,
+    PhysicalDiskRow[] PhysicalDisks,
     NetworkSwitchRow[] NetworkSwitches,
     NetworkRow[] Networks,
     EventRow[] Events,
@@ -16,7 +17,7 @@ internal sealed record Snapshot(
     DiscoveryProgress Discovery,
     string RdcStatus)
 {
-    public static Snapshot Empty { get; } = new(DateTime.Now, [], [], [], [], [], [], [], [], true, false, false, DiscoveryProgress.Empty, "idle");
+    public static Snapshot Empty { get; } = new(DateTime.Now, [], [], [], [], [], [], [], [], [], true, false, false, DiscoveryProgress.Empty, "idle");
 }
 
 internal sealed record DiscoveryProgress(
@@ -78,6 +79,21 @@ internal sealed record DiskRow(string HostName, string Name, string Size, string
     public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
     {
         [nameof(Free)] = Free.Current,
+        [nameof(Io)] = Io.Current,
+        [nameof(ReadIo)] = ReadIo.Current,
+        [nameof(WriteIo)] = WriteIo.Current,
+        [nameof(Iops)] = Iops.Current,
+        [nameof(ReadIops)] = ReadIops.Current,
+        [nameof(WriteIops)] = WriteIops.Current,
+        [nameof(QueueDepth)] = QueueDepth.Current,
+        [nameof(Latency)] = Latency.Current
+    };
+}
+
+internal sealed record PhysicalDiskRow(string HostName, string PhysicalDiskId, string Name, string Type, string Size, string FriendlyName, string Manufacturer, string Model, string FirmwareVersion, string SerialNumber, string Mapping, Metric Io, Metric ReadIo, Metric WriteIo, Metric Iops, Metric ReadIops, Metric WriteIops, Metric QueueDepth, Metric Latency, string Status)
+{
+    public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
+    {
         [nameof(Io)] = Io.Current,
         [nameof(ReadIo)] = ReadIo.Current,
         [nameof(WriteIo)] = WriteIo.Current,

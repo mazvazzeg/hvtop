@@ -5,6 +5,8 @@ internal sealed record RdcStatus(string Status, string Host);
 [JsonSourceGenerationOptions(NumberHandling = JsonNumberHandling.AllowNamedFloatingPointLiterals)]
 [JsonSerializable(typeof(Snapshot))]
 [JsonSerializable(typeof(RdcStatus))]
+[JsonSerializable(typeof(PhysicalDiskInventoryJson))]
+[JsonSerializable(typeof(PhysicalDiskInventoryJson[]))]
 internal sealed partial class HvtopJsonContext : JsonSerializerContext;
 
 internal static class RdcLog

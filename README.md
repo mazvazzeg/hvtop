@@ -1,7 +1,8 @@
 # hvtop
 
 hvtop is a TUI prototype for monitoring Windows and Hyper-V hosts, VMs when
-Hyper-V is present, failover clusters, CSV/storage, network, and recent events.
+Hyper-V is present, failover clusters, CSV/storage, physical disks, network, and
+recent events.
 It is shaped like `htop` or `esxtop`, but with fast drill-down views and a small
 rolling history buffer for max/spike visibility.
 
@@ -127,6 +128,7 @@ panes remain useful on standard Windows servers.
 - `H`: Hosts
 - `V`: VMs
 - `D`: CSV/storage
+- `P`: Physical disks
 - `N`: Network
 - `E`: Events
 - `Up/Down`: move selection
@@ -153,9 +155,9 @@ CLUSTER -> HOSTS -> select host -> host detail -> select VM -> VM detail
 On non-cluster hosts, the flow starts at `HOSTS`. On standard Windows servers
 without Hyper-V, the VM pane is expected to be empty.
 
-The top-level `VMs`, `CSV/storage`, and `Network` panes are global views. In
-cluster/RDC mode they include rows from all reporting hosts and show a `HOST`
-column so the source node is visible.
+The top-level `VMs`, `CSV/storage`, `Physical disks`, and `Network` panes are
+global views. In cluster/RDC mode they include rows from all reporting hosts and
+show a `HOST` column so the source node is visible.
 
 Detail panes resolve the selected row from the latest snapshot on every repaint,
 so values continue updating live while you are drilled in.
@@ -166,6 +168,7 @@ so values continue updating live while you are drilled in.
 - Hosts: hostname, version, uptime, CPU, memory, I/O, network, status
 - VMs: host, name, version, uptime, CPU, memory, I/O, network, status
 - CSV/storage: host, name, free space, I/O, IOPS, queue depth, latency, status
+- Physical disks: host, PDID, type, size, I/O, IOPS, queue depth, latency, status
 - Network: host, vSwitch or adapter, link, throughput, receive, transmit, drops, status
 - Events: timestamped status, spike, and collector events
 
@@ -213,6 +216,33 @@ so the local host still has useful data if the remote target is unavailable. Use
 required. If the remote collector cannot be deployed or polled, hvtop keeps the
 TUI open, shows the terminal RDC error in the bottom status line, and leaves the
 Events pane available for the detailed failure trail.
+
+## Physical Disk Discovery
+
+The `P` physical disk pane uses native `PhysicalDisk(*)` PDH counters for the
+hot-path metrics: I/O, IOPS, queue depth, and latency. Inventory data is resolved
+less frequently and is used only to label those counter instances with useful
+metadata such as PDID, type, size, friendly name, model, firmware, and serial.
+
+hvtop correlates physical disk counter instances with several Windows inventory
+sources:
+
+- `Get-Disk` for Windows disk number, bus type, media type, size, and friendly
+  name.
+- `Win32_DiskDrive` for model, manufacturer, firmware revision, serial number,
+  and virtual/emulated disk hints.
+- `Get-PhysicalDisk -PhysicallyConnected` and `Get-PhysicalDisk` for Storage
+  Spaces and S2D physical disk identity.
+- `Get-PhysicalDiskStorageNodeView` when available, so cluster/S2D nodes can map
+  the disks that are physically connected to the current node.
+- `Win32_ComputerSystem` and `Win32_SCSIController` as a fallback for virtual
+  machines, so otherwise anonymous rows can still show labels such as
+  `Hyper-V Storage`, `VMware PVSCSI`, `VirtIO Storage`, or `VirtualBox Storage`
+  instead of plain `n/a`.
+
+Physical disk sizes are displayed as vendor/marketing capacity with the binary
+capacity in details, for example `8 TB (7.28 TiB)`. The overview pane keeps the
+short vendor-style value to save horizontal space.
 
 ## Native Collection Direction
 

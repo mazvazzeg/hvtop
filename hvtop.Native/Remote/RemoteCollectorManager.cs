@@ -210,6 +210,18 @@ internal sealed class RemoteCollectorManager : IDisposable
             .ToArray();
     }
 
+    public static PhysicalDiskRow[] MergePhysicalDisks(PhysicalDiskRow[] local, RemoteSnapshot[] remote)
+    {
+        return local
+            .Concat(remote.SelectMany(r => r.Snapshot.PhysicalDisks.Select(d => string.IsNullOrWhiteSpace(d.HostName) ? d with { HostName = r.NodeName } : d)))
+            .Where(disk => !string.IsNullOrWhiteSpace(disk.Name))
+            .GroupBy(disk => $"{disk.HostName}\0{disk.Name}", StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.Last())
+            .OrderBy(disk => disk.HostName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(disk => disk.Name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
     public static NetworkSwitchRow[] MergeNetworkSwitches(NetworkSwitchRow[] local, RemoteSnapshot[] remote)
     {
         return local
