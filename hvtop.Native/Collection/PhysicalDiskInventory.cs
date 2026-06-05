@@ -46,7 +46,7 @@ internal static class PhysicalDiskInventory
                 : BuildEntry(row, rawRows);
             events.Add(new InventoryEvent(
                 "INFO",
-                $"PDINV src={row.Source ?? source} id='{TrimForEvent(id, 12)}' dev='{TrimForEvent(row.DeviceId ?? string.Empty, 12)}' friendly='{TrimForEvent(row.FriendlyName ?? string.Empty, 28)}' bus='{TrimForEvent(row.BusType ?? string.Empty, 10)}' media='{TrimForEvent(row.MediaType ?? string.Empty, 10)}' type='{mapped.Type}' size='{mapped.Size}' map='{TrimForEvent(mapped.Mapping, 18)}' model='{TrimForEvent(mapped.Model, 24)}' fw='{TrimForEvent(mapped.FirmwareVersion, 12)}' sn='{TrimForEvent(mapped.SerialNumber, 18)}'"));
+                $"PDINV src={row.Source ?? source} id='{TrimForEvent(id, 12)}' dev='{TrimForEvent(row.DeviceId ?? string.Empty, 12)}' node='{TrimForEvent(row.ConnectedNode ?? string.Empty, 18)}' ndev='{TrimForEvent(row.ConnectedNodeDeviceNumber ?? string.Empty, 8)}' friendly='{TrimForEvent(row.FriendlyName ?? string.Empty, 28)}' bus='{TrimForEvent(row.BusType ?? string.Empty, 10)}' media='{TrimForEvent(row.MediaType ?? string.Empty, 10)}' type='{mapped.Type}' size='{mapped.Size}' map='{TrimForEvent(mapped.Mapping, 18)}' model='{TrimForEvent(mapped.Model, 24)}' fw='{TrimForEvent(mapped.FirmwareVersion, 12)}' sn='{TrimForEvent(mapped.SerialNumber, 18)}'"));
         }
 
         foreach (var disk in disks.Take(16))
@@ -70,14 +70,16 @@ internal static class PhysicalDiskInventory
             "$ErrorActionPreference='SilentlyContinue'; " +
             "function _hvprop($o,$n){ if($null -eq $o){ '' } else { $p=$o.PSObject.Properties[$n]; if($null -eq $p -or $null -eq $p.Value){ '' } else { [string]$p.Value } } }; " +
             "function _hvnum($o,$n){ if($null -eq $o){ [uint64]0 } else { $p=$o.PSObject.Properties[$n]; if($null -eq $p -or $null -eq $p.Value){ [uint64]0 } else { [uint64]$p.Value } } }; " +
+            "function First-NonEmpty(){ foreach($v in $args){ if(-not [string]::IsNullOrWhiteSpace([string]$v)){ [string]$v; return } }; '' }; " +
             "$cs=@(); try { $c=Get-CimInstance Win32_ComputerSystem; $cs=@([pscustomobject]@{Source='ComputerSystem';DeviceId='';DeviceNumber='';FriendlyName=$c.Model;MediaType='';BusType='';Size=0;Manufacturer=$c.Manufacturer;Model=$c.Model;FirmwareVersion='';SerialNumber=''}) } catch { }; " +
             "$ctrl=@(); try { $ctrl=@(Get-CimInstance Win32_SCSIController | Select-Object @{n='Source';e={'StorageController'}},@{n='DeviceId';e={''}},@{n='DeviceNumber';e={''}},@{n='FriendlyName';e={$_.Caption}},@{n='MediaType';e={''}},@{n='BusType';e={'SCSI'}},@{n='Size';e={[uint64]0}},Manufacturer,@{n='Model';e={$_.Name}},@{n='FirmwareVersion';e={''}},@{n='SerialNumber';e={''}}) } catch { }; " +
             "$disk=@(Get-Disk | Select-Object @{n='Source';e={'Get-Disk'}},@{n='DeviceId';e={[string]$_.Number}},@{n='DeviceNumber';e={[string]$_.Number}},FriendlyName,MediaType,BusType,Size,@{n='Manufacturer';e={_hvprop $_ 'Manufacturer'}},@{n='Model';e={_hvprop $_ 'Model'}},@{n='FirmwareVersion';e={_hvprop $_ 'FirmwareVersion'}},@{n='SerialNumber';e={_hvprop $_ 'SerialNumber'}}); " +
             "$drive=@(Get-CimInstance Win32_DiskDrive | Select-Object @{n='Source';e={'Win32_DiskDrive'}},@{n='DeviceId';e={[string]$_.Index}},@{n='DeviceNumber';e={[string]$_.Index}},@{n='FriendlyName';e={$_.Model}},MediaType,@{n='BusType';e={$_.InterfaceType}},Size,Manufacturer,Model,@{n='FirmwareVersion';e={$_.FirmwareRevision}},SerialNumber); " +
+            "$sbc=@(); try { $sbc=@(Get-StorageBusClientDevice | Select-Object @{n='Source';e={'StorageBusClientDevice'}},@{n='DeviceId';e={First-NonEmpty (_hvprop $_ 'ConnectedNodeDeviceNumber') (_hvprop $_ 'DiskNumber') (_hvprop $_ 'Number') (_hvprop $_ 'Id')}},@{n='DeviceNumber';e={First-NonEmpty (_hvprop $_ 'ConnectedNodeDeviceNumber') (_hvprop $_ 'DiskNumber') (_hvprop $_ 'Number')}},@{n='FriendlyName';e={First-NonEmpty (_hvprop $_ 'ProductId') (_hvprop $_ 'Model') (_hvprop $_ 'Id')}},@{n='MediaType';e={_hvprop $_ 'DeviceType'}},@{n='BusType';e={'S2D'}},@{n='Size';e={_hvnum $_ 'Size'}},@{n='Manufacturer';e={_hvprop $_ 'VendorId'}},@{n='Model';e={First-NonEmpty (_hvprop $_ 'ProductId') (_hvprop $_ 'Model')}},@{n='FirmwareVersion';e={_hvprop $_ 'FirmwareVersion'}},@{n='SerialNumber';e={_hvprop $_ 'SerialNumber'}},@{n='ConnectedNode';e={_hvprop $_ 'ConnectedNode'}},@{n='ConnectedNodeDeviceNumber';e={_hvprop $_ 'ConnectedNodeDeviceNumber'}},@{n='Flags';e={(_hvprop $_ 'Flags')}}) } catch { }; " +
             "$nodeView=@(); try { $node=Get-StorageNode -Name $env:COMPUTERNAME -ErrorAction SilentlyContinue; if($node){ $nodeView=@(Get-PhysicalDisk | Get-PhysicalDiskStorageNodeView -StorageNode $node | Where-Object { $_.IsPhysicallyConnected } | Select-Object @{n='Source';e={'StorageNodeView'}},@{n='DeviceId';e={[string]$_.DiskNumber}},@{n='DeviceNumber';e={_hvprop $_.PhysicalDisk 'DeviceNumber'}},@{n='FriendlyName';e={_hvprop $_.PhysicalDisk 'FriendlyName'}},@{n='MediaType';e={_hvprop $_.PhysicalDisk 'MediaType'}},@{n='BusType';e={_hvprop $_.PhysicalDisk 'BusType'}},@{n='Size';e={_hvnum $_.PhysicalDisk 'Size'}},@{n='Manufacturer';e={_hvprop $_.PhysicalDisk 'Manufacturer'}},@{n='Model';e={_hvprop $_.PhysicalDisk 'Model'}},@{n='FirmwareVersion';e={_hvprop $_.PhysicalDisk 'FirmwareVersion'}},@{n='SerialNumber';e={_hvprop $_.PhysicalDisk 'SerialNumber'}}) } } catch { }; " +
             "$physicalLocal=@(); try { $physicalLocal=@(Get-PhysicalDisk -PhysicallyConnected | Select-Object @{n='Source';e={'Get-PhysicalDiskLocal'}},@{n='DeviceId';e={[string]$_.DeviceId}},@{n='DeviceNumber';e={_hvprop $_ 'DeviceNumber'}},FriendlyName,MediaType,BusType,Size,@{n='Manufacturer';e={_hvprop $_ 'Manufacturer'}},@{n='Model';e={_hvprop $_ 'Model'}},@{n='FirmwareVersion';e={_hvprop $_ 'FirmwareVersion'}},@{n='SerialNumber';e={_hvprop $_ 'SerialNumber'}}) } catch { }; " +
             "$physical=@(Get-PhysicalDisk | Select-Object @{n='Source';e={'Get-PhysicalDisk'}},@{n='DeviceId';e={[string]$_.DeviceId}},@{n='DeviceNumber';e={_hvprop $_ 'DeviceNumber'}},FriendlyName,MediaType,BusType,Size,@{n='Manufacturer';e={_hvprop $_ 'Manufacturer'}},@{n='Model';e={_hvprop $_ 'Model'}},@{n='FirmwareVersion';e={_hvprop $_ 'FirmwareVersion'}},@{n='SerialNumber';e={_hvprop $_ 'SerialNumber'}}); " +
-            "$rows=@($cs + $ctrl + $disk + $drive + $nodeView + $physicalLocal + $physical); " +
+            "$rows=@($cs + $ctrl + $disk + $drive + $sbc + $nodeView + $physicalLocal + $physical); " +
             "$rows | ConvertTo-Json -Compress";
 
         if (!PowerShellRunner.TryRun(script, 5000, out var output) || string.IsNullOrWhiteSpace(output))
@@ -97,7 +99,10 @@ internal static class PhysicalDiskInventory
                 ? JsonSerializer.Deserialize(output, HvtopJsonContext.Default.PhysicalDiskInventoryJsonArray) ?? []
                 : [JsonSerializer.Deserialize(output, HvtopJsonContext.Default.PhysicalDiskInventoryJson)!];
 
-            rawRows = rows.Where(row => row is not null).ToArray();
+            rawRows = rows
+                .Where(row => row is not null)
+                .Where(IsLocalInventoryRow)
+                .ToArray();
             virtualStorageEvidence = BuildVirtualStorageEvidence(rawRows);
             virtualStorageType = DetectVirtualStorageType(virtualStorageEvidence);
             source = string.Join("+", rawRows
@@ -107,8 +112,8 @@ internal static class PhysicalDiskInventory
             if (string.IsNullOrWhiteSpace(source))
                 source = "none";
             lastError = string.Empty;
-            entries = rows
-                .Where(row => row is not null && !string.IsNullOrWhiteSpace(InventoryId(row)))
+            entries = rawRows
+                .Where(row => !string.IsNullOrWhiteSpace(InventoryId(row)))
                 .Select(row => BuildEntry(row, rawRows))
                 .GroupBy(row => row.PhysicalDiskId, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(group => group.Key, ChooseBestEntry, StringComparer.OrdinalIgnoreCase);
@@ -131,6 +136,27 @@ internal static class PhysicalDiskInventory
         return string.IsNullOrWhiteSpace(digits) ? value : digits;
     }
 
+    private static bool IsLocalInventoryRow(PhysicalDiskInventoryJson row)
+    {
+        if (row.Source?.Equals("StorageBusClientDevice", StringComparison.OrdinalIgnoreCase) != true)
+            return true;
+
+        var connectedNode = row.ConnectedNode?.Trim();
+        return string.IsNullOrWhiteSpace(connectedNode) || IsSameNode(connectedNode, Environment.MachineName);
+    }
+
+    private static bool IsSameNode(string left, string right)
+    {
+        static string NormalizeNode(string value)
+        {
+            value = value.Trim();
+            var dot = value.IndexOf('.');
+            return dot >= 0 ? value[..dot] : value;
+        }
+
+        return NormalizeNode(left).Equals(NormalizeNode(right), StringComparison.OrdinalIgnoreCase);
+    }
+
     private static PhysicalDiskInventoryEntry BuildEntry(PhysicalDiskInventoryJson row, PhysicalDiskInventoryJson[] allRows)
     {
         var id = InventoryId(row);
@@ -141,10 +167,14 @@ internal static class PhysicalDiskInventory
         var model = row.Model?.Trim() ?? string.Empty;
         var firmware = row.FirmwareVersion?.Trim() ?? string.Empty;
         var serial = row.SerialNumber?.Trim() ?? string.Empty;
+        var size = row.Size;
 
-        if (row.Source?.Equals("Win32_DiskDrive", StringComparison.OrdinalIgnoreCase) == true)
+        if (row.Source?.Equals("Win32_DiskDrive", StringComparison.OrdinalIgnoreCase) == true
+            || row.Source?.Equals("StorageBusClientDevice", StringComparison.OrdinalIgnoreCase) == true)
         {
-            var storageRow = FindStoragePhysicalDisk(row, allRows);
+            var storageRow = row.Source.Equals("StorageBusClientDevice", StringComparison.OrdinalIgnoreCase)
+                ? FindStoragePhysicalDiskBySerial(row, allRows) ?? FindStoragePhysicalDisk(row, allRows)
+                : FindStoragePhysicalDisk(row, allRows);
             if (storageRow is not null)
             {
                 busType = storageRow.BusType;
@@ -153,6 +183,8 @@ internal static class PhysicalDiskInventory
                 model = FirstNonEmpty(model, storageRow.Model, storageRow.FriendlyName);
                 firmware = FirstNonEmpty(firmware, storageRow.FirmwareVersion);
                 serial = FirstNonEmpty(serial, storageRow.SerialNumber);
+                if (size == 0)
+                    size = storageRow.Size;
             }
         }
 
@@ -160,12 +192,12 @@ internal static class PhysicalDiskInventory
             id,
             friendlyName,
             FormatType(busType, mediaType),
-            FormatSize(row.Size),
+            FormatSize(size),
             manufacturer,
             model,
             firmware,
             serial,
-            $"Direct ({row.Source ?? "unknown"})"));
+            MappingLabel(row)));
     }
 
     private static PhysicalDiskInventoryEntry ChooseBestEntry(IEnumerable<PhysicalDiskInventoryEntry> entries)
@@ -186,6 +218,8 @@ internal static class PhysicalDiskInventory
             score += 1;
         if (!string.IsNullOrWhiteSpace(entry.SerialNumber))
             score += 1;
+        if (entry.Mapping.StartsWith("Direct (StorageBusClientDevice", StringComparison.OrdinalIgnoreCase))
+            score += 3;
         return score;
     }
 
@@ -201,6 +235,22 @@ internal static class PhysicalDiskInventory
                 && candidate.FriendlyName.Trim().Equals(name, StringComparison.OrdinalIgnoreCase)
                 && IsCloseSize(candidate.Size, row.Size))
             .OrderBy(candidate => Math.Abs((double)candidate.Size - row.Size))
+            .FirstOrDefault();
+    }
+
+    private static PhysicalDiskInventoryJson? FindStoragePhysicalDiskBySerial(PhysicalDiskInventoryJson row, PhysicalDiskInventoryJson[] allRows)
+    {
+        var serial = row.SerialNumber?.Trim();
+        if (string.IsNullOrWhiteSpace(serial))
+            return null;
+
+        return allRows
+            .Where(candidate => candidate.Source?.Equals("Get-PhysicalDisk", StringComparison.OrdinalIgnoreCase) == true
+                || candidate.Source?.Equals("Get-PhysicalDiskLocal", StringComparison.OrdinalIgnoreCase) == true
+                || candidate.Source?.Equals("StorageNodeView", StringComparison.OrdinalIgnoreCase) == true)
+            .Where(candidate => !string.IsNullOrWhiteSpace(candidate.SerialNumber)
+                && candidate.SerialNumber.Trim().Equals(serial, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(candidate => candidate.Size)
             .FirstOrDefault();
     }
 
@@ -295,6 +345,9 @@ internal static class PhysicalDiskInventory
         value = value?.Trim() ?? string.Empty;
         return value.ToUpperInvariant() switch
         {
+            "FIXED HARD DISK MEDIA" => string.Empty,
+            "UNKNOWN" => string.Empty,
+            "UNSPECIFIED" => string.Empty,
             "SSD" => "SSD",
             "HDD" => "HDD",
             "SCM" => "SCM",
@@ -311,6 +364,24 @@ internal static class PhysicalDiskInventory
     private static string FormatSize(ulong size)
         => size == 0 ? "n/a" : CapacityFormatter.FormatPhysicalDiskCapacity(size);
 
+    private static string MappingLabel(PhysicalDiskInventoryJson row)
+    {
+        var sourceName = row.Source ?? "unknown";
+        if (!sourceName.Equals("StorageBusClientDevice", StringComparison.OrdinalIgnoreCase))
+            return $"Direct ({sourceName})";
+
+        var details = new[]
+            {
+                string.IsNullOrWhiteSpace(row.ConnectedNode) ? string.Empty : $"node={row.ConnectedNode}",
+                string.IsNullOrWhiteSpace(row.ConnectedNodeDeviceNumber) ? string.Empty : $"ndev={row.ConnectedNodeDeviceNumber}"
+            }
+            .Where(value => !string.IsNullOrWhiteSpace(value));
+        var suffix = string.Join(" ", details);
+        return string.IsNullOrWhiteSpace(suffix)
+            ? "Direct (StorageBusClientDevice)"
+            : $"Direct (StorageBusClientDevice {suffix})";
+    }
+
     private static PhysicalDiskInventoryEntry MissingEntry(string id)
         => new(id, string.Empty, "n/a", "n/a", string.Empty, string.Empty, string.Empty, string.Empty, "n/a");
 
@@ -321,7 +392,9 @@ internal static class PhysicalDiskInventory
     {
         if (virtualStorageType.Equals("n/a", StringComparison.OrdinalIgnoreCase))
             return entry;
-        if (!entry.Type.Equals("n/a", StringComparison.OrdinalIgnoreCase))
+        if (!entry.Type.Equals("n/a", StringComparison.OrdinalIgnoreCase)
+            && !IsWeakVirtualDiskType(entry.Type)
+            && !LooksLikeVirtualDisk(entry))
             return entry;
 
         var friendlyName = string.IsNullOrWhiteSpace(entry.FriendlyName)
@@ -332,7 +405,7 @@ internal static class PhysicalDiskInventory
             : entry.Model;
         var mapping = entry.Mapping.Equals("n/a", StringComparison.OrdinalIgnoreCase)
             ? $"Virtual platform fallback ({virtualStorageType})"
-            : entry.Type.Equals("n/a", StringComparison.OrdinalIgnoreCase)
+            : entry.Type.Equals("n/a", StringComparison.OrdinalIgnoreCase) || IsWeakVirtualDiskType(entry.Type)
                 ? $"{entry.Mapping}; virtual platform fallback"
                 : entry.Mapping;
 
@@ -346,6 +419,19 @@ internal static class PhysicalDiskInventory
             entry.FirmwareVersion,
             entry.SerialNumber,
             mapping);
+    }
+
+    private static bool IsWeakVirtualDiskType(string type)
+        => type.Equals("SCSI", StringComparison.OrdinalIgnoreCase)
+           || type.Equals("IDE", StringComparison.OrdinalIgnoreCase)
+           || type.Equals("ATA", StringComparison.OrdinalIgnoreCase)
+           || type.Equals("SCSI HDD", StringComparison.OrdinalIgnoreCase)
+           || type.Equals("SCSI SSD", StringComparison.OrdinalIgnoreCase);
+
+    private static bool LooksLikeVirtualDisk(PhysicalDiskInventoryEntry entry)
+    {
+        var evidence = $"{entry.FriendlyName} {entry.Manufacturer} {entry.Model}";
+        return ContainsAny(evidence, "Msft Virtual", "Microsoft Virtual", "Virtual Disk", "Virtual HD", "VMware Virtual", "QEMU", "VirtIO", "VirtualBox");
     }
 
     private static string BuildVirtualStorageEvidence(PhysicalDiskInventoryJson[] rows)
@@ -409,6 +495,6 @@ internal static class PhysicalDiskInventory
 
 }
 
-internal sealed record PhysicalDiskInventoryJson(string? Source, string? DeviceId, string? DeviceNumber, string? FriendlyName, string? MediaType, string? BusType, ulong Size, string? Manufacturer, string? Model, string? FirmwareVersion, string? SerialNumber);
+internal sealed record PhysicalDiskInventoryJson(string? Source, string? DeviceId, string? DeviceNumber, string? FriendlyName, string? MediaType, string? BusType, ulong Size, string? Manufacturer, string? Model, string? FirmwareVersion, string? SerialNumber, string? ConnectedNode, string? ConnectedNodeDeviceNumber, string? Flags);
 
 internal sealed record PhysicalDiskInventoryEntry(string PhysicalDiskId, string FriendlyName, string Type, string Size, string Manufacturer, string Model, string FirmwareVersion, string SerialNumber, string Mapping);

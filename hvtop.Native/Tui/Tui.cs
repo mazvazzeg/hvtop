@@ -568,11 +568,11 @@ internal sealed class Tui
         var missing = sortable.Where(item => IsMissingSortValue(item.Value)).Select(item => item.Row).OrderBy(GetRowName, StringComparer.OrdinalIgnoreCase);
         return state.Descending
             ? valid.OrderByDescending(item => item.Value, SortValueComparer.Instance)
-                .ThenBy(item => GetRowName(item.Row), StringComparer.OrdinalIgnoreCase)
+                .ThenBy(item => SecondarySortValue(item.Row), SortValueComparer.Instance)
                 .Select(item => item.Row)
                 .Concat(missing)
             : valid.OrderBy(item => item.Value, SortValueComparer.Instance)
-                .ThenBy(item => GetRowName(item.Row), StringComparer.OrdinalIgnoreCase)
+                .ThenBy(item => SecondarySortValue(item.Row), SortValueComparer.Instance)
                 .Select(item => item.Row)
                 .Concat(missing);
     }
@@ -720,6 +720,9 @@ internal sealed class Tui
         },
         _ => null
     };
+
+    private static object? SecondarySortValue(object row)
+        => row is PhysicalDiskRow disk ? ParsePhysicalDiskId(disk.PhysicalDiskId) : GetRowName(row);
 
     private static int StatusRank(string status) => status.ToUpperInvariant() switch
     {
@@ -1443,7 +1446,7 @@ internal sealed class Tui
             case HostRow host:
                 var hostVms = snapshot.Vms.Where(v => v.HostName.Equals(host.Name, StringComparison.OrdinalIgnoreCase)).OrderBy(v => v.Name, StringComparer.OrdinalIgnoreCase).ToArray();
                 var hostDisks = snapshot.Disks.Where(d => d.HostName.Equals(host.Name, StringComparison.OrdinalIgnoreCase)).OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase).ToArray();
-                var hostPhysicalDisks = snapshot.PhysicalDisks.Where(d => d.HostName.Equals(host.Name, StringComparison.OrdinalIgnoreCase)).OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+                var hostPhysicalDisks = snapshot.PhysicalDisks.Where(d => d.HostName.Equals(host.Name, StringComparison.OrdinalIgnoreCase)).OrderBy(d => ParsePhysicalDiskId(d.PhysicalDiskId), SortValueComparer.Instance).ThenBy(d => d.Name, StringComparer.OrdinalIgnoreCase).ToArray();
                 var hostNetworks = snapshot.NetworkSwitches.Where(n => n.HostName.Equals(host.Name, StringComparison.OrdinalIgnoreCase)).OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase).ToArray();
                 var selectableRows = hostVms.Length + hostDisks.Length + hostPhysicalDisks.Length + hostNetworks.Length;
                 selected = Math.Min(selected, Math.Max(0, selectableRows - 1));
@@ -1613,9 +1616,14 @@ internal sealed class Tui
 
     private int RenderVmCheckpoints(int y, VmCheckpointRow[] checkpoints)
     {
-        if (!HasCheckpointMetadata(checkpoints))
+        if (!HasNamedCheckpointMetadata(checkpoints))
         {
             Detail(y, "Checkpoints", "None", ConsoleColor.DarkGray);
+            if (HasActiveDifferencingDisk(checkpoints))
+            {
+                Detail(y + 1, "Differencing disk", "Active / merging", ConsoleColor.Yellow);
+                return y + 1;
+            }
             return y;
         }
 
@@ -1755,11 +1763,14 @@ internal sealed class Tui
             .FirstOrDefault() ?? string.Empty;
     }
 
-    private static bool HasCheckpointMetadata(VmCheckpointRow[] checkpoints)
+    private static bool HasNamedCheckpointMetadata(VmCheckpointRow[] checkpoints)
         => checkpoints.Any(checkpoint => !IsNowCheckpoint(checkpoint)
-            && (!string.IsNullOrWhiteSpace(checkpoint.Name) || !string.IsNullOrWhiteSpace(checkpoint.ParentName)))
-           || checkpoints.Any(checkpoint => !string.IsNullOrWhiteSpace(checkpoint.Path)
-               && checkpoint.Path.EndsWith(".avhdx", StringComparison.OrdinalIgnoreCase));
+            && (!string.IsNullOrWhiteSpace(checkpoint.Name) || !string.IsNullOrWhiteSpace(checkpoint.ParentName)));
+
+    private static bool HasActiveDifferencingDisk(VmCheckpointRow[] checkpoints)
+        => checkpoints.Any(checkpoint => IsNowCheckpoint(checkpoint)
+            || (!string.IsNullOrWhiteSpace(checkpoint.Path)
+                && checkpoint.Path.EndsWith(".avhdx", StringComparison.OrdinalIgnoreCase)));
 
     private static bool IsNowCheckpoint(VmCheckpointRow checkpoint)
         => IsNowCheckpointName(checkpoint.Name);
