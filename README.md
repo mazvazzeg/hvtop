@@ -37,7 +37,17 @@ Click any thumbnail to open the full-size image.
 | --- |
 | <a href="docs/screenshots/hvtop-events.PNG"><img src="docs/screenshots/hvtop-events.PNG" alt="Events view" width="260"></a> |
 
-## Run Native
+## Installing
+
+Using winget: 
+
+```powershell
+winget install mazvazzeg.hvtop -e
+```
+
+or: [Download](https://github.com/mazvazzeg/hvtop/releases)
+
+## Run Native (Building from source)
 
 ```powershell
 cd .\hvtop.Native
