@@ -43,6 +43,7 @@ internal sealed class HyperVTopology
     public void RequestCheckpointRefreshIfDue(TimeSpan interval)
     {
         Dictionary<string, VDiskRow[]> diskMap;
+        DiskRow[] disks;
         lock (gate)
         {
             var now = DateTime.UtcNow;
@@ -50,13 +51,13 @@ internal sealed class HyperVTopology
                 return;
 
             isCheckpointRefreshing = true;
-            lastCheckpointRefreshUtc = now;
             diskMap = cache
                 .Where(vm => vm.Disks.Length > 0)
                 .ToDictionary(vm => vm.VmName, vm => vm.Disks, StringComparer.OrdinalIgnoreCase);
+            disks = latestDisks;
         }
 
-        _ = Task.Run(() => RefreshCheckpointsAsync(diskMap));
+        _ = Task.Run(() => RefreshCheckpointsAsync(diskMap, disks));
     }
 
     private void RefreshAsync(DiskRow[] disks, NetworkRow[] networks)
@@ -98,14 +99,17 @@ internal sealed class HyperVTopology
         }
     }
 
-    private void RefreshCheckpointsAsync(Dictionary<string, VDiskRow[]> diskMap)
+    private void RefreshCheckpointsAsync(Dictionary<string, VDiskRow[]> diskMap, DiskRow[] disks)
     {
         try
         {
-            var checkpointMap = TryReadPowerShellCheckpoints(diskMap);
+            var refreshedDiskMap = TryReadPowerShellDisks(disks);
+            if (refreshedDiskMap.Count == 0)
+                refreshedDiskMap = diskMap;
+            var checkpointMap = TryReadPowerShellCheckpoints(refreshedDiskMap);
             lock (gate)
             {
-                cache = MergeCheckpointTopology(cache, checkpointMap);
+                cache = MergeCheckpointTopology(cache, refreshedDiskMap, checkpointMap);
             }
         }
         catch
@@ -119,19 +123,34 @@ internal sealed class HyperVTopology
         finally
         {
             lock (gate)
+            {
+                lastCheckpointRefreshUtc = DateTime.UtcNow;
                 isCheckpointRefreshing = false;
+            }
         }
     }
 
-    private static VmTopologyRow[] MergeCheckpointTopology(VmTopologyRow[] topology, Dictionary<string, VmCheckpointRow[]> checkpointMap)
+    private static VmTopologyRow[] MergeCheckpointTopology(
+        VmTopologyRow[] topology,
+        Dictionary<string, VDiskRow[]> diskMap,
+        Dictionary<string, VmCheckpointRow[]> checkpointMap)
     {
         var existing = topology.ToDictionary(row => row.VmName, StringComparer.OrdinalIgnoreCase);
         return topology
-            .Select(row => row with { Checkpoints = checkpointMap.TryGetValue(row.VmName, out var checkpoints) ? checkpoints : [] })
-            .Concat(checkpointMap.Keys
+            .Select(row => row with
+            {
+                Disks = diskMap.TryGetValue(row.VmName, out var disks) ? disks : row.Disks,
+                Checkpoints = checkpointMap.TryGetValue(row.VmName, out var checkpoints) ? checkpoints : []
+            })
+            .Concat(diskMap.Keys.Concat(checkpointMap.Keys)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
                 .Where(name => !existing.ContainsKey(name))
                 .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
-                .Select(name => new VmTopologyRow(name, [], [], checkpointMap[name])))
+                .Select(name => new VmTopologyRow(
+                    name,
+                    diskMap.GetValueOrDefault(name, []),
+                    [],
+                    checkpointMap.GetValueOrDefault(name, []))))
             .OrderBy(row => row.VmName, StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }

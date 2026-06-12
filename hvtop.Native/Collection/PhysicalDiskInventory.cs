@@ -3,7 +3,10 @@ namespace hvtop.Native;
 internal static class PhysicalDiskInventory
 {
     private static readonly TimeSpan CacheDuration = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan FailureRetryDelay = TimeSpan.FromSeconds(5);
+    private static readonly object refreshGate = new();
     private static DateTime lastRefresh = DateTime.MinValue;
+    private static DateTime lastAttempt = DateTime.MinValue;
     private static Dictionary<string, PhysicalDiskInventoryEntry> entries = new(StringComparer.OrdinalIgnoreCase);
     private static PhysicalDiskInventoryJson[] rawRows = [];
     private static string source = "none";
@@ -62,10 +65,19 @@ internal static class PhysicalDiskInventory
 
     private static void EnsureFresh()
     {
-        if (DateTime.UtcNow - lastRefresh < CacheDuration)
-            return;
+        lock (refreshGate)
+        {
+            var now = DateTime.UtcNow;
+            if (now - lastRefresh < CacheDuration || now - lastAttempt < FailureRetryDelay)
+                return;
 
-        lastRefresh = DateTime.UtcNow;
+            lastAttempt = now;
+            RefreshInventory();
+        }
+    }
+
+    private static void RefreshInventory()
+    {
         var script =
             "$ErrorActionPreference='SilentlyContinue'; " +
             "function _hvprop($o,$n){ if($null -eq $o){ '' } else { $p=$o.PSObject.Properties[$n]; if($null -eq $p -or $null -eq $p.Value){ '' } else { [string]$p.Value } } }; " +
@@ -82,14 +94,10 @@ internal static class PhysicalDiskInventory
             "$rows=@($cs + $ctrl + $disk + $drive + $sbc + $nodeView + $physicalLocal + $physical); " +
             "$rows | ConvertTo-Json -Compress";
 
-        if (!PowerShellRunner.TryRun(script, 5000, out var output) || string.IsNullOrWhiteSpace(output))
+        if (!PowerShellRunner.TryRun(script, 15000, out var output) || string.IsNullOrWhiteSpace(output))
         {
-            entries = new Dictionary<string, PhysicalDiskInventoryEntry>(StringComparer.OrdinalIgnoreCase);
-            rawRows = [];
             source = "failed";
             lastError = string.IsNullOrWhiteSpace(output) ? "PowerShell failed or timed out" : output;
-            virtualStorageType = "n/a";
-            virtualStorageEvidence = string.Empty;
             return;
         }
 
@@ -117,11 +125,10 @@ internal static class PhysicalDiskInventory
                 .Select(row => BuildEntry(row, rawRows))
                 .GroupBy(row => row.PhysicalDiskId, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(group => group.Key, ChooseBestEntry, StringComparer.OrdinalIgnoreCase);
+            lastRefresh = DateTime.UtcNow;
         }
         catch
         {
-            entries = new Dictionary<string, PhysicalDiskInventoryEntry>(StringComparer.OrdinalIgnoreCase);
-            rawRows = [];
             source = "parse-failed";
             lastError = "Physical disk inventory JSON parse failed";
             virtualStorageType = "n/a";

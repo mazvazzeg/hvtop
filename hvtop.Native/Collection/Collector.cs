@@ -206,7 +206,7 @@ internal sealed class Collector : IDisposable
         var vmTopologyResult = topology.TryRead(disks, adapters);
         if (topologyRefreshRequested)
             topology.RequestRefresh();
-        topology.RequestCheckpointRefreshIfDue(TimeSpan.FromSeconds(30));
+        topology.RequestCheckpointRefreshIfDue(TimeSpan.FromSeconds(5));
         if (!string.IsNullOrWhiteSpace(vmTopologyResult.EventMessage))
             AddEvent(vmTopologyResult.EventSeverity, vmTopologyResult.EventMessage);
         Mark("topology-read", stepStarted);
