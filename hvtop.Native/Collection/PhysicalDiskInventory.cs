@@ -49,7 +49,7 @@ internal static class PhysicalDiskInventory
                 : BuildEntry(row, rawRows);
             events.Add(new InventoryEvent(
                 "INFO",
-                $"PDINV src={row.Source ?? source} id='{TrimForEvent(id, 12)}' dev='{TrimForEvent(row.DeviceId ?? string.Empty, 12)}' node='{TrimForEvent(row.ConnectedNode ?? string.Empty, 18)}' ndev='{TrimForEvent(row.ConnectedNodeDeviceNumber ?? string.Empty, 8)}' friendly='{TrimForEvent(row.FriendlyName ?? string.Empty, 28)}' bus='{TrimForEvent(row.BusType ?? string.Empty, 10)}' media='{TrimForEvent(row.MediaType ?? string.Empty, 10)}' type='{mapped.Type}' size='{mapped.Size}' map='{TrimForEvent(mapped.Mapping, 18)}' model='{TrimForEvent(mapped.Model, 24)}' fw='{TrimForEvent(mapped.FirmwareVersion, 12)}' sn='{TrimForEvent(mapped.SerialNumber, 18)}'"));
+                $"PDINV src={row.Source ?? source} id='{TrimForEvent(id, 12)}' dev='{TrimForEvent(row.DeviceId ?? string.Empty, 12)}' raid='{TrimForEvent(row.SoftwareRaidDrive ?? string.Empty, 3)} {TrimForEvent(row.SoftwareRaidType ?? string.Empty, 10)}' node='{TrimForEvent(row.ConnectedNode ?? string.Empty, 18)}' ndev='{TrimForEvent(row.ConnectedNodeDeviceNumber ?? string.Empty, 8)}' friendly='{TrimForEvent(row.FriendlyName ?? string.Empty, 28)}' bus='{TrimForEvent(row.BusType ?? string.Empty, 10)}' media='{TrimForEvent(row.MediaType ?? string.Empty, 10)}' type='{mapped.Type}' size='{mapped.Size}' map='{TrimForEvent(mapped.Mapping, 18)}' model='{TrimForEvent(mapped.Model, 24)}' fw='{TrimForEvent(mapped.FirmwareVersion, 12)}' sn='{TrimForEvent(mapped.SerialNumber, 18)}'"));
         }
 
         foreach (var disk in disks.Take(16))
@@ -57,7 +57,7 @@ internal static class PhysicalDiskInventory
             var missing = disk.Type.Equals("n/a", StringComparison.OrdinalIgnoreCase) || disk.Size.Equals("n/a", StringComparison.OrdinalIgnoreCase);
             events.Add(new InventoryEvent(
                 missing ? "WARN" : "INFO",
-                $"PDMAP inst='{TrimForEvent(disk.Name, 30)}' id='{TrimForEvent(disk.PhysicalDiskId, 12)}' type='{disk.Type}' size='{disk.Size}'"));
+                $"PDMAP inst='{TrimForEvent(disk.Name, 30)}' id='{TrimForEvent(disk.PhysicalDiskId, 12)}' type='{disk.Type}' size='{disk.Size}' raid='{TrimForEvent(disk.SoftwareRaid, 28)}'"));
         }
 
         return events.ToArray();
@@ -87,11 +87,13 @@ internal static class PhysicalDiskInventory
             "$ctrl=@(); try { $ctrl=@(Get-CimInstance Win32_SCSIController | Select-Object @{n='Source';e={'StorageController'}},@{n='DeviceId';e={''}},@{n='DeviceNumber';e={''}},@{n='FriendlyName';e={$_.Caption}},@{n='MediaType';e={''}},@{n='BusType';e={'SCSI'}},@{n='Size';e={[uint64]0}},Manufacturer,@{n='Model';e={$_.Name}},@{n='FirmwareVersion';e={''}},@{n='SerialNumber';e={''}}) } catch { }; " +
             "$disk=@(Get-Disk | Select-Object @{n='Source';e={'Get-Disk'}},@{n='DeviceId';e={[string]$_.Number}},@{n='DeviceNumber';e={[string]$_.Number}},FriendlyName,MediaType,BusType,Size,@{n='Manufacturer';e={_hvprop $_ 'Manufacturer'}},@{n='Model';e={_hvprop $_ 'Model'}},@{n='FirmwareVersion';e={_hvprop $_ 'FirmwareVersion'}},@{n='SerialNumber';e={_hvprop $_ 'SerialNumber'}}); " +
             "$drive=@(Get-CimInstance Win32_DiskDrive | Select-Object @{n='Source';e={'Win32_DiskDrive'}},@{n='DeviceId';e={[string]$_.Index}},@{n='DeviceNumber';e={[string]$_.Index}},@{n='FriendlyName';e={$_.Model}},MediaType,@{n='BusType';e={$_.InterfaceType}},Size,Manufacturer,Model,@{n='FirmwareVersion';e={$_.FirmwareRevision}},SerialNumber); " +
+            "$raidVolumes=@(); try { $dp=Join-Path $env:TEMP ('hvtop-diskpart-' + [guid]::NewGuid().ToString('N') + '.txt'); Set-Content -LiteralPath $dp -Value 'list volume' -Encoding ASCII; $dpo=& diskpart /s $dp 2>$null; Remove-Item -LiteralPath $dp -Force -ErrorAction SilentlyContinue; foreach($line in $dpo){ if($line -match '^\\s*Volume\\s+(?<num>\\d+)\\s+(?<ltr>[A-Z]?)\\s+.*?\\s+(?<type>Simple|Mirror|Stripe|Spanned|RAID-5)\\s+'){ if($matches.type -ne 'Simple' -and -not [string]::IsNullOrWhiteSpace($matches.ltr)){ $raidVolumes += [pscustomobject]@{Number=[int]$matches.num;Drive=($matches.ltr + ':');Type=[string]$matches.type} } } } } catch { }; " +
+            "$raid=@(); try { if($raidVolumes.Count -gt 0){ $dp=Join-Path $env:TEMP ('hvtop-diskpart-detail-' + [guid]::NewGuid().ToString('N') + '.txt'); $cmds=@(); foreach($v in $raidVolumes){ $cmds += ('select volume ' + $v.Number); $cmds += 'detail volume' }; Set-Content -LiteralPath $dp -Value ($cmds -join [Environment]::NewLine) -Encoding ASCII; $detail=& diskpart /s $dp 2>$null; Remove-Item -LiteralPath $dp -Force -ErrorAction SilentlyContinue; $current=$null; foreach($line in $detail){ if($line -match '^\\s*Volume\\s+(?<num>\\d+)\\s+is\\s+the\\s+selected\\s+volume'){ $n=[int]$matches.num; $current=$raidVolumes | Where-Object { $_.Number -eq $n } | Select-Object -First 1; continue }; if($null -ne $current -and $line -match '^\\s*\\*?\\s*Disk\\s+(?<disk>\\d+)\\s+'){ $raid += [pscustomobject]@{Source='SoftwareRaid';DeviceId=[string]$matches.disk;DeviceNumber=[string]$matches.disk;FriendlyName='';MediaType='';BusType='';Size=[uint64]0;Manufacturer='';Model='';FirmwareVersion='';SerialNumber='';SoftwareRaidDrive=$current.Drive;SoftwareRaidType=$current.Type} } } } } catch { }; " +
             "$sbc=@(); try { $sbc=@(Get-StorageBusClientDevice | Select-Object @{n='Source';e={'StorageBusClientDevice'}},@{n='DeviceId';e={First-NonEmpty (_hvprop $_ 'ConnectedNodeDeviceNumber') (_hvprop $_ 'DiskNumber') (_hvprop $_ 'Number') (_hvprop $_ 'Id')}},@{n='DeviceNumber';e={First-NonEmpty (_hvprop $_ 'ConnectedNodeDeviceNumber') (_hvprop $_ 'DiskNumber') (_hvprop $_ 'Number')}},@{n='FriendlyName';e={First-NonEmpty (_hvprop $_ 'ProductId') (_hvprop $_ 'Model') (_hvprop $_ 'Id')}},@{n='MediaType';e={_hvprop $_ 'DeviceType'}},@{n='BusType';e={'S2D'}},@{n='Size';e={_hvnum $_ 'Size'}},@{n='Manufacturer';e={_hvprop $_ 'VendorId'}},@{n='Model';e={First-NonEmpty (_hvprop $_ 'ProductId') (_hvprop $_ 'Model')}},@{n='FirmwareVersion';e={_hvprop $_ 'FirmwareVersion'}},@{n='SerialNumber';e={_hvprop $_ 'SerialNumber'}},@{n='ConnectedNode';e={_hvprop $_ 'ConnectedNode'}},@{n='ConnectedNodeDeviceNumber';e={_hvprop $_ 'ConnectedNodeDeviceNumber'}},@{n='Flags';e={(_hvprop $_ 'Flags')}}) } catch { }; " +
             "$nodeView=@(); try { $node=Get-StorageNode -Name $env:COMPUTERNAME -ErrorAction SilentlyContinue; if($node){ $nodeView=@(Get-PhysicalDisk | Get-PhysicalDiskStorageNodeView -StorageNode $node | Where-Object { $_.IsPhysicallyConnected } | Select-Object @{n='Source';e={'StorageNodeView'}},@{n='DeviceId';e={[string]$_.DiskNumber}},@{n='DeviceNumber';e={_hvprop $_.PhysicalDisk 'DeviceNumber'}},@{n='FriendlyName';e={_hvprop $_.PhysicalDisk 'FriendlyName'}},@{n='MediaType';e={_hvprop $_.PhysicalDisk 'MediaType'}},@{n='BusType';e={_hvprop $_.PhysicalDisk 'BusType'}},@{n='Size';e={_hvnum $_.PhysicalDisk 'Size'}},@{n='Manufacturer';e={_hvprop $_.PhysicalDisk 'Manufacturer'}},@{n='Model';e={_hvprop $_.PhysicalDisk 'Model'}},@{n='FirmwareVersion';e={_hvprop $_.PhysicalDisk 'FirmwareVersion'}},@{n='SerialNumber';e={_hvprop $_.PhysicalDisk 'SerialNumber'}}) } } catch { }; " +
             "$physicalLocal=@(); try { $physicalLocal=@(Get-PhysicalDisk -PhysicallyConnected | Select-Object @{n='Source';e={'Get-PhysicalDiskLocal'}},@{n='DeviceId';e={[string]$_.DeviceId}},@{n='DeviceNumber';e={_hvprop $_ 'DeviceNumber'}},FriendlyName,MediaType,BusType,Size,@{n='Manufacturer';e={_hvprop $_ 'Manufacturer'}},@{n='Model';e={_hvprop $_ 'Model'}},@{n='FirmwareVersion';e={_hvprop $_ 'FirmwareVersion'}},@{n='SerialNumber';e={_hvprop $_ 'SerialNumber'}}) } catch { }; " +
             "$physical=@(Get-PhysicalDisk | Select-Object @{n='Source';e={'Get-PhysicalDisk'}},@{n='DeviceId';e={[string]$_.DeviceId}},@{n='DeviceNumber';e={_hvprop $_ 'DeviceNumber'}},FriendlyName,MediaType,BusType,Size,@{n='Manufacturer';e={_hvprop $_ 'Manufacturer'}},@{n='Model';e={_hvprop $_ 'Model'}},@{n='FirmwareVersion';e={_hvprop $_ 'FirmwareVersion'}},@{n='SerialNumber';e={_hvprop $_ 'SerialNumber'}}); " +
-            "$rows=@($cs + $ctrl + $disk + $drive + $sbc + $nodeView + $physicalLocal + $physical); " +
+            "$rows=@($cs + $ctrl + $disk + $drive + $raid + $sbc + $nodeView + $physicalLocal + $physical); " +
             "$rows | ConvertTo-Json -Compress";
 
         if (!PowerShellRunner.TryRun(script, 15000, out var output) || string.IsNullOrWhiteSpace(output))
@@ -204,7 +206,8 @@ internal static class PhysicalDiskInventory
             model,
             firmware,
             serial,
-            MappingLabel(row)));
+            MappingLabel(row),
+            SoftwareRaidLabel(row, allRows)));
     }
 
     private static PhysicalDiskInventoryEntry ChooseBestEntry(IEnumerable<PhysicalDiskInventoryEntry> entries)
@@ -295,7 +298,8 @@ internal static class PhysicalDiskInventory
             string.Empty,
             string.Empty,
             string.Empty,
-            $"Inferred from {best.Count()} matching physical disk(s)");
+            $"Inferred from {best.Count()} matching physical disk(s)",
+            string.Empty);
     }
 
     private static PhysicalDiskInventoryJson[] PhysicalRowsForInference()
@@ -389,8 +393,33 @@ internal static class PhysicalDiskInventory
             : $"Direct (StorageBusClientDevice {suffix})";
     }
 
+    private static string SoftwareRaidLabel(PhysicalDiskInventoryJson row, PhysicalDiskInventoryJson[] allRows)
+    {
+        var raidRow = row.Source?.Equals("SoftwareRaid", StringComparison.OrdinalIgnoreCase) == true
+            ? row
+            : allRows.FirstOrDefault(candidate => candidate.Source?.Equals("SoftwareRaid", StringComparison.OrdinalIgnoreCase) == true
+                && InventoryId(candidate).Equals(InventoryId(row), StringComparison.OrdinalIgnoreCase));
+
+        var drive = raidRow?.SoftwareRaidDrive?.Trim();
+        var raidType = raidRow?.SoftwareRaidType?.Trim();
+        if (string.IsNullOrWhiteSpace(drive) || string.IsNullOrWhiteSpace(raidType))
+            return string.Empty;
+
+        return $"{drive} ({SoftwareRaidTypeLabel(raidType)})";
+    }
+
+    private static string SoftwareRaidTypeLabel(string raidType)
+        => raidType.Trim().ToUpperInvariant() switch
+        {
+            "MIRROR" => "Mirror-set",
+            "STRIPE" => "Stripe-set",
+            "SPANNED" => "Spanned-set",
+            "RAID-5" => "RAID-5 set",
+            _ => $"{raidType.Trim()} set"
+        };
+
     private static PhysicalDiskInventoryEntry MissingEntry(string id)
-        => new(id, string.Empty, "n/a", "n/a", string.Empty, string.Empty, string.Empty, string.Empty, "n/a");
+        => new(id, string.Empty, "n/a", "n/a", string.Empty, string.Empty, string.Empty, string.Empty, "n/a", string.Empty);
 
     private static PhysicalDiskInventoryEntry VirtualFallbackEntry(string id)
         => ApplyVirtualFallback(MissingEntry(id));
@@ -425,7 +454,8 @@ internal static class PhysicalDiskInventory
             model,
             entry.FirmwareVersion,
             entry.SerialNumber,
-            mapping);
+            mapping,
+            entry.SoftwareRaid);
     }
 
     private static bool IsWeakVirtualDiskType(string type)
@@ -502,6 +532,6 @@ internal static class PhysicalDiskInventory
 
 }
 
-internal sealed record PhysicalDiskInventoryJson(string? Source, string? DeviceId, string? DeviceNumber, string? FriendlyName, string? MediaType, string? BusType, ulong Size, string? Manufacturer, string? Model, string? FirmwareVersion, string? SerialNumber, string? ConnectedNode, string? ConnectedNodeDeviceNumber, string? Flags);
+internal sealed record PhysicalDiskInventoryJson(string? Source, string? DeviceId, string? DeviceNumber, string? FriendlyName, string? MediaType, string? BusType, ulong Size, string? Manufacturer, string? Model, string? FirmwareVersion, string? SerialNumber, string? ConnectedNode, string? ConnectedNodeDeviceNumber, string? Flags, string? SoftwareRaidDrive, string? SoftwareRaidType);
 
-internal sealed record PhysicalDiskInventoryEntry(string PhysicalDiskId, string FriendlyName, string Type, string Size, string Manufacturer, string Model, string FirmwareVersion, string SerialNumber, string Mapping);
+internal sealed record PhysicalDiskInventoryEntry(string PhysicalDiskId, string FriendlyName, string Type, string Size, string Manufacturer, string Model, string FirmwareVersion, string SerialNumber, string Mapping, string SoftwareRaid);

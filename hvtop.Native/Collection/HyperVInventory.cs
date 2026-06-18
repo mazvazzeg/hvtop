@@ -62,11 +62,11 @@ internal sealed class HyperVInventory
             "$available=$false; $rows=@(); " +
             "try { " +
             "Import-Module Hyper-V -ErrorAction Stop | Out-Null; $available=$true; " +
-            "$rows = @(Get-VM -ErrorAction Stop | Select-Object Name,@{N='Version';E={[string]$_.Version}},@{N='IsRunning';E={[bool]($_.State -eq 'Running')}},MemoryAssigned,MemoryDemand,MemoryStatus,DynamicMemoryEnabled,@{N='ReplicationState';E={try {[string]$_.ReplicationState} catch {''}}},@{N='ReplicationHealth';E={try {[string]$_.ReplicationHealth} catch {''}}}); " +
+            "$rows = @(Get-VM -ErrorAction Stop | Select-Object Name,@{N='Version';E={[string]$_.Version}},@{N='IsRunning';E={[bool]($_.State -eq 'Running')}},@{N='ProcessorCount';E={try {[int]$_.ProcessorCount} catch {0}}},@{N='MemoryStartup';E={try {[double]$_.MemoryStartup} catch {0}}},MemoryAssigned,MemoryDemand,MemoryStatus,DynamicMemoryEnabled,@{N='ReplicationState';E={try {[string]$_.ReplicationState} catch {''}}},@{N='ReplicationHealth';E={try {[string]$_.ReplicationHealth} catch {''}}}); " +
             "} catch { " +
             "$rows = @(Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_ComputerSystem -ErrorAction Stop " +
             "| Where-Object { $_.Caption -eq 'Virtual Machine' } " +
-            "| Select-Object @{N='Name';E={$_.ElementName}},@{N='Version';E={''}},@{N='IsRunning';E={[bool]($_.EnabledState -eq 2)}},@{N='UptimeSeconds';E={if ($_.EnabledState -eq 2 -and $_.OnTimeInMilliseconds) { [double]$_.OnTimeInMilliseconds / 1000 } else { 0 }}},@{N='MemoryAssigned';E={0}},@{N='MemoryDemand';E={0}},@{N='MemoryStatus';E={''}},@{N='DynamicMemoryEnabled';E={$false}},@{N='ReplicationState';E={''}},@{N='ReplicationHealth';E={''}}); " +
+            "| Select-Object @{N='Name';E={$_.ElementName}},@{N='Version';E={''}},@{N='IsRunning';E={[bool]($_.EnabledState -eq 2)}},@{N='ProcessorCount';E={0}},@{N='MemoryStartup';E={0}},@{N='UptimeSeconds';E={if ($_.EnabledState -eq 2 -and $_.OnTimeInMilliseconds) { [double]$_.OnTimeInMilliseconds / 1000 } else { 0 }}},@{N='MemoryAssigned';E={0}},@{N='MemoryDemand';E={0}},@{N='MemoryStatus';E={''}},@{N='DynamicMemoryEnabled';E={$false}},@{N='ReplicationState';E={''}},@{N='ReplicationHealth';E={''}}); " +
             "if ($rows -and $rows.Count -gt 0) { $available=$true }; " +
             "} ; " +
             "[pscustomobject]@{Available=$available; Vms=@($rows)} | ConvertTo-Json -Compress -Depth 4";
@@ -171,6 +171,7 @@ internal sealed class HyperVInventory
                     var name = ReadJsonString(element, "Name");
                     var version = ReadJsonString(element, "Version");
                     var isRunning = ReadJsonBool(element, "IsRunning");
+                    var processorCount = Math.Max(0, (int)Math.Round(ReadJsonDouble(element, "ProcessorCount")));
                     var uptime = ReadJsonTimeSpan(element, "Uptime");
                     if (uptime == TimeSpan.Zero)
                     {
@@ -178,13 +179,14 @@ internal sealed class HyperVInventory
                         if (uptimeSeconds > 0)
                             uptime = TimeSpan.FromSeconds(uptimeSeconds);
                     }
+                    var memoryStartupBytes = ReadJsonDouble(element, "MemoryStartup");
                     var memoryAssignedBytes = ReadJsonDouble(element, "MemoryAssigned");
                     var memoryDemandBytes = ReadJsonDouble(element, "MemoryDemand");
                     var memoryStatus = ReadJsonString(element, "MemoryStatus");
                     var dynamicMemoryEnabled = ReadJsonBool(element, "DynamicMemoryEnabled");
                     var replicationState = ReadJsonString(element, "ReplicationState");
                     var replicationHealth = ReadJsonString(element, "ReplicationHealth");
-                    return new HyperVInventoryVm(name, version, isRunning, uptime, DateTime.UtcNow, memoryAssignedBytes, memoryDemandBytes, memoryStatus, dynamicMemoryEnabled, replicationState, replicationHealth);
+                    return new HyperVInventoryVm(name, version, isRunning, uptime, DateTime.UtcNow, processorCount, memoryStartupBytes, memoryAssignedBytes, memoryDemandBytes, memoryStatus, dynamicMemoryEnabled, replicationState, replicationHealth);
                 })
                 .Where(vm => !string.IsNullOrWhiteSpace(vm.Name))
                 .DistinctBy(vm => vm.Name, StringComparer.OrdinalIgnoreCase)
@@ -319,6 +321,8 @@ internal sealed record HyperVInventoryVm(
     bool IsRunning,
     TimeSpan Uptime,
     DateTime UptimeSampledAt,
+    int ProcessorCount,
+    double MemoryStartupBytes,
     double MemoryAssignedBytes,
     double MemoryDemandBytes,
     string MemoryStatus,

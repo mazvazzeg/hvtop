@@ -47,21 +47,25 @@ internal sealed class HyperVVmSampler
             {
                 var name = vm.Name;
                 var vcpuCount = CountVirtualProcessors(cpuInstanceCounts, name);
-                var cpuValue = vm.IsRunning ? (vcpuCount > 0 ? Get(cpu, name) / vcpuCount : Get(cpu, name)) : 0;
+                if (vcpuCount <= 0 && vm.ProcessorCount > 0)
+                    vcpuCount = vm.ProcessorCount;
+                var cpuValue = vm.IsRunning ? (vcpuCount > 0 ? Get(cpu, name) / vcpuCount : Get(cpu, name)) : double.NaN;
                 var assignedMb = Get(assignedMem, name);
                 var visibleMb = Get(visibleMem, name);
                 var assignedBytes = vm.MemoryAssignedBytes > 0 ? vm.MemoryAssignedBytes : (assignedMb > 0 ? assignedMb * 1024d * 1024d : 0);
                 var demandBytes = vm.MemoryDemandBytes > 0 ? vm.MemoryDemandBytes : 0;
                 var memPercent = ComputeVmMemoryPercent(vm, assignedBytes, demandBytes, visibleMb);
-                var memoryCapacityBytes = assignedBytes > 0
+                var memoryCapacityBytes = !vm.IsRunning && vm.MemoryStartupBytes > 0
+                    ? vm.MemoryStartupBytes
+                    : assignedBytes > 0
                     ? assignedBytes
                     : (visibleMb > 0 ? visibleMb * 1024d * 1024d : 0);
                 var memoryCapacityLabel = BuildVmMemoryCapacityLabel(vm, memoryCapacityBytes);
-                var readBytesValue = vm.IsRunning ? SumStorageCounters(readBytes, name) : 0;
-                var writeBytesValue = vm.IsRunning ? SumStorageCounters(writeBytes, name) : 0;
-                var ioMbps = (readBytesValue + writeBytesValue) / 1024 / 1024;
-                var netMbps = vm.IsRunning ? Get(net, name) / 1024 / 1024 : 0;
-                var iops = vm.IsRunning ? SumStorageCounters(readOps, name) + SumStorageCounters(writeOps, name) : 0;
+                var readBytesValue = vm.IsRunning ? SumStorageCounters(readBytes, name) : double.NaN;
+                var writeBytesValue = vm.IsRunning ? SumStorageCounters(writeBytes, name) : double.NaN;
+                var ioMbps = vm.IsRunning ? (readBytesValue + writeBytesValue) / 1024 / 1024 : double.NaN;
+                var netMbps = vm.IsRunning ? Get(net, name) / 1024 / 1024 : double.NaN;
+                var iops = vm.IsRunning ? SumStorageCounters(readOps, name) + SumStorageCounters(writeOps, name) : double.NaN;
                 var status = vm.IsRunning ? Status.From(cpuValue, memPercent, 0, 0) : "OFF";
                 var uptime = vm.IsRunning
                     ? vm.Uptime + (DateTime.UtcNow - vm.UptimeSampledAt)
@@ -85,7 +89,7 @@ internal sealed class HyperVVmSampler
                     Metric.Iops(iops),
                     Metric.Milliseconds(0),
                     status);
-                return history.Apply("vm:" + row.Name, row);
+                return vm.IsRunning ? history.Apply("vm:" + row.Name, row) : row;
             })
             .ToArray();
     }
@@ -93,7 +97,7 @@ internal sealed class HyperVVmSampler
     private static double ComputeVmMemoryPercent(HyperVInventoryVm vm, double assignedBytes, double demandBytes, double visibleMb)
     {
         if (!vm.IsRunning)
-            return 0;
+            return double.NaN;
 
         if (assignedBytes > 0 && demandBytes > 0)
             return Math.Clamp(demandBytes / assignedBytes * 100, 0, 100);

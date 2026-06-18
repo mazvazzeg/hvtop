@@ -238,7 +238,7 @@ internal sealed class Collector : IDisposable
             vms = ApplyTopologyFallback(vms, mergedTopology);
             host = host with
             {
-                Io = Metric.Mbps(Math.Max(host.Io.Current, Math.Max(vms.Sum(v => v.Io.Current), disks.Sum(d => d.Io.Current))))
+                Io = Metric.Mbps(Math.Max(host.Io.Current, Math.Max(SumFinite(vms.Select(v => v.Io.Current)), SumFinite(disks.Select(d => d.Io.Current)))))
             };
             host = history.Apply("host:" + host.Name, host);
             hosts = BuildHosts(host, clusterResult.Nodes);
@@ -305,6 +305,9 @@ internal sealed class Collector : IDisposable
         networks = RemoteCollectorManager.MergeNetworks(networks, snapshots);
         topology = RemoteCollectorManager.MergeTopology(topology, snapshots);
     }
+
+    private static double SumFinite(IEnumerable<double> values)
+        => values.Where(v => !double.IsNaN(v) && !double.IsInfinity(v)).Sum();
 
     private Snapshot CollectRemoteOnly()
     {
@@ -465,8 +468,8 @@ internal sealed class Collector : IDisposable
             if (!topologyMap.TryGetValue($"{vm.HostName}\0{vm.Name}", out var topo) || topo.Disks.Length == 0)
                 return vm;
 
-            var io = topo.Disks.Sum(d => d.ReadMbps + d.WriteMbps);
-            var iops = topo.Disks.Sum(d => d.ReadIops + d.WriteIops);
+            var io = SumFinite(topo.Disks.SelectMany(d => new[] { d.ReadMbps, d.WriteMbps }));
+            var iops = SumFinite(topo.Disks.SelectMany(d => new[] { d.ReadIops, d.WriteIops }));
             return vm with
             {
                 Io = (vm.Io.Current <= 0 && io > 0) ? Metric.Mbps(io) with { Max = Math.Max(vm.Io.Max, io) } : vm.Io,
@@ -483,8 +486,8 @@ internal sealed class Collector : IDisposable
             if (!vmMap.TryGetValue($"{vm.HostName}\0{vm.VmName}", out var liveVm) || vm.Disks.Length == 0)
                 return vm;
 
-            var diskIo = vm.Disks.Sum(d => d.ReadMbps + d.WriteMbps);
-            var diskIops = vm.Disks.Sum(d => d.ReadIops + d.WriteIops);
+            var diskIo = SumFinite(vm.Disks.SelectMany(d => new[] { d.ReadMbps, d.WriteMbps }));
+            var diskIops = SumFinite(vm.Disks.SelectMany(d => new[] { d.ReadIops, d.WriteIops }));
             if (diskIo > 0 || diskIops > 0)
                 return vm;
 
@@ -595,8 +598,8 @@ internal sealed class Collector : IDisposable
                 g => g.Key,
                 g => new
                 {
-                    Io = g.Sum(d => d.Disk.ReadMbps + d.Disk.WriteMbps),
-                    Iops = g.Sum(d => d.Disk.ReadIops + d.Disk.WriteIops)
+                    Io = SumFinite(g.SelectMany(d => new[] { d.Disk.ReadMbps, d.Disk.WriteMbps })),
+                    Iops = SumFinite(g.SelectMany(d => new[] { d.Disk.ReadIops, d.Disk.WriteIops }))
                 },
                 StringComparer.OrdinalIgnoreCase);
 
@@ -605,10 +608,10 @@ internal sealed class Collector : IDisposable
             if (!byStorage.TryGetValue($"{disk.HostName}\0{disk.Name}", out var totals))
                 return disk;
 
-            var ioCurrent = Math.Max(disk.Io.Current, totals.Io);
-            var ioMax = Math.Max(disk.Io.Max, ioCurrent);
-            var iopsCurrent = Math.Max(disk.Iops.Current, totals.Iops);
-            var iopsMax = Math.Max(disk.Iops.Max, iopsCurrent);
+            var ioCurrent = MaxFinite(disk.Io.Current, totals.Io);
+            var ioMax = MaxFinite(disk.Io.Max, ioCurrent);
+            var iopsCurrent = MaxFinite(disk.Iops.Current, totals.Iops);
+            var iopsMax = MaxFinite(disk.Iops.Max, iopsCurrent);
             return disk with
             {
                 Io = Metric.Mbps(ioCurrent) with { Max = ioMax },
@@ -775,6 +778,19 @@ internal sealed class Collector : IDisposable
                     $"NETMAP sw='{TrimForEvent(switchRow.Name, 18)}' uplink='{TrimForEvent(uplink.Name, 28)}' desc='{TrimForEvent(uplink.Description, 36)}' -> {(match is null ? "NO MATCH" : $"'{TrimForEvent(match.Name, 28)}' rx={match.Rx.Current:0.00} tx={match.Tx.Current:0.00} pdh='{TrimForEvent(match.PdhInstance, 28)}'")}");
             }
         }
+    }
+
+    private static double MaxFinite(double left, double right)
+    {
+        var leftFinite = !double.IsNaN(left) && !double.IsInfinity(left);
+        var rightFinite = !double.IsNaN(right) && !double.IsInfinity(right);
+        return (leftFinite, rightFinite) switch
+        {
+            (true, true) => Math.Max(left, right),
+            (true, false) => left,
+            (false, true) => right,
+            _ => double.NaN
+        };
     }
 
     private void MaybeLogPhysicalDiskDiagnostics(bool refreshRequested, PhysicalDiskRow[] disks)

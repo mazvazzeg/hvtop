@@ -1148,19 +1148,19 @@ internal sealed class Tui
             Cell("LAT", 10)
         });
 
-    private static string VmDiskDataRow(VDiskRow disk, Snapshot snapshot, string hostName)
+    private static string VmDiskDataRow(VDiskRow disk, Snapshot snapshot, string hostName, bool vmIsRunning)
     {
         var storage = FindStorageRow(snapshot, hostName, disk.StorageName);
         return "  " + string.Join("  ", new[]
         {
             Cell(DisplayName(disk.Name, 32), 32),
             Cell(DisplayName(disk.StorageName, 26), 26),
-            Cell(FmtValue(disk.ReadMbps, Unit.Mbps), 10),
-            Cell(FmtValue(disk.ReadIops, Unit.Iops), 10),
-            Cell(FmtValue(disk.WriteMbps, Unit.Mbps), 10),
-            Cell(FmtValue(disk.WriteIops, Unit.Iops), 10),
-            Cell(storage is null ? "n/a" : FmtValue(storage.QueueDepth.Current, storage.QueueDepth.Unit), 6),
-            Cell(storage is null ? "n/a" : FmtValue(storage.Latency.Current, storage.Latency.Unit), 10)
+            Cell(vmIsRunning ? FmtValue(disk.ReadMbps, Unit.Mbps) : "n/a", 10),
+            Cell(vmIsRunning ? FmtValue(disk.ReadIops, Unit.Iops) : "n/a", 10),
+            Cell(vmIsRunning ? FmtValue(disk.WriteMbps, Unit.Mbps) : "n/a", 10),
+            Cell(vmIsRunning ? FmtValue(disk.WriteIops, Unit.Iops) : "n/a", 10),
+            Cell(vmIsRunning && storage is not null ? FmtValue(storage.QueueDepth.Current, storage.QueueDepth.Unit) : "n/a", 6),
+            Cell(vmIsRunning && storage is not null ? FmtValue(storage.Latency.Current, storage.Latency.Unit) : "n/a", 10)
         });
     }
 
@@ -1188,10 +1188,10 @@ internal sealed class Tui
         => "  " + string.Join("  ", new[]
         {
             Cell("VMs", 32),
-            Cell("UP", 4),
-            Cell("CPU", 10),
-            Cell("MEM", 10),
-            Cell("I/O", 10),
+            Cell("UP", 4, true),
+            Cell("CPU", 10, true),
+            Cell("MEM", 10, true),
+            Cell("I/O", 10, true),
             Cell("STA", 6)
         });
 
@@ -1200,9 +1200,9 @@ internal sealed class Tui
         {
             Cell(DisplayName(vm.Name, 32), 32),
             Cell(vm.IsRunning ? UptimeFormatter.FormatShort(vm.Uptime) : "OFF", 4, true),
-            Cell(FmtValue(vm.Cpu.Current, vm.Cpu.Unit), 10),
-            Cell(FmtValue(vm.Mem.Current, vm.Mem.Unit), 10),
-            Cell(FmtValue(vm.Io.Current, vm.Io.Unit), 10),
+            Cell(FmtValue(vm.Cpu.Current, vm.Cpu.Unit), 10, true),
+            Cell(FmtValue(vm.Mem.Current, vm.Mem.Unit), 10, true),
+            Cell(FmtValue(vm.Io.Current, vm.Io.Unit), 10, true),
             Cell(vm.Status, 6)
         });
 
@@ -1210,10 +1210,10 @@ internal sealed class Tui
         => "  " + string.Join("  ", new[]
         {
             Cell("Storage", 32),
-            Cell("FREE", 10),
-            Cell("I/O", 10),
-            Cell("IOPS", 10),
-            Cell("LAT", 10),
+            Cell("FREE", 10, true),
+            Cell("I/O", 10, true),
+            Cell("IOPS", 10, true),
+            Cell("LAT", 10, true),
             Cell("STA", 6)
         });
 
@@ -1221,10 +1221,10 @@ internal sealed class Tui
         => "  " + string.Join("  ", new[]
         {
             Cell(DisplayName(disk.Name, 32), 32),
-            Cell(FmtValue(disk.Free.Current, disk.Free.Unit), 10),
-            Cell(FmtValue(disk.Io.Current, disk.Io.Unit), 10),
-            Cell(FmtValue(disk.Iops.Current, disk.Iops.Unit), 10),
-            Cell(FmtValue(disk.Latency.Current, disk.Latency.Unit), 10),
+            Cell(FmtValue(disk.Free.Current, disk.Free.Unit), 10, true),
+            Cell(FmtValue(disk.Io.Current, disk.Io.Unit), 10, true),
+            Cell(FmtValue(disk.Iops.Current, disk.Iops.Unit), 10, true),
+            Cell(FmtValue(disk.Latency.Current, disk.Latency.Unit), 10, true),
             Cell(disk.Status, 6)
         });
 
@@ -1248,7 +1248,7 @@ internal sealed class Tui
             Cell(disk.PhysicalDiskId, PdidWidth, true),
             Cell(DisplayName(disk.Type, TypeWidth), TypeWidth),
             Cell(PhysicalDiskSizeSummary(disk.Size), SizeWidth, true),
-            Cell(DisplayName(disk.Name, 24), 24),
+            Cell(DisplayName(PhysicalDiskInstanceDisplay(disk), 24), 24),
             Cell(FmtValue(disk.Io.Current, disk.Io.Unit), 10),
             Cell(FmtValue(disk.Iops.Current, disk.Iops.Unit), 10),
             Cell(FmtValue(disk.QueueDepth.Current, disk.QueueDepth.Unit), 6),
@@ -1389,15 +1389,15 @@ internal sealed class Tui
                 var vmDisks = GetVmDisks(vm, snapshot);
                 var vmAdapters = GetVmNetworkAdapters(vm, snapshot);
                 var vmCheckpoints = GetVmCheckpoints(vm, snapshot);
-                var vmReadIo = DetailAggregateMetric(vmDisks, d => d.ReadMbps, d => d.ReadMbpsMax, Unit.Mbps);
-                var vmWriteIo = DetailAggregateMetric(vmDisks, d => d.WriteMbps, d => d.WriteMbpsMax, Unit.Mbps);
-                var vmReadIops = DetailAggregateMetric(vmDisks, d => d.ReadIops, d => d.ReadIopsMax, Unit.Iops);
-                var vmWriteIops = DetailAggregateMetric(vmDisks, d => d.WriteIops, d => d.WriteIopsMax, Unit.Iops);
+                var vmReadIo = vm.IsRunning ? DetailAggregateMetric(vmDisks, d => d.ReadMbps, d => d.ReadMbpsMax, Unit.Mbps) : Metric.Mbps(double.NaN);
+                var vmWriteIo = vm.IsRunning ? DetailAggregateMetric(vmDisks, d => d.WriteMbps, d => d.WriteMbpsMax, Unit.Mbps) : Metric.Mbps(double.NaN);
+                var vmReadIops = vm.IsRunning ? DetailAggregateMetric(vmDisks, d => d.ReadIops, d => d.ReadIopsMax, Unit.Iops) : Metric.Iops(double.NaN);
+                var vmWriteIops = vm.IsRunning ? DetailAggregateMetric(vmDisks, d => d.WriteIops, d => d.WriteIopsMax, Unit.Iops) : Metric.Iops(double.NaN);
                 var vmTotalNet = vmAdapters.Length == 0
                     ? vm.Net
-                    : DetailAggregateNetworkMetric(vmAdapters, d => d.ThroughputMbps, d => d.ThroughputMbpsMax);
-                var vmRxNet = DetailAggregateNetworkMetric(vmAdapters, d => d.RxMbps, d => d.RxMbpsMax);
-                var vmTxNet = DetailAggregateNetworkMetric(vmAdapters, d => d.TxMbps, d => d.TxMbpsMax);
+                    : vm.IsRunning ? DetailAggregateNetworkMetric(vmAdapters, d => d.ThroughputMbps, d => d.ThroughputMbpsMax) : Metric.Mbps(double.NaN);
+                var vmRxNet = vm.IsRunning ? DetailAggregateNetworkMetric(vmAdapters, d => d.RxMbps, d => d.RxMbpsMax) : Metric.Mbps(double.NaN);
+                var vmTxNet = vm.IsRunning ? DetailAggregateNetworkMetric(vmAdapters, d => d.TxMbps, d => d.TxMbpsMax) : Metric.Mbps(double.NaN);
                 selected = Math.Min(selected, Math.Max(0, vmDisks.Length + vmAdapters.Length - 1));
                 Detail(7, "Name", vm.Name);
                 Detail(8, "Uptime", vm.IsRunning ? UptimeFormatter.FormatExact(vm.Uptime) : "Powered off");
@@ -1431,7 +1431,7 @@ internal sealed class Tui
                 for (var i = 0; i < vmDisks.Length; i++)
                 {
                     var disk = vmDisks[i];
-                    vmDetailLines.Add(DetailLine.Selectable(VmDiskDataRow(disk, snapshot, vm.HostName), disk, i));
+                    vmDetailLines.Add(DetailLine.Selectable(VmDiskDataRow(disk, snapshot, vm.HostName, vm.IsRunning), disk, i));
                 }
                 vmDetailLines.Add(DetailLine.Blank());
                 vmDetailLines.Add(DetailLine.Header(VmNetworkHeaderRow()));
@@ -1551,7 +1551,7 @@ internal sealed class Tui
             case PhysicalDiskRow disk:
                 Detail(7, "PDID", disk.PhysicalDiskId);
                 Detail(8, "Host", disk.HostName);
-                Detail(9, "Instance", disk.Name);
+                Detail(9, "Instance", PhysicalDiskInstanceDisplay(disk));
                 Detail(10, "Mapping", DetailValue(disk.Mapping), disk.Mapping.StartsWith("Inferred", StringComparison.OrdinalIgnoreCase) ? ConsoleColor.Yellow : ConsoleColor.Gray);
                 Detail(11, "Friendly name", DetailValue(disk.FriendlyName));
                 Detail(12, "Manufacturer", DetailValue(disk.Manufacturer));
@@ -1966,6 +1966,21 @@ internal sealed class Tui
         EventRow evt => evt.Message,
         _ => string.Empty
     };
+
+    private static string PhysicalDiskInstanceDisplay(PhysicalDiskRow disk)
+    {
+        if (string.IsNullOrWhiteSpace(disk.SoftwareRaid))
+            return disk.Name;
+
+        var drive = disk.SoftwareRaid.Split(' ', 2)[0];
+        if (!string.IsNullOrWhiteSpace(drive) && disk.Name.Contains(drive, StringComparison.OrdinalIgnoreCase))
+        {
+            var suffix = disk.SoftwareRaid[drive.Length..].TrimStart();
+            return string.IsNullOrWhiteSpace(suffix) ? disk.Name : $"{disk.Name} {suffix}";
+        }
+
+        return $"{disk.Name} {disk.SoftwareRaid}";
+    }
 
     private static VDiskRow[] GetVmDisks(VmRow vm, Snapshot snapshot)
     {

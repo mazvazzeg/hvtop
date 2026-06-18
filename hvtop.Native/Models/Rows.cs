@@ -90,7 +90,7 @@ internal sealed record DiskRow(string HostName, string Name, string Size, string
     };
 }
 
-internal sealed record PhysicalDiskRow(string HostName, string PhysicalDiskId, string Name, string Type, string Size, string FriendlyName, string Manufacturer, string Model, string FirmwareVersion, string SerialNumber, string Mapping, Metric Io, Metric ReadIo, Metric WriteIo, Metric Iops, Metric ReadIops, Metric WriteIops, Metric QueueDepth, Metric Latency, string Status)
+internal sealed record PhysicalDiskRow(string HostName, string PhysicalDiskId, string Name, string Type, string Size, string FriendlyName, string Manufacturer, string Model, string FirmwareVersion, string SerialNumber, string Mapping, string SoftwareRaid, Metric Io, Metric ReadIo, Metric WriteIo, Metric Iops, Metric ReadIops, Metric WriteIops, Metric QueueDepth, Metric Latency, string Status)
 {
     public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
     {
