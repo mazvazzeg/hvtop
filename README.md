@@ -6,8 +6,10 @@ recent events.
 It is shaped like `htop` or `esxtop`, but with fast drill-down views and a small
 rolling history buffer for max/spike visibility.
 
-The native implementation is written in C# with native Windows counters and no
-PowerShell in the hot path.
+The implementation is written in C# and keeps the high-frequency metric path on
+native Windows APIs/counters. PowerShell is still used for slower inventory,
+topology, deployment, and compatibility probes where Windows exposes the useful
+shape most reliably through cmdlets or CIM/WMI wrappers.
 
 ## Screenshots
 
@@ -88,6 +90,7 @@ dotnet run -- --refresh 1 --history 15
 dotnet run -- --rdc-host HV01 --rdc-user DOMAIN\AdminUser --rdc-password "secret"
 dotnet run -- --rdc-host HV01 --rdc-token "shared-secret"
 dotnet run -- --rdc-disable
+dotnet run -- --ldc-disable --rdc-host HV01
 dotnet run -- --debug-log
 dotnet run -- --smoke
 ```
@@ -106,7 +109,8 @@ dotnet run -- --smoke
 --rdc-password <password>  Password for remote ADMIN$/CIM access.
 --rdc-token <value>        Token passed to hvtop-rdc. Default: generated per run.
 --rdc-disable              Disable remote data collection.
---local-disable            Disable local data collection; requires --rdc-host.
+--ldc-disable              Disable local data collection; requires --rdc-host.
+--local-disable            Deprecated alias for --ldc-disable; removed at 1.0.
 --debug-log                Write hvtop.log; also enables remote hvtop-rdc.log.
 --smoke                    Print one sample and exit.
 --help                     Show help.
@@ -127,10 +131,12 @@ dotnet run -- --smoke
 ```
 
 The native version currently uses PDH for host CPU, memory, disk throughput,
-IOPS, queue depth, and latency. Network rates come from the native Windows IP
-Helper API. VM rows are populated from Hyper-V inventory and counters when
-Hyper-V is available; otherwise the VM pane is empty and the host/storage/network
-panes remain useful on standard Windows servers.
+IOPS, queue depth, latency, VM counters, virtual disk counters, network adapter
+counters, Hyper-V switch counters, and RDMA counters. Network adapter base rates
+also use the native Windows IP Helper API. VM rows are populated from Hyper-V
+inventory and counters when Hyper-V is available; otherwise the VM pane is empty
+and the host/storage/network/physical-disk panes remain useful on standard
+Windows servers.
 
 ## Keys
 
@@ -171,6 +177,35 @@ show a `HOST` column so the source node is visible.
 
 Detail panes resolve the selected row from the latest snapshot on every repaint,
 so values continue updating live while you are drilled in.
+
+## Data Sources
+
+hvtop separates live counters from slower discovery work:
+
+- Hot-path metrics use native APIs and PDH/perflib counters. This includes host
+  CPU and memory, logical and physical disk throughput/IOPS/queue depth/latency,
+  VM CPU/memory/I/O/network counters, Hyper-V virtual switch counters, physical
+  NIC counters, and RDMA activity counters.
+- Network adapter identity, link state, link speed, and raw byte counters use
+  the Windows IP Helper API.
+- Hyper-V VM inventory, VM configuration, dynamic memory settings, replication
+  status, vDisk/vNIC topology, vSwitch topology, SET/LBFO hints, and checkpoint
+  state currently use PowerShell-hosted Hyper-V cmdlets and CIM/WMI queries.
+- Failover Cluster discovery currently uses PowerShell-hosted cluster cmdlets.
+- Physical disk inventory uses a PowerShell-hosted mix of `Get-Disk`,
+  `Get-PhysicalDisk`, `Get-PhysicalDiskStorageNodeView`,
+  `Get-StorageBusClientDevice`, and CIM classes such as `Win32_DiskDrive`,
+  `Win32_ComputerSystem`, and `Win32_SCSIController`.
+- Windows software RAID membership detection uses `diskpart` (`list volume` and
+  `detail volume`) during inventory refresh, then joins the detected set
+  membership to physical disk rows.
+- Remote Data Collector deployment uses `ADMIN$` file copy, CIM/WinRM process
+  start/stop, and a legacy WMI/DCOM fallback when CIM/WinRM is unavailable.
+
+hvtop does not currently call `wmic.exe`; when Win32 information is needed it is
+queried through CIM/WMI from PowerShell or .NET-side APIs. The goal is still to
+move more topology/inventory collection to native APIs over time, but the
+performance-sensitive metric loop should remain free of PowerShell polling.
 
 ## First Panels
 
@@ -220,12 +255,13 @@ hvtop.exe --rdc-host HV01 --rdc-token "shared-secret"
 curl "http://HV01:54321/snapshot?token=shared-secret"
 ```
 
-Local collection remains enabled by default even when `--rdc-host` is specified,
-so the local host still has useful data if the remote target is unavailable. Use
-`--local-disable` for remote-only workstation mode. In that mode `--rdc-host` is
-required. If the remote collector cannot be deployed or polled, hvtop keeps the
-TUI open, shows the terminal RDC error in the bottom status line, and leaves the
-Events pane available for the detailed failure trail.
+LDC (Local Data Collection) remains enabled by default even when `--rdc-host` is
+specified, so the local host still has useful data if the remote target is
+unavailable. Use `--ldc-disable` for remote-only workstation mode. In that mode
+`--rdc-host` is required. The older `--local-disable` spelling is accepted as a
+deprecated alias until hvtop 1.0. If the remote collector cannot be deployed or
+polled, hvtop keeps the TUI open, shows the terminal RDC error in the bottom
+status line, and leaves the Events pane available for the detailed failure trail.
 
 ## Physical Disk Discovery
 
@@ -249,6 +285,9 @@ sources:
   machines, so otherwise anonymous rows can still show labels such as
   `Hyper-V Storage`, `VMware PVSCSI`, `VirtIO Storage`, or `VirtualBox Storage`
   instead of plain `n/a`.
+- `diskpart` for Windows dynamic/software RAID volume membership, so host
+  details can show labels such as `3 D: (Mirror-set)` or
+  `1 E: (RAID-5 set)` in the physical disk instance column.
 
 Physical disk sizes are displayed as vendor/marketing capacity with the binary
 capacity in details, for example `8 TB (7.28 TiB)`. The overview pane keeps the
@@ -256,11 +295,14 @@ short vendor-style value to save horizontal space.
 
 ## Native Collection Direction
 
-The native collector should use:
+The collector direction is:
 
 - PDH/perflib counters for high-frequency metrics.
-- Hyper-V WMI/CIM APIs for topology and inventory, sampled less frequently.
-- Cluster APIs for CSV ownership and CSV-specific state.
+- Native APIs first for topology and inventory where the native surface is
+  practical and reliable.
+- Hyper-V WMI/CIM APIs or PowerShell cmdlets for topology/inventory gaps, sampled
+  less frequently than live counters.
+- Cluster APIs or cluster cmdlets for CSV ownership and CSV-specific state.
 - ETW later for event-rich timelines where counters are not enough.
 
 Good next additions are:

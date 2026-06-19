@@ -319,7 +319,7 @@ internal sealed class Collector : IDisposable
         if (snapshots.Length == 0)
         {
             if (remote.HasTerminalFailure)
-                throw new InvalidOperationException($"RDC failed and local collection is disabled: {remote.TerminalFailureSummary}");
+                throw new InvalidOperationException($"RDC failed and LDC is disabled: {remote.TerminalFailureSummary}");
 
             var waiting = new DiscoveryProgress(false, false, false, false, false, 0, 0, 0, 0);
             return new Snapshot(DateTime.Now, [], [], [], [], [], [], [], events, [], true, false, false, waiting, remote.StatusSummary);

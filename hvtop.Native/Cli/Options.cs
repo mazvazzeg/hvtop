@@ -109,7 +109,8 @@ internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, b
           --rdc-password <password>  Password for remote ADMIN$/CIM access.
           --rdc-token <value>        Token passed to hvtop-rdc. Default: generated per run.
           --rdc-disable              Disable remote data collection.
-          --local-disable            Disable local data collection; requires --rdc-host.
+          --ldc-disable              Disable local data collection; requires --rdc-host.
+          --local-disable            Deprecated alias for --ldc-disable; removed at 1.0.
           --debug-log                Write hvtop.log; also enables remote hvtop-rdc.log.
           --smoke                    Print one sample and exit.
           --help                     Show this help.
@@ -160,7 +161,8 @@ internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, b
             }
             else if (arg.Equals("--smoke", StringComparison.OrdinalIgnoreCase))
                 smoke = true;
-            else if (arg.Equals("--local-disable", StringComparison.OrdinalIgnoreCase))
+            else if (arg.Equals("--ldc-disable", StringComparison.OrdinalIgnoreCase)
+                     || arg.Equals("--local-disable", StringComparison.OrdinalIgnoreCase))
                 localCollectors = false;
             else if (arg.Equals("--rdc-disable", StringComparison.OrdinalIgnoreCase))
                 remoteCollectors = false;
@@ -209,9 +211,9 @@ internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, b
             remoteCollectors = false;
 
         if (error is null && !localCollectors && string.IsNullOrWhiteSpace(rdcHost))
-            error = "--local-disable requires --rdc-host";
+            error = "--ldc-disable requires --rdc-host";
         if (error is null && !localCollectors && !remoteCollectors)
-            error = "--local-disable cannot be combined with --rdc-disable";
+            error = "--ldc-disable cannot be combined with --rdc-disable";
         if (error is null && !string.IsNullOrWhiteSpace(rdcPassword) && string.IsNullOrWhiteSpace(rdcUser))
             error = "--rdc-password requires --rdc-user";
         if (error is null && !string.IsNullOrWhiteSpace(rdcHost) && !remoteCollectors)

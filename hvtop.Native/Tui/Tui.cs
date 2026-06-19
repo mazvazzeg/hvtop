@@ -1881,7 +1881,8 @@ internal sealed class Tui
                 .OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase))
             .Concat(snapshot.PhysicalDisks
                 .Where(d => d.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase))
-                .OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase))
+                .OrderBy(d => ParsePhysicalDiskId(d.PhysicalDiskId), SortValueComparer.Instance)
+                .ThenBy(d => d.Name, StringComparer.OrdinalIgnoreCase))
             .Concat(snapshot.NetworkSwitches
                 .Where(n => n.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase))
                 .OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase))

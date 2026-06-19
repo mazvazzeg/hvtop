@@ -15,7 +15,7 @@ namespace hvtop.Native;
 internal static class Program
 {
 #if RDC
-    public const string DisplayVersion = "0.8.3-rdc+20260618.0172";
+    public const string DisplayVersion = "0.8.4-rdc+20260618.0174";
     public const string AppName = "hvtop-rdc";
 
     public static async Task<int> Main(string[] args)
@@ -189,7 +189,7 @@ internal static class Program
     }
 
 #else
-    public const string DisplayVersion = "0.8.3+20260618.0172";
+    public const string DisplayVersion = "0.8.4+20260618.0174";
     public const string AppName = "hvtop";
 
     public static async Task<int> Main(string[] args)
