@@ -13,6 +13,13 @@ internal sealed class Collector : IDisposable
     private readonly RemoteCollectorManager remote;
     private readonly Counter cpu;
     private readonly Counter memory;
+    private readonly Counter memoryAvailableBytes;
+    private readonly Counter memoryModifiedBytes;
+    private readonly Counter memoryStandbyNormalBytes;
+    private readonly Counter memoryStandbyReserveBytes;
+    private readonly Counter memoryStandbyCoreBytes;
+    private readonly Counter memoryPoolPagedBytes;
+    private readonly Counter memoryPoolNonpagedBytes;
     private readonly Counter diskBytes;
     private readonly Counter diskIops;
     private readonly Counter diskQueue;
@@ -36,6 +43,13 @@ internal sealed class Collector : IDisposable
         remote = new RemoteCollectorManager(options);
         cpu = pdh.Add(@"\Processor(_Total)\% Processor Time");
         memory = pdh.Add(@"\Memory\% Committed Bytes In Use");
+        memoryAvailableBytes = pdh.Add(@"\Memory\Available Bytes");
+        memoryModifiedBytes = pdh.Add(@"\Memory\Modified Page List Bytes");
+        memoryStandbyNormalBytes = pdh.Add(@"\Memory\Standby Cache Normal Priority Bytes");
+        memoryStandbyReserveBytes = pdh.Add(@"\Memory\Standby Cache Reserve Bytes");
+        memoryStandbyCoreBytes = pdh.Add(@"\Memory\Standby Cache Core Bytes");
+        memoryPoolPagedBytes = pdh.Add(@"\Memory\Pool Paged Bytes");
+        memoryPoolNonpagedBytes = pdh.Add(@"\Memory\Pool Nonpaged Bytes");
         diskBytes = pdh.Add(@"\LogicalDisk(_Total)\Disk Bytes/sec");
         diskIops = pdh.Add(@"\LogicalDisk(_Total)\Disk Transfers/sec");
         diskQueue = pdh.Add(@"\LogicalDisk(_Total)\Current Disk Queue Length");
@@ -63,13 +77,28 @@ internal sealed class Collector : IDisposable
         pdh.Collect();
         var hostCpu = cpu.Read();
         var hostMem = memory.Read();
+        var totalMemBytes = Native.GetPhysicalMemoryBytes();
+        var availableMemBytes = memoryAvailableBytes.Read();
+        var modifiedMemBytes = memoryModifiedBytes.Read();
+        var standbyMemBytes = memoryStandbyNormalBytes.Read() + memoryStandbyReserveBytes.Read() + memoryStandbyCoreBytes.Read();
+        var kernelMemBytes = memoryPoolPagedBytes.Read() + memoryPoolNonpagedBytes.Read();
+        var inUseMemBytes = totalMemBytes - availableMemBytes;
+        var processMemBytes = inUseMemBytes - kernelMemBytes - modifiedMemBytes;
+        var freeMemBytes = availableMemBytes - standbyMemBytes;
+        var hostRam = new HostMemoryBreakdown(
+            Metric.Bytes(ClampMemoryBytes(inUseMemBytes)),
+            Metric.Bytes(ClampMemoryBytes(processMemBytes)),
+            Metric.Bytes(ClampMemoryBytes(kernelMemBytes)),
+            Metric.Bytes(ClampMemoryBytes(modifiedMemBytes)),
+            Metric.Bytes(ClampMemoryBytes(standbyMemBytes)),
+            Metric.Bytes(ClampMemoryBytes(freeMemBytes)));
         var hostIo = diskBytes.Read() / 1024 / 1024;
         Mark("host-pdh", stepStarted);
 
         stepStarted = Stopwatch.GetTimestamp();
         var adapterRates = network.Sample();
         var visibleAdapterRates = adapterRates.Where(a => a.IsVisibleAdapter).ToArray();
-        var hostNet = visibleAdapterRates.Sum(a => a.TotalBytesPerSecond + a.RdmaTotalBytesPerSecond) / 1024 / 1024;
+        var hostNet = visibleAdapterRates.Where(a => a.IsUp).Sum(a => a.TotalBytesPerSecond + a.RdmaTotalBytesPerSecond) / 1024 / 1024;
         Mark("network", stepStarted);
 
         stepStarted = Stopwatch.GetTimestamp();
@@ -119,7 +148,8 @@ internal sealed class Collector : IDisposable
             Metric.Percent(hostCpu),
             $"{Native.GetActiveLogicalProcessorCount()} CPU",
             Metric.Percent(hostMem),
-            CapacityFormatter.FormatConfigCapacity(Native.GetPhysicalMemoryBytes()),
+            CapacityFormatter.FormatConfigCapacity(totalMemBytes),
+            hostRam,
             Metric.Mbps(hostIo),
             Metric.Mbps(hostNet),
             Status.From(hostCpu, hostMem, latency, queue));
@@ -143,9 +173,9 @@ internal sealed class Collector : IDisposable
                 var row = new DiskRow(
                     host.Name,
                     storage.DisplayName,
-                    CapacityFormatter.FormatCapacity(storage.TotalBytes),
-                    CapacityFormatter.FormatCapacity(storage.TotalBytes - storage.FreeBytes),
-                    CapacityFormatter.FormatCapacity(storage.FreeBytes),
+                    CapacityFormatter.FormatPhysicalDiskCapacity(storage.TotalBytes),
+                    CapacityFormatter.FormatPhysicalDiskCapacity(storage.TotalBytes - storage.FreeBytes),
+                    CapacityFormatter.FormatPhysicalDiskCapacity(storage.FreeBytes),
                     Metric.Percent(free),
                     Metric.Mbps(diskIo),
                     Metric.Mbps(diskReadIo),
@@ -165,6 +195,13 @@ internal sealed class Collector : IDisposable
         var adapters = visibleAdapterRates
             .Select(a =>
             {
+                var throughputMbps = a.IsUp ? (a.TotalBytesPerSecond + a.RdmaTotalBytesPerSecond) / 1024 / 1024 : double.NaN;
+                var rxMbps = a.IsUp ? a.ReceivedBytesPerSecond / 1024 / 1024 : double.NaN;
+                var txMbps = a.IsUp ? a.SentBytesPerSecond / 1024 / 1024 : double.NaN;
+                var rdmaThroughputMbps = a.IsUp ? a.RdmaTotalBytesPerSecond / 1024 / 1024 : double.NaN;
+                var rdmaRxMbps = a.IsUp ? a.RdmaReceivedBytesPerSecond / 1024 / 1024 : double.NaN;
+                var rdmaTxMbps = a.IsUp ? a.RdmaSentBytesPerSecond / 1024 / 1024 : double.NaN;
+                var drops = a.IsUp ? a.DropsPerSecond : double.NaN;
                 var row = new NetworkRow(
                     host.Name,
                     a.Name,
@@ -172,13 +209,13 @@ internal sealed class Collector : IDisposable
                     NetworkLinkFormatter.Format(a.LinkSpeedBitsPerSecond, a.IsUp),
                     a.IsUp,
                     a.LinkSpeedBitsPerSecond,
-                    Metric.Mbps((a.TotalBytesPerSecond + a.RdmaTotalBytesPerSecond) / 1024 / 1024),
-                    Metric.Mbps(a.ReceivedBytesPerSecond / 1024 / 1024),
-                    Metric.Mbps(a.SentBytesPerSecond / 1024 / 1024),
-                    Metric.Mbps(a.RdmaTotalBytesPerSecond / 1024 / 1024),
-                    Metric.Mbps(a.RdmaReceivedBytesPerSecond / 1024 / 1024),
-                    Metric.Mbps(a.RdmaSentBytesPerSecond / 1024 / 1024),
-                    Metric.Plain(a.DropsPerSecond),
+                    Metric.Mbps(throughputMbps),
+                    Metric.Mbps(rxMbps),
+                    Metric.Mbps(txMbps),
+                    Metric.Mbps(rdmaThroughputMbps),
+                    Metric.Mbps(rdmaRxMbps),
+                    Metric.Mbps(rdmaTxMbps),
+                    Metric.Plain(drops),
                     Status.FromNetwork(a.TotalBytesPerSecond + a.RdmaTotalBytesPerSecond, a.LinkSpeedBitsPerSecond, a.IsUp),
                     a.PdhInstance,
                     a.RawReceivedBytesPerSecond,
@@ -309,6 +346,9 @@ internal sealed class Collector : IDisposable
     private static double SumFinite(IEnumerable<double> values)
         => values.Where(v => !double.IsNaN(v) && !double.IsInfinity(v)).Sum();
 
+    private static double ClampMemoryBytes(double value)
+        => double.IsNaN(value) || double.IsInfinity(value) ? double.NaN : Math.Max(0, value);
+
     private Snapshot CollectRemoteOnly()
     {
         remote.UpdateTargets([], Environment.MachineName);
@@ -358,6 +398,7 @@ internal sealed class Collector : IDisposable
                     "n/a CPU",
                     Metric.Percent(double.NaN),
                     "n/a",
+                    HostMemoryBreakdown.Empty,
                     Metric.Mbps(double.NaN),
                     Metric.Mbps(double.NaN),
                     node.Status);
@@ -376,7 +417,11 @@ internal sealed class Collector : IDisposable
             : hyperVSwitchRates.Count > 0
                 ? hyperVSwitchRates.Keys
                     .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
-                    .Select(name => new NetworkSwitchTopologyRow(name, "Switch", [], string.Empty))
+                    .Select(name => new NetworkSwitchTopologyRow(
+                        name,
+                        "Switch",
+                        hyperVSwitchRates.Count == 1 ? InferSingleSwitchUplinks(adapters) : [],
+                        string.Empty))
                     .ToArray()
             : adapters.Select(adapter => new NetworkSwitchTopologyRow(adapter.Name, "Adapter", [new NetworkUplinkInfo(adapter.Name, adapter.Description, adapter.Link, adapter.IsUp, adapter.LinkSpeedBitsPerSecond)], string.Empty)).ToArray();
 
@@ -410,7 +455,7 @@ internal sealed class Collector : IDisposable
                     ? uplinks.Where(a => a.IsUp).Sum(a => Math.Max(0L, a.LinkSpeedBitsPerSecond))
                     : switchRow.Uplinks.Where(u => u.IsUp).Sum(u => Math.Max(0L, u.LinkSpeedBitsPerSecond));
                 var status = switchRow.Uplinks.Length == 0
-                    ? "IDLE"
+                    ? Status.FromNetwork(throughput * 1024d * 1024d, linkSpeedBitsPerSecond, throughput > 0)
                     : uplinks.Length == 0 ? (switchRow.Uplinks.All(u => !u.IsUp) ? "OFF" : "OK")
                     : uplinks.All(a => !a.IsUp) ? "OFF"
                     : Status.FromNetwork(throughput * 1024d * 1024d, linkSpeedBitsPerSecond, true);
@@ -434,6 +479,31 @@ internal sealed class Collector : IDisposable
             .ToArray();
     }
 
+    private static NetworkUplinkInfo[] InferSingleSwitchUplinks(NetworkRow[] adapters)
+        => adapters
+            .Where(IsPhysicalUplinkCandidate)
+            .Where(adapter => adapter.IsUp)
+            .Select(adapter => new NetworkUplinkInfo(adapter.Name, adapter.Description, adapter.Link, adapter.IsUp, adapter.LinkSpeedBitsPerSecond))
+            .ToArray();
+
+    private static bool IsPhysicalUplinkCandidate(NetworkRow adapter)
+    {
+        var text = $"{adapter.Name} {adapter.Description}";
+        if (adapter.Name.StartsWith("vEthernet", StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (adapter.Description.Contains("Hyper-V Virtual", StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (text.Contains("WireGuard", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("VPN", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Tunnel", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Miniport", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Loopback", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Virtual", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return adapter.IsUp || adapter.LinkSpeedBitsPerSecond > 0 || adapter.Link.Equals("DOWN", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static string SummarizeLink(NetworkUplinkInfo[] topologyUplinks, NetworkRow[] liveUplinks)
     {
         if (liveUplinks.Length > 0)
@@ -449,7 +519,10 @@ internal sealed class Collector : IDisposable
             return "MIXED";
         }
 
-        if (topologyUplinks.Length == 0 || topologyUplinks.All(a => !a.IsUp))
+        if (topologyUplinks.Length == 0)
+            return "n/a";
+
+        if (topologyUplinks.All(a => !a.IsUp))
             return "DOWN";
 
         var topologyUp = topologyUplinks.Where(a => a.IsUp).ToArray();

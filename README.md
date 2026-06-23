@@ -27,6 +27,10 @@ Click any thumbnail to open the full-size image.
 | --- | --- | --- |
 | <a href="docs/screenshots/hvtop-vms-details.PNG"><img src="docs/screenshots/hvtop-vms-details.PNG" alt="VM detail view" width="260"></a> | <a href="docs/screenshots/hvtop-storage.PNG"><img src="docs/screenshots/hvtop-storage.PNG" alt="Storage overview" width="260"></a> | <a href="docs/screenshots/hvtop-storage-details.PNG"><img src="docs/screenshots/hvtop-storage-details.PNG" alt="Storage detail view" width="260"></a> |
 
+| Physical Disks | Physical Disk Detail |
+| --- | --- |
+| <a href="docs/screenshots/hvtop-physical.PNG"><img src="docs/screenshots/hvtop-physical.PNG" alt="Physical disk overview" width="260"></a> | <a href="docs/screenshots/hvtop-physical-details.PNG"><img src="docs/screenshots/hvtop-physical-details.PNG" alt="Physical disk detail view" width="260"></a> |
+
 | vHDX Detail | Network | Physical NICs |
 | --- | --- | --- |
 | <a href="docs/screenshots/hvtop-vhdx-details.PNG"><img src="docs/screenshots/hvtop-vhdx-details.PNG" alt="Virtual disk detail view" width="260"></a> | <a href="docs/screenshots/hvtop-network.PNG"><img src="docs/screenshots/hvtop-network.PNG" alt="Network overview" width="260"></a> | <a href="docs/screenshots/hvtop-network-pnics.PNG"><img src="docs/screenshots/hvtop-network-pnics.PNG" alt="Physical NIC list" width="260"></a> |

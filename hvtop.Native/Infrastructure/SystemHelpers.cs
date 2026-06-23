@@ -202,6 +202,15 @@ internal sealed class RollingHistory
         {
             Cpu = row.Cpu with { Max = values[nameof(row.Cpu)] },
             Mem = row.Mem with { Max = values[nameof(row.Mem)] },
+            Ram = row.Ram with
+            {
+                InUse = row.Ram.InUse with { Max = values[nameof(row.Ram) + nameof(row.Ram.InUse)] },
+                Processes = row.Ram.Processes with { Max = values[nameof(row.Ram) + nameof(row.Ram.Processes)] },
+                Kernel = row.Ram.Kernel with { Max = values[nameof(row.Ram) + nameof(row.Ram.Kernel)] },
+                Modified = row.Ram.Modified with { Max = values[nameof(row.Ram) + nameof(row.Ram.Modified)] },
+                StandbyCache = row.Ram.StandbyCache with { Max = values[nameof(row.Ram) + nameof(row.Ram.StandbyCache)] },
+                Free = row.Ram.Free with { Max = values[nameof(row.Ram) + nameof(row.Ram.Free)] }
+            },
             Io = row.Io with { Max = values[nameof(row.Io)] },
             Net = row.Net with { Max = values[nameof(row.Net)] }
         };

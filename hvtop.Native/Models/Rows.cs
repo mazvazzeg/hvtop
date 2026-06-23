@@ -37,6 +37,7 @@ internal sealed record DiscoveryProgress(
 internal sealed record Metric(double Current, double Max, Unit Unit)
 {
     public static Metric Percent(double value) => new(value, value, Unit.Percent);
+    public static Metric Bytes(double value) => new(value, value, Unit.Bytes);
     public static Metric Mbps(double value) => new(value, value, Unit.Mbps);
     public static Metric Iops(double value) => new(value, value, Unit.Iops);
     public static Metric Milliseconds(double value) => new(value, value, Unit.Milliseconds);
@@ -44,18 +45,35 @@ internal sealed record Metric(double Current, double Max, Unit Unit)
     public static Metric Plain(double value) => new(value, value, Unit.Plain);
 }
 
-internal enum Unit { Plain, Percent, Mbps, Iops, Milliseconds, QueueDepth }
+internal enum Unit { Plain, Percent, Bytes, Mbps, Iops, Milliseconds, QueueDepth }
 
 internal sealed record ClusterRow(string Name, int NodeCount, int UpNodeCount, string OwnerNode, string Quorum, string FunctionalLevel, string Status);
 
 internal sealed record ClusterNodeRow(string Name, string State, string Status);
 
-internal sealed record HostRow(string Name, string Version, TimeSpan? Uptime, Metric Cpu, string CpuCapacity, Metric Mem, string MemCapacity, Metric Io, Metric Net, string Status)
+internal sealed record HostMemoryBreakdown(Metric InUse, Metric Processes, Metric Kernel, Metric Modified, Metric StandbyCache, Metric Free)
+{
+    public static HostMemoryBreakdown Empty { get; } = new(
+        Metric.Bytes(double.NaN),
+        Metric.Bytes(double.NaN),
+        Metric.Bytes(double.NaN),
+        Metric.Bytes(double.NaN),
+        Metric.Bytes(double.NaN),
+        Metric.Bytes(double.NaN));
+}
+
+internal sealed record HostRow(string Name, string Version, TimeSpan? Uptime, Metric Cpu, string CpuCapacity, Metric Mem, string MemCapacity, HostMemoryBreakdown Ram, Metric Io, Metric Net, string Status)
 {
     public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
     {
         [nameof(Cpu)] = Cpu.Current,
         [nameof(Mem)] = Mem.Current,
+        [nameof(Ram) + nameof(Ram.InUse)] = Ram.InUse.Current,
+        [nameof(Ram) + nameof(Ram.Processes)] = Ram.Processes.Current,
+        [nameof(Ram) + nameof(Ram.Kernel)] = Ram.Kernel.Current,
+        [nameof(Ram) + nameof(Ram.Modified)] = Ram.Modified.Current,
+        [nameof(Ram) + nameof(Ram.StandbyCache)] = Ram.StandbyCache.Current,
+        [nameof(Ram) + nameof(Ram.Free)] = Ram.Free.Current,
         [nameof(Io)] = Io.Current,
         [nameof(Net)] = Net.Current
     };
@@ -90,7 +108,7 @@ internal sealed record DiskRow(string HostName, string Name, string Size, string
     };
 }
 
-internal sealed record PhysicalDiskRow(string HostName, string PhysicalDiskId, string Name, string Type, string Size, string FriendlyName, string Manufacturer, string Model, string FirmwareVersion, string SerialNumber, string Mapping, string SoftwareRaid, Metric Io, Metric ReadIo, Metric WriteIo, Metric Iops, Metric ReadIops, Metric WriteIops, Metric QueueDepth, Metric Latency, string Status)
+internal sealed record PhysicalDiskRow(string HostName, string PhysicalDiskId, string Name, string Type, string Size, string FriendlyName, string Manufacturer, string Model, string FirmwareVersion, string SerialNumber, string Mapping, string SoftwareRaid, string VolumeName, Metric Io, Metric ReadIo, Metric WriteIo, Metric Iops, Metric ReadIops, Metric WriteIops, Metric QueueDepth, Metric Latency, string Status)
 {
     public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
     {

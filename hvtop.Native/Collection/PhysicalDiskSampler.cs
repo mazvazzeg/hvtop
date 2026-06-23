@@ -53,6 +53,7 @@ internal static class PhysicalDiskSampler
                     inventory.SerialNumber,
                     inventory.Mapping,
                     inventory.SoftwareRaid,
+                    inventory.VolumeName,
                     Metric.Mbps(io),
                     Metric.Mbps(readIo),
                     Metric.Mbps(writeIo),

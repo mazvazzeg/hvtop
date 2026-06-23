@@ -21,6 +21,11 @@ internal sealed class Tui
     private const int UptimeWidth = 4;
     private const int PdidWidth = 4;
     private const int TypeWidth = 9;
+    private const int HostDetailNameWidth = 32;
+    private const int HostDetailAWidth = 10;
+    private const int HostDetailBWidth = 14;
+    private const int HostDetailMetricWidth = 10;
+    private const int HostDetailQueueWidth = 6;
     private const int CountWidth = 5;
     private const int OwnerWidth = 18;
     private const int QuorumWidth = 14;
@@ -1029,7 +1034,7 @@ internal sealed class Tui
                         Row(Header("HOST", HostColumnWidth), Header("NAME", nameWidth), HeaderRight("SIZE", SizeWidth), GroupHeader("FREE", ShortMetricWidth), GroupHeader("I/O", MetricWidth), GroupHeader("IOPS", ShortMetricWidth), GroupHeader("QD", ShortMetricWidth), GroupHeader("LAT", ShortMetricWidth), Header("STA", StatusWidth)),
                         Row(Header(string.Empty, HostColumnWidth), Header(string.Empty, nameWidth), Header(string.Empty, SizeWidth), FreeShortMetricSubHeader(), MetricSubHeader(), ShortMetricSubHeader(), ShortMetricSubHeader(), ShortMetricSubHeader(), Header(string.Empty, StatusWidth)),
                         CurrentRows().Cast<DiskRow>().ToArray(),
-                        r => Row(Cell(DisplayName(r.HostName, HostColumnWidth), HostColumnWidth), Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Size, SizeWidth, true), FmtShort(r.Free), Fmt(r.Io), FmtShort(r.Iops), FmtShort(r.QueueDepth), FmtShort(r.Latency), Cell(r.Status, StatusWidth)));
+                        r => Row(Cell(DisplayName(r.HostName, HostColumnWidth), HostColumnWidth), Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(PhysicalDiskSizeSummary(r.Size), SizeWidth, true), FmtShort(r.Free), Fmt(r.Io), FmtShort(r.Iops), FmtShort(r.QueueDepth), FmtShort(r.Latency), Cell(r.Status, StatusWidth)));
                 }
                 break;
             case Panel.PhysicalDisks:
@@ -1187,96 +1192,137 @@ internal sealed class Tui
     private static string HostVmHeaderRow()
         => "  " + string.Join("  ", new[]
         {
-            Cell("VMs", 32),
-            Cell("UP", 4, true),
-            Cell("CPU", 10, true),
-            Cell("MEM", 10, true),
-            Cell("I/O", 10, true),
+            Cell("VMs", HostDetailNameWidth),
+            Cell("UP", HostDetailAWidth, true),
+            Cell("CPU", HostDetailBWidth, true),
+            Cell("MEM", HostDetailMetricWidth, true),
+            Cell("I/O", HostDetailMetricWidth, true),
+            Cell(string.Empty, HostDetailQueueWidth),
+            Cell("NET", HostDetailMetricWidth, true),
             Cell("STA", 6)
         });
 
     private static string HostVmDataRow(VmRow vm)
         => "  " + string.Join("  ", new[]
         {
-            Cell(DisplayName(vm.Name, 32), 32),
-            Cell(vm.IsRunning ? UptimeFormatter.FormatShort(vm.Uptime) : "OFF", 4, true),
-            Cell(FmtValue(vm.Cpu.Current, vm.Cpu.Unit), 10, true),
-            Cell(FmtValue(vm.Mem.Current, vm.Mem.Unit), 10, true),
-            Cell(FmtValue(vm.Io.Current, vm.Io.Unit), 10, true),
+            Cell(DisplayName(vm.Name, HostDetailNameWidth), HostDetailNameWidth),
+            Cell(vm.IsRunning ? UptimeFormatter.FormatShort(vm.Uptime) : "OFF", HostDetailAWidth, true),
+            Cell(FmtValue(vm.Cpu.Current, vm.Cpu.Unit), HostDetailBWidth, true),
+            Cell(FmtValue(vm.Mem.Current, vm.Mem.Unit), HostDetailMetricWidth, true),
+            Cell(FmtValue(vm.Io.Current, vm.Io.Unit), HostDetailMetricWidth, true),
+            Cell(string.Empty, HostDetailQueueWidth),
+            Cell(FmtValue(vm.Net.Current, vm.Net.Unit), HostDetailMetricWidth, true),
             Cell(vm.Status, 6)
         });
 
     private static string HostDiskHeaderRow()
         => "  " + string.Join("  ", new[]
         {
-            Cell("Storage", 32),
-            Cell("FREE", 10, true),
-            Cell("I/O", 10, true),
-            Cell("IOPS", 10, true),
-            Cell("LAT", 10, true),
+            Cell("Storage", HostDetailNameWidth),
+            Cell("FREE", HostDetailAWidth, true),
+            Cell("SIZE", HostDetailBWidth, true),
+            Cell("I/O", HostDetailMetricWidth, true),
+            Cell("IOPS", HostDetailMetricWidth, true),
+            Cell("QD", HostDetailQueueWidth, true),
+            Cell("LAT", HostDetailMetricWidth, true),
             Cell("STA", 6)
         });
 
     private static string HostDiskDataRow(DiskRow disk)
         => "  " + string.Join("  ", new[]
         {
-            Cell(DisplayName(disk.Name, 32), 32),
-            Cell(FmtValue(disk.Free.Current, disk.Free.Unit), 10, true),
-            Cell(FmtValue(disk.Io.Current, disk.Io.Unit), 10, true),
-            Cell(FmtValue(disk.Iops.Current, disk.Iops.Unit), 10, true),
-            Cell(FmtValue(disk.Latency.Current, disk.Latency.Unit), 10, true),
+            Cell(DisplayName(HostStorageDisplayName(disk), HostDetailNameWidth), HostDetailNameWidth),
+            Cell(FmtValue(disk.Free.Current, disk.Free.Unit), HostDetailAWidth, true),
+            Cell(PhysicalDiskSizeSummary(disk.Size), HostDetailBWidth, true),
+            Cell(FmtValue(disk.Io.Current, disk.Io.Unit), HostDetailMetricWidth, true),
+            Cell(FmtValue(disk.Iops.Current, disk.Iops.Unit), HostDetailMetricWidth, true),
+            Cell(FmtValue(disk.QueueDepth.Current, disk.QueueDepth.Unit), HostDetailQueueWidth, true),
+            Cell(FmtValue(disk.Latency.Current, disk.Latency.Unit), HostDetailMetricWidth, true),
             Cell(disk.Status, 6)
         });
 
     private static string HostPhysicalDiskHeaderRow()
         => "  " + string.Join("  ", new[]
         {
-            Cell("PDID", PdidWidth),
-            Cell("TYPE", TypeWidth),
-            Cell("SIZE", SizeWidth),
-            Cell("Instance", 24),
-            Cell("I/O", 10),
-            Cell("IOPS", 10),
-            Cell("QD", 6),
-            Cell("LAT", 10),
+            Cell("PD", HostDetailNameWidth),
+            Cell("TYPE", HostDetailAWidth, true),
+            Cell("SIZE", HostDetailBWidth, true),
+            Cell("I/O", HostDetailMetricWidth, true),
+            Cell("IOPS", HostDetailMetricWidth, true),
+            Cell("QD", HostDetailQueueWidth, true),
+            Cell("LAT", HostDetailMetricWidth, true),
             Cell("STA", 6)
         });
 
     private static string HostPhysicalDiskDataRow(PhysicalDiskRow disk)
         => "  " + string.Join("  ", new[]
         {
-            Cell(disk.PhysicalDiskId, PdidWidth, true),
-            Cell(DisplayName(disk.Type, TypeWidth), TypeWidth),
-            Cell(PhysicalDiskSizeSummary(disk.Size), SizeWidth, true),
-            Cell(DisplayName(PhysicalDiskInstanceDisplay(disk), 24), 24),
-            Cell(FmtValue(disk.Io.Current, disk.Io.Unit), 10),
-            Cell(FmtValue(disk.Iops.Current, disk.Iops.Unit), 10),
-            Cell(FmtValue(disk.QueueDepth.Current, disk.QueueDepth.Unit), 6),
-            Cell(FmtValue(disk.Latency.Current, disk.Latency.Unit), 10),
+            Cell(DisplayName($"{disk.PhysicalDiskId} {PhysicalDiskInstanceDisplay(disk)}", HostDetailNameWidth), HostDetailNameWidth),
+            Cell(DisplayName(disk.Type, HostDetailAWidth), HostDetailAWidth, true),
+            Cell(PhysicalDiskSizeSummary(disk.Size), HostDetailBWidth, true),
+            Cell(FmtValue(disk.Io.Current, disk.Io.Unit), HostDetailMetricWidth, true),
+            Cell(FmtValue(disk.Iops.Current, disk.Iops.Unit), HostDetailMetricWidth, true),
+            Cell(FmtValue(disk.QueueDepth.Current, disk.QueueDepth.Unit), HostDetailQueueWidth, true),
+            Cell(FmtValue(disk.Latency.Current, disk.Latency.Unit), HostDetailMetricWidth, true),
             Cell(disk.Status, 6)
         });
 
     private static string HostNetworkHeaderRow()
         => "  " + string.Join("  ", new[]
         {
-            Cell("Network", 32),
-            Cell("LINK", 6),
-            Cell("THR", 10),
-            Cell("RX", 10),
-            Cell("TX", 10),
+            Cell("Network", HostDetailNameWidth),
+            Cell("LINK", HostDetailAWidth, true),
+            Cell("THR", HostDetailBWidth, true),
+            Cell("RX", HostDetailMetricWidth, true),
+            Cell("TX", HostDetailMetricWidth, true),
+            Cell(string.Empty, HostDetailQueueWidth),
+            Cell(string.Empty, HostDetailMetricWidth),
             Cell("STA", 6)
         });
 
     private static string HostNetworkDataRow(NetworkSwitchRow network)
         => "  " + string.Join("  ", new[]
         {
-            Cell(DisplayName(NetworkSwitchDisplayName(network), 32), 32),
-            Cell(network.Link, 6),
-            Cell(FmtValue(network.Throughput.Current, network.Throughput.Unit), 10),
-            Cell(FmtValue(network.Rx.Current, network.Rx.Unit), 10),
-            Cell(FmtValue(network.Tx.Current, network.Tx.Unit), 10),
+            Cell(DisplayName(NetworkSwitchDisplayName(network), HostDetailNameWidth), HostDetailNameWidth),
+            Cell(network.Link, HostDetailAWidth, true),
+            Cell(FmtValue(network.Throughput.Current, network.Throughput.Unit), HostDetailBWidth, true),
+            Cell(FmtValue(network.Rx.Current, network.Rx.Unit), HostDetailMetricWidth, true),
+            Cell(FmtValue(network.Tx.Current, network.Tx.Unit), HostDetailMetricWidth, true),
+            Cell(string.Empty, HostDetailQueueWidth),
+            Cell(string.Empty, HostDetailMetricWidth),
             Cell(network.Status, 6)
         });
+
+    private static string HostNetworkDataRow(NetworkRow network)
+        => "  " + string.Join("  ", new[]
+        {
+            Cell(DisplayName(NetworkAdapterDisplayName(network), HostDetailNameWidth), HostDetailNameWidth),
+            Cell(network.Link, HostDetailAWidth, true),
+            Cell(FmtValue(network.Throughput.Current, network.Throughput.Unit), HostDetailBWidth, true),
+            Cell(FmtValue(network.Rx.Current, network.Rx.Unit), HostDetailMetricWidth, true),
+            Cell(FmtValue(network.Tx.Current, network.Tx.Unit), HostDetailMetricWidth, true),
+            Cell(string.Empty, HostDetailQueueWidth),
+            Cell(string.Empty, HostDetailMetricWidth),
+            Cell(network.Status, 6)
+        });
+
+    private static string NetworkAdapterDisplayName(NetworkRow network)
+        => string.IsNullOrWhiteSpace(network.Name) ? network.Description : $"{network.Name} (Adapter)";
+
+    private static string HostStorageDisplayName(DiskRow disk)
+    {
+        var name = disk.Name.Trim();
+        if (name.StartsWith(@"C:\ClusterStorage\", StringComparison.OrdinalIgnoreCase))
+            return name;
+
+        if (name.Length > 2 && name[1] == ':' && char.IsWhiteSpace(name[2]))
+        {
+            var label = name[3..].Trim();
+            return string.IsNullOrWhiteSpace(label) ? name[..2] : $"{name[..2]} [{label}]";
+        }
+
+        return name;
+    }
 
     private string CurrentNetworkSwitchDisplayName()
     {
@@ -1448,21 +1494,28 @@ internal sealed class Tui
                 var hostDisks = snapshot.Disks.Where(d => d.HostName.Equals(host.Name, StringComparison.OrdinalIgnoreCase)).OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase).ToArray();
                 var hostPhysicalDisks = snapshot.PhysicalDisks.Where(d => d.HostName.Equals(host.Name, StringComparison.OrdinalIgnoreCase)).OrderBy(d => ParsePhysicalDiskId(d.PhysicalDiskId), SortValueComparer.Instance).ThenBy(d => d.Name, StringComparer.OrdinalIgnoreCase).ToArray();
                 var hostNetworks = snapshot.NetworkSwitches.Where(n => n.HostName.Equals(host.Name, StringComparison.OrdinalIgnoreCase)).OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase).ToArray();
-                var selectableRows = hostVms.Length + hostDisks.Length + hostPhysicalDisks.Length + hostNetworks.Length;
+                var hostAdapters = HostDetailExtraAdapters(snapshot, host.Name, hostNetworks);
+                var selectableRows = hostVms.Length + hostDisks.Length + hostPhysicalDisks.Length + hostNetworks.Length + hostAdapters.Length;
                 selected = Math.Min(selected, Math.Max(0, selectableRows - 1));
                 Detail(7, "Name", host.Name);
                 Detail(8, "Version", host.Version);
                 Detail(9, "Uptime", UptimeFormatter.FormatExact(host.Uptime));
                 DetailScalar(10, string.Empty, string.Empty);
-                DetailCapacityMetricHeader(11, string.Empty);
-                DetailMetricWithCapacity(12, "CPU", host.Cpu, host.CpuCapacity);
-                DetailMetricWithCapacity(13, "Memory", host.Mem, host.MemCapacity);
-                DetailScalar(14, string.Empty, string.Empty);
-                DetailMetricHeader(15, string.Empty, "cur", "max");
-                DetailMetric(16, "I/O", host.Io);
-                DetailMetric(17, "Network", host.Net);
-                DetailScalar(18, string.Empty, string.Empty);
-                Detail(19, "Status", host.Status, StatusColor(host.Status));
+                DetailWideCapacityMetricHeader(11, string.Empty);
+                DetailWideMetricWithCapacity(12, "CPU", host.Cpu, host.CpuCapacity);
+                DetailWideMetricWithCapacity(13, "Memory", host.Mem, host.MemCapacity);
+                DetailMetric(14, "  ├ In Use", host.Ram.InUse);
+                DetailMetric(15, "  │ ├ Processes", host.Ram.Processes);
+                DetailMetric(16, "  │ ├ Kernel", host.Ram.Kernel);
+                DetailMetric(17, "  │ └ Modified", host.Ram.Modified);
+                DetailMetric(18, "  ├ Standby Cache", host.Ram.StandbyCache);
+                DetailMetric(19, "  └ Free", host.Ram.Free);
+                DetailScalar(20, string.Empty, string.Empty);
+                DetailMetricHeader(21, string.Empty, "cur", "max");
+                DetailMetric(22, "I/O", host.Io);
+                DetailMetric(23, "Network", host.Net);
+                DetailScalar(24, string.Empty, string.Empty);
+                Detail(25, "Status", host.Status, StatusColor(host.Status));
                 var absolute = 0;
                 var hostDetailLines = new List<DetailLine>
                 {
@@ -1470,6 +1523,8 @@ internal sealed class Tui
                 };
                 foreach (var vmRow in hostVms)
                     hostDetailLines.Add(DetailLine.Selectable(HostVmDataRow(vmRow), vmRow, absolute++));
+                if (hostVms.Length == 0)
+                    hostDetailLines.Add(DetailLine.Info("  No Hyper-V / no VMs detected"));
 
                 hostDetailLines.Add(DetailLine.Blank());
                 hostDetailLines.Add(DetailLine.Header(HostDiskHeaderRow()));
@@ -1485,7 +1540,9 @@ internal sealed class Tui
                 hostDetailLines.Add(DetailLine.Header(HostNetworkHeaderRow()));
                 foreach (var networkRow in hostNetworks)
                     hostDetailLines.Add(DetailLine.Selectable(HostNetworkDataRow(networkRow), networkRow, absolute++));
-                RenderDetailLines(22, hostDetailLines);
+                foreach (var adapterRow in hostAdapters)
+                    hostDetailLines.Add(DetailLine.Selectable(HostNetworkDataRow(adapterRow), adapterRow, absolute++));
+                RenderDetailLines(28, hostDetailLines);
                 break;
             case VDiskDetailRow vdisk:
                 var virtualDisk = vdisk.Disk;
@@ -1797,6 +1854,12 @@ internal sealed class Tui
     private void DetailMetricHeader(int y, string label, string currentLabel, string maxLabel)
         => DetailScalar(y, label, DetailMetricHeaderValue(currentLabel, maxLabel), ConsoleColor.DarkCyan);
 
+    private void DetailWideCapacityMetricHeader(int y, string label)
+        => DetailScalar(y, label, DetailWideCapacityMetricHeaderValue(), ConsoleColor.DarkCyan);
+
+    private void DetailWideMetricWithCapacity(int y, string label, Metric metric, string capacity)
+        => DetailScalar(y, label, DetailWideMetricWithCapacityValue(metric, capacity));
+
     private void CheckpointDetailMetricHeader(int y, string label, string currentLabel, string maxLabel)
         => CheckpointDetailScalar(y, label, CheckpointChangePrefix(string.Empty) + DetailMetricHeaderValue(currentLabel, maxLabel), ConsoleColor.DarkCyan);
 
@@ -1844,6 +1907,7 @@ internal sealed class Tui
             var selectedLineVisible = line.SelectionIndex == selected;
             var foreground = line.Kind == DetailLineKind.Header
                 ? ConsoleColor.Yellow
+                : line.Kind == DetailLineKind.Info ? ConsoleColor.DarkGray
                 : selectedLineVisible ? ConsoleColor.White : RowColor(line.Row!);
             WriteLine(top + i, line.Text, foreground, selectedLineVisible ? ConsoleColor.DarkCyan : ConsoleColor.Black);
         }
@@ -1872,6 +1936,12 @@ internal sealed class Tui
 
     private static object[] HostDetailRows(Snapshot snapshot, string hostName)
     {
+        var hostNetworks = snapshot.NetworkSwitches
+            .Where(n => n.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var hostAdapters = HostDetailExtraAdapters(snapshot, hostName, hostNetworks);
+
         return snapshot.Vms
             .Where(v => v.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase))
             .OrderBy(v => v.Name, StringComparer.OrdinalIgnoreCase)
@@ -1883,10 +1953,43 @@ internal sealed class Tui
                 .Where(d => d.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase))
                 .OrderBy(d => ParsePhysicalDiskId(d.PhysicalDiskId), SortValueComparer.Instance)
                 .ThenBy(d => d.Name, StringComparer.OrdinalIgnoreCase))
-            .Concat(snapshot.NetworkSwitches
-                .Where(n => n.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase))
-                .OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase))
+            .Concat(hostNetworks)
+            .Concat(hostAdapters)
             .ToArray();
+    }
+
+    private static NetworkRow[] HostDetailExtraAdapters(Snapshot snapshot, string hostName, NetworkSwitchRow[] switches)
+    {
+        var represented = switches
+            .SelectMany(sw => sw.Uplinks)
+            .SelectMany(uplink => new[] { uplink.Name, uplink.Description })
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        return snapshot.Networks
+            .Where(adapter => adapter.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase))
+            .Where(IsHostDetailPhysicalAdapter)
+            .Where(adapter => !represented.Contains(adapter.Name) && !represented.Contains(adapter.Description))
+            .OrderBy(adapter => adapter.Name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static bool IsHostDetailPhysicalAdapter(NetworkRow adapter)
+    {
+        var text = $"{adapter.Name} {adapter.Description}";
+        if (adapter.Name.StartsWith("vEthernet", StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (adapter.Description.Contains("Hyper-V Virtual", StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (text.Contains("WireGuard", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("VPN", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Tunnel", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Miniport", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Loopback", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Virtual", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return true;
     }
 
     private object? ResolveDetailTarget()
@@ -1970,17 +2073,13 @@ internal sealed class Tui
 
     private static string PhysicalDiskInstanceDisplay(PhysicalDiskRow disk)
     {
-        if (string.IsNullOrWhiteSpace(disk.SoftwareRaid))
-            return disk.Name;
+        if (!string.IsNullOrWhiteSpace(disk.SoftwareRaid))
+            return disk.SoftwareRaid;
 
-        var drive = disk.SoftwareRaid.Split(' ', 2)[0];
-        if (!string.IsNullOrWhiteSpace(drive) && disk.Name.Contains(drive, StringComparison.OrdinalIgnoreCase))
-        {
-            var suffix = disk.SoftwareRaid[drive.Length..].TrimStart();
-            return string.IsNullOrWhiteSpace(suffix) ? disk.Name : $"{disk.Name} {suffix}";
-        }
+        if (!string.IsNullOrWhiteSpace(disk.VolumeName))
+            return disk.VolumeName;
 
-        return $"{disk.Name} {disk.SoftwareRaid}";
+        return disk.Name;
     }
 
     private static VDiskRow[] GetVmDisks(VmRow vm, Snapshot snapshot)
@@ -2054,6 +2153,12 @@ internal sealed class Tui
     private static string DetailCapacityMetricHeaderValue()
         => $"{Cell("cur", 4, true)} | {Cell("max", 4, true)} | {Cell("cfg", 12)}";
 
+    private static string DetailWideMetricWithCapacityValue(Metric metric, string capacity)
+        => $"{Cell(FmtValue(metric.Current, metric.Unit), 9, true)} | {Cell(FmtValue(metric.Max, metric.Unit), 9)} | {Cell($"({capacity})", 12)}";
+
+    private static string DetailWideCapacityMetricHeaderValue()
+        => $"{Cell("cur", 9, true)} | {Cell("max", 9)} | {Cell("(cfg)", 12)}";
+
     private static string DetailSplitValue(Metric metric, double ratio)
         => $"{Cell(FmtValue(metric.Current * ratio, metric.Unit), 9, true)} | {Cell(FmtValue(metric.Max * ratio, metric.Unit), 9)}";
 
@@ -2075,6 +2180,7 @@ internal sealed class Tui
         return unit switch
         {
             Unit.Percent => $"{value,3:N0}%",
+            Unit.Bytes => FormatBytes(value),
             Unit.Mbps => FormatRate(value),
             Unit.Iops => FormatCompact(value, suffix: string.Empty, kiloSuffix: "k"),
             Unit.Milliseconds => $"{FormatNumber4(value)} ms",
@@ -2093,6 +2199,20 @@ internal sealed class Tui
             return $"{FormatNumber4(megabytesPerSecond)} MB/s";
 
         return $"{FormatNumber4(megabytesPerSecond / 1024)} GB/s";
+    }
+
+    private static string FormatBytes(double bytes)
+    {
+        if (double.IsNaN(bytes)) return "n/a";
+
+        var abs = Math.Abs(bytes);
+        if (abs >= 1024d * 1024d * 1024d * 1024d)
+            return $"{FormatNumber4(bytes / 1024d / 1024d / 1024d / 1024d)} TB";
+        if (abs >= 1024d * 1024d * 1024d)
+            return $"{FormatNumber4(bytes / 1024d / 1024d / 1024d)} GB";
+        if (abs >= 1024d * 1024d)
+            return $"{FormatNumber4(bytes / 1024d / 1024d)} MB";
+        return $"{FormatNumber4(bytes / 1024d)} KB";
     }
 
     private static string FormatCompact(double value, string suffix, string kiloSuffix)
@@ -2383,7 +2503,7 @@ internal enum DrillView { Overview, HostVms, NetworkAdapters, Detail }
 
 internal enum TableKind { ClusterLike, HostLike, VmLike, DiskLike, PhysicalDiskLike, NetworkLike, NetworkSwitchLike }
 
-internal enum DetailLineKind { Header, Selectable, Blank }
+internal enum DetailLineKind { Header, Selectable, Blank, Info }
 
 internal sealed record CheckpointDisplayRow(string Name, string ParentName, DateTime Created);
 
@@ -2391,6 +2511,7 @@ internal sealed record DetailLine(string Text, object? Row, int SelectionIndex, 
 {
     public static DetailLine Header(string text) => new(text, null, -1, DetailLineKind.Header);
     public static DetailLine Selectable(string text, object row, int selectionIndex) => new(text, row, selectionIndex, DetailLineKind.Selectable);
+    public static DetailLine Info(string text) => new(text, null, -1, DetailLineKind.Info);
     public static DetailLine Blank() => new(string.Empty, null, -1, DetailLineKind.Blank);
 }
 
