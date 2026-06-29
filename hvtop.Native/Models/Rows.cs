@@ -15,7 +15,8 @@ internal sealed record Snapshot(
     bool InventoryRefreshing,
     bool TopologyRefreshing,
     DiscoveryProgress Discovery,
-    string RdcStatus)
+    string RdcStatus,
+    string RdcCollectorVersion = "")
 {
     public static Snapshot Empty { get; } = new(DateTime.Now, [], [], [], [], [], [], [], [], [], true, false, false, DiscoveryProgress.Empty, "idle");
 }

@@ -290,7 +290,7 @@ internal sealed class Collector : IDisposable
             MaybeAddSpikeEvent(host, disks);
             Mark("remote-events", stepStarted);
             MaybeAddCounterTiming(timings, sampleStarted);
-            return new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, physicalDisks, networkSwitches, adapters, events, mergedTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery, remote.StatusSummary);
+            return WithDebugCounterMetrics(new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, physicalDisks, networkSwitches, adapters, events, mergedTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery, remote.StatusSummary));
         }
 
         stepStarted = Stopwatch.GetTimestamp();
@@ -308,7 +308,7 @@ internal sealed class Collector : IDisposable
         MaybeAddSpikeEvent(host, disks);
         Mark("remote-events", stepStarted);
         MaybeAddCounterTiming(timings, sampleStarted);
-        return new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, physicalDisks, networkSwitches, adapters, events, liveTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery, remote.StatusSummary);
+        return WithDebugCounterMetrics(new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, physicalDisks, networkSwitches, adapters, events, liveTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery, remote.StatusSummary));
     }
 
     private void MaybeAddCounterTiming(List<(string Name, double Ms)>? timings, long sampleStarted)
@@ -323,6 +323,149 @@ internal sealed class Collector : IDisposable
             .Take(8)
             .Select(t => $"{t.Name}={t.Ms:N0}ms");
         AddEvent("INFO", $"COUNTERS total={total:N0}ms {string.Join(" ", slow)}");
+    }
+
+    private Snapshot WithDebugCounterMetrics(Snapshot snapshot)
+    {
+        if (!options.DebugCounters)
+            return snapshot;
+
+        var lines = BuildDebugCounterMetricLines(snapshot);
+        foreach (var line in lines.AsEnumerable().Reverse())
+            AddDebugCounterEvent(line);
+
+        return snapshot with { Events = events };
+    }
+
+    private static string[] BuildDebugCounterMetricLines(Snapshot snapshot)
+    {
+        var lines = new List<string>();
+        foreach (var host in snapshot.Hosts)
+        {
+            lines.Add($"METRIC HOST {Id(host.Name)} CPU {Pair(host.Cpu)} MEM {Pair(host.Mem)} RAM.INUSE {Pair(host.Ram.InUse)} RAM.PROC {Pair(host.Ram.Processes)} RAM.KERNEL {Pair(host.Ram.Kernel)} RAM.MOD {Pair(host.Ram.Modified)} RAM.STANDBY {Pair(host.Ram.StandbyCache)} RAM.FREE {Pair(host.Ram.Free)} IO {Pair(host.Io)} NET {Pair(host.Net)} STA {host.Status}");
+        }
+
+        foreach (var vm in snapshot.Vms)
+        {
+            lines.Add($"METRIC VM {Id(vm.HostName)}/{Id(vm.Name)} CPU {Pair(vm.Cpu)} MEM {Pair(vm.Mem)} IO {Pair(vm.Io)} NET {Pair(vm.Net)} IOPS {Pair(vm.Iops)} LAT {Pair(vm.Latency)} RUN {vm.IsRunning} STA {vm.Status}");
+        }
+
+        foreach (var disk in snapshot.Disks)
+        {
+            lines.Add($"METRIC STORAGE {Id(disk.HostName)}/{Id(disk.Name)} FREE {Pair(disk.Free)} IO {Pair(disk.Io)} RIO {Pair(disk.ReadIo)} WIO {Pair(disk.WriteIo)} IOPS {Pair(disk.Iops)} RIOPS {Pair(disk.ReadIops)} WIOPS {Pair(disk.WriteIops)} QD {Pair(disk.QueueDepth)} LAT {Pair(disk.Latency)} STA {disk.Status}");
+        }
+
+        foreach (var disk in snapshot.PhysicalDisks)
+        {
+            lines.Add($"METRIC PDISK {Id(disk.HostName)}/{Id(disk.PhysicalDiskId)} INST {Id(disk.Name)} IO {Pair(disk.Io)} RIO {Pair(disk.ReadIo)} WIO {Pair(disk.WriteIo)} IOPS {Pair(disk.Iops)} RIOPS {Pair(disk.ReadIops)} WIOPS {Pair(disk.WriteIops)} QD {Pair(disk.QueueDepth)} LAT {Pair(disk.Latency)} STA {disk.Status}");
+        }
+
+        foreach (var sw in snapshot.NetworkSwitches)
+        {
+            lines.Add($"METRIC VSWITCH {Id(sw.HostName)}/{Id(sw.Name)} THR {Pair(sw.Throughput)} RX {Pair(sw.Rx)} TX {Pair(sw.Tx)} RDMA {Pair(sw.RdmaThroughput)} RDMA_RX {Pair(sw.RdmaRx)} RDMA_TX {Pair(sw.RdmaTx)} DROPS {Pair(sw.Drops)} STA {sw.Status}");
+        }
+
+        foreach (var net in snapshot.Networks)
+        {
+            lines.Add($"METRIC NET {Id(net.HostName)}/{Id(net.Name)} THR {Pair(net.Throughput)} RX {Pair(net.Rx)} TX {Pair(net.Tx)} RDMA {Pair(net.RdmaThroughput)} RDMA_RX {Pair(net.RdmaRx)} RDMA_TX {Pair(net.RdmaTx)} DROPS {Pair(net.Drops)} STA {net.Status}");
+        }
+
+        foreach (var vm in snapshot.VmTopology)
+        {
+            foreach (var disk in vm.Disks)
+            {
+                lines.Add($"METRIC VDISK {Id(vm.HostName)}/{Id(vm.VmName)}/{Id(disk.Name)} IO {Pair(disk.TotalMbps, disk.TotalMbpsMax, Unit.Mbps)} RIO {Pair(disk.ReadMbps, disk.ReadMbpsMax, Unit.Mbps)} WIO {Pair(disk.WriteMbps, disk.WriteMbpsMax, Unit.Mbps)} IOPS {Pair(disk.TotalIops, disk.TotalIopsMax, Unit.Iops)} RIOPS {Pair(disk.ReadIops, disk.ReadIopsMax, Unit.Iops)} WIOPS {Pair(disk.WriteIops, disk.WriteIopsMax, Unit.Iops)}");
+            }
+
+            foreach (var nic in vm.Networks)
+            {
+                lines.Add($"METRIC VNIC {Id(vm.HostName)}/{Id(vm.VmName)}/{Id(nic.Name)} THR {Pair(nic.ThroughputMbps, nic.ThroughputMbpsMax, Unit.Mbps)} RX {Pair(nic.RxMbps, nic.RxMbpsMax, Unit.Mbps)} TX {Pair(nic.TxMbps, nic.TxMbpsMax, Unit.Mbps)}");
+            }
+
+            foreach (var checkpoint in vm.Checkpoints)
+            {
+                lines.Add($"METRIC CHECKPOINT {Id(vm.HostName)}/{Id(vm.VmName)}/{Id(checkpoint.Name)} SIZE {PairMb(checkpoint.SizeMb, checkpoint.SizeMbMax)} CHANGE {PairMb(checkpoint.ChangeMb, checkpoint.ChangeMbMax)}");
+            }
+        }
+
+        return lines.ToArray();
+    }
+
+    private static string Id(string value)
+        => string.IsNullOrWhiteSpace(value) ? "(none)" : TrimForEvent(value, 48);
+
+    private static string Pair(Metric metric)
+        => Pair(metric.Current, metric.Max, metric.Unit);
+
+    private static string Pair(double current, double max, Unit unit)
+        => $"{FmtDebugValue(current, unit)} | {FmtDebugValue(max, unit)}";
+
+    private static string PairMb(double current, double max)
+        => $"{FormatDebugMegabytes(current)} | {FormatDebugMegabytes(max)}";
+
+    private static string FmtDebugValue(double value, Unit unit)
+    {
+        if (double.IsNaN(value) || double.IsInfinity(value))
+            return "n/a";
+
+        return unit switch
+        {
+            Unit.Percent => $"{value:N0}%",
+            Unit.Bytes => FormatDebugBytes(value),
+            Unit.Mbps => FormatDebugRate(value),
+            Unit.Iops => FormatDebugCompact(value, string.Empty, "k"),
+            Unit.Milliseconds => $"{FormatDebugNumber(value)} ms",
+            Unit.QueueDepth => Math.Max(0, (int)Math.Round(value, MidpointRounding.AwayFromZero)).ToString(CultureInfo.CurrentCulture),
+            _ => FormatDebugNumber(value)
+        };
+    }
+
+    private static string FormatDebugRate(double megabytesPerSecond)
+    {
+        var kb = megabytesPerSecond * 1024;
+        if (Math.Abs(kb) < 1024)
+            return $"{FormatDebugNumber(kb)} KB/s";
+        if (Math.Abs(megabytesPerSecond) < 1024)
+            return $"{FormatDebugNumber(megabytesPerSecond)} MB/s";
+        return $"{FormatDebugNumber(megabytesPerSecond / 1024)} GB/s";
+    }
+
+    private static string FormatDebugBytes(double bytes)
+    {
+        var abs = Math.Abs(bytes);
+        if (abs >= 1024d * 1024d * 1024d * 1024d)
+            return $"{FormatDebugNumber(bytes / 1024d / 1024d / 1024d / 1024d)} TB";
+        if (abs >= 1024d * 1024d * 1024d)
+            return $"{FormatDebugNumber(bytes / 1024d / 1024d / 1024d)} GB";
+        if (abs >= 1024d * 1024d)
+            return $"{FormatDebugNumber(bytes / 1024d / 1024d)} MB";
+        return $"{FormatDebugNumber(bytes / 1024d)} KB";
+    }
+
+    private static string FormatDebugMegabytes(double megabytes)
+    {
+        if (double.IsNaN(megabytes) || double.IsInfinity(megabytes))
+            return "n/a";
+
+        var abs = Math.Abs(megabytes);
+        if (abs >= 1024d * 1024d)
+            return $"{FormatDebugNumber(megabytes / 1024d / 1024d)} TB";
+        if (abs >= 1024d)
+            return $"{FormatDebugNumber(megabytes / 1024d)} GB";
+        return $"{FormatDebugNumber(megabytes)} MB";
+    }
+
+    private static string FormatDebugCompact(double value, string suffix, string kiloSuffix)
+        => Math.Abs(value) >= 1000 ? $"{FormatDebugNumber(value / 1000)}{kiloSuffix}" : $"{FormatDebugNumber(value)}{suffix}";
+
+    private static string FormatDebugNumber(double value)
+    {
+        var abs = Math.Abs(value);
+        if (abs >= 100)
+            return value.ToString("0", CultureInfo.CurrentCulture);
+        if (abs >= 10)
+            return value.ToString("0.0", CultureInfo.CurrentCulture);
+        return value.ToString("0.00", CultureInfo.CurrentCulture);
     }
 
     private void MergeRemoteTelemetry(ref HostRow[] hosts, ref VmRow[] vms, ref DiskRow[] disks, ref PhysicalDiskRow[] physicalDisks, ref NetworkSwitchRow[] networkSwitches, ref NetworkRow[] networks, ref VmTopologyRow[] topology)
@@ -362,7 +505,7 @@ internal sealed class Collector : IDisposable
                 throw new InvalidOperationException($"RDC failed and LDC is disabled: {remote.TerminalFailureSummary}");
 
             var waiting = new DiscoveryProgress(false, false, false, false, false, 0, 0, 0, 0);
-            return new Snapshot(DateTime.Now, [], [], [], [], [], [], [], events, [], true, false, false, waiting, remote.StatusSummary);
+            return WithDebugCounterMetrics(new Snapshot(DateTime.Now, [], [], [], [], [], [], [], events, [], true, false, false, waiting, remote.StatusSummary));
         }
 
         var hosts = RemoteCollectorManager.MergeHosts([], snapshots);
@@ -374,7 +517,7 @@ internal sealed class Collector : IDisposable
         var topology = RemoteCollectorManager.MergeTopology([], snapshots);
         var discovery = new DiscoveryProgress(hosts.Length > 0, true, disks.Length > 0, true, true, vms.Length, disks.Length, networks.Count(n => n.IsUp), networkSwitches.Length);
         initialDiscoveryComplete = true;
-        return new Snapshot(DateTime.Now, [], hosts, vms, disks, physicalDisks, networkSwitches, networks, events, topology, false, false, false, discovery, remote.StatusSummary);
+        return WithDebugCounterMetrics(new Snapshot(DateTime.Now, [], hosts, vms, disks, physicalDisks, networkSwitches, networks, events, topology, false, false, false, discovery, remote.StatusSummary));
     }
 
     private static HostRow[] BuildHosts(HostRow localHost, ClusterNodeRow[] clusterNodes)
@@ -891,6 +1034,12 @@ internal sealed class Collector : IDisposable
 
         RdcLog.Info($"{severity} {message}");
         events = events.Prepend(new EventRow(DateTime.Now, severity, message)).Take(200).ToArray();
+    }
+
+    private void AddDebugCounterEvent(string message)
+    {
+        DebugCounterLog.Info(message);
+        events = events.Prepend(new EventRow(DateTime.Now, "INFO", message)).Take(200).ToArray();
     }
 
     public void Dispose()

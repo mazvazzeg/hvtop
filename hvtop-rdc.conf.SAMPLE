@@ -1,0 +1,10 @@
+DELIMITER::
+#PORT:54321
+#REFRESH:1
+#TIMEOUT:10
+#COPY-TIMEOUT:120
+#SKIP-DEPLOY
+#TOKEN:random-user-token
+#HV01:::::
+#HV02:DOMAIN\MegaAdminUser:secretpassword:12345:another-user-token:SKIP-DEPLOY
+#HV03:LocalAdminUser:secretpassword

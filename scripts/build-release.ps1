@@ -21,9 +21,7 @@ $stageRoot = Join-Path $artifactsRoot "stage"
 $releaseRoot = Join-Path $artifactsRoot "release"
 
 New-Item -ItemType Directory -Force -Path $releaseRoot | Out-Null
-if (Test-Path -LiteralPath $stageRoot) {
-    Remove-Item -LiteralPath $stageRoot -Recurse -Force
-}
+New-Item -ItemType Directory -Force -Path $stageRoot | Out-Null
 
 function Invoke-Publish {
     param(
@@ -70,6 +68,10 @@ function New-HvtopZip {
     $rdcOut = Join-Path $variantRoot "publish-rdc"
     $zipStage = Join-Path $variantRoot "zip"
 
+    if (Test-Path -LiteralPath $variantRoot) {
+        Remove-Item -LiteralPath $variantRoot -Recurse -Force
+    }
+
     New-Item -ItemType Directory -Force -Path $nativeOut, $rdcOut, $zipStage | Out-Null
 
     Write-Host "Publishing $variant hvtop..."
@@ -80,9 +82,11 @@ function New-HvtopZip {
 
     Copy-Item -LiteralPath (Join-Path $nativeOut "hvtop.exe") -Destination (Join-Path $zipStage "hvtop.exe") -Force
     Copy-Item -LiteralPath (Join-Path $rdcOut "hvtop-rdc.exe") -Destination (Join-Path $zipStage "hvtop-rdc.exe") -Force
+    Copy-Item -LiteralPath (Join-Path $repoRoot "hvtop-rdc.conf.SAMPLE") -Destination (Join-Path $zipStage "hvtop-rdc.conf.SAMPLE") -Force
 
     $hvtopExe = Join-Path $zipStage "hvtop.exe"
     $rdcExe = Join-Path $zipStage "hvtop-rdc.exe"
+    $sampleConfig = Join-Path $zipStage "hvtop-rdc.conf.SAMPLE"
     $hashText = @(
         "$zipBase`:",
         "hvtop.exe SHA256: $((Get-FileHash -LiteralPath $hvtopExe -Algorithm SHA256).Hash)",
@@ -98,7 +102,7 @@ function New-HvtopZip {
         Remove-Item -LiteralPath $zipPath -Force
     }
 
-    Compress-Archive -LiteralPath $hvtopExe, $rdcExe, $hashPath -DestinationPath $zipPath -Force
+    Compress-Archive -LiteralPath $hvtopExe, $rdcExe, $sampleConfig, $hashPath -DestinationPath $zipPath -Force
     Write-Host "Created $zipPath"
 }
 

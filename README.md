@@ -15,9 +15,9 @@ shape most reliably through cmdlets or CIM/WMI wrappers.
 
 Click any thumbnail to open the full-size image.
 
-| Cluster | Cluster Detail |
-| --- | --- |
-| <a href="docs/screenshots/hvtop-cluster.PNG"><img src="docs/screenshots/hvtop-cluster.PNG" alt="Cluster overview" width="260"></a> | <a href="docs/screenshots/hvtop-cluster-details.PNG"><img src="docs/screenshots/hvtop-cluster-details.PNG" alt="Cluster detail view" width="260"></a> |
+| Cluster | Cluster Hosts | Cluster Detail |
+| --- | --- | --- |
+| <a href="docs/screenshots/hvtop-cluster.PNG"><img src="docs/screenshots/hvtop-cluster.PNG" alt="Cluster overview" width="260"></a> | <a href="docs/screenshots/hvtop-cluster-hosts.PNG"><img src="docs/screenshots/hvtop-cluster-hosts.PNG" alt="Cluster hosts view" width="260"></a> | <a href="docs/screenshots/hvtop-cluster-details.PNG"><img src="docs/screenshots/hvtop-cluster-details.PNG" alt="Cluster detail view" width="260"></a> |
 
 | Hosts | Host Detail | VMs |
 | --- | --- | --- |
@@ -35,9 +35,9 @@ Click any thumbnail to open the full-size image.
 | --- | --- | --- |
 | <a href="docs/screenshots/hvtop-vhdx-details.PNG"><img src="docs/screenshots/hvtop-vhdx-details.PNG" alt="Virtual disk detail view" width="260"></a> | <a href="docs/screenshots/hvtop-network.PNG"><img src="docs/screenshots/hvtop-network.PNG" alt="Network overview" width="260"></a> | <a href="docs/screenshots/hvtop-network-pnics.PNG"><img src="docs/screenshots/hvtop-network-pnics.PNG" alt="Physical NIC list" width="260"></a> |
 
-| Network pNIC Detail | pNIC Detail | vNIC Detail |
-| --- | --- | --- |
-| <a href="docs/screenshots/hvtop-network-pnics-details.PNG"><img src="docs/screenshots/hvtop-network-pnics-details.PNG" alt="Network physical NIC detail view" width="260"></a> | <a href="docs/screenshots/hvtop-pnic-details.PNG"><img src="docs/screenshots/hvtop-pnic-details.PNG" alt="Physical NIC detail view" width="260"></a> | <a href="docs/screenshots/hvtop-vnic-details.PNG"><img src="docs/screenshots/hvtop-vnic-details.PNG" alt="Virtual NIC detail view" width="260"></a> |
+| Network pNIC Detail | vNIC Detail |
+| --- | --- |
+| <a href="docs/screenshots/hvtop-network-pnics-details.PNG"><img src="docs/screenshots/hvtop-network-pnics-details.PNG" alt="Network physical NIC detail view" width="260"></a> | <a href="docs/screenshots/hvtop-vnic-details.PNG"><img src="docs/screenshots/hvtop-vnic-details.PNG" alt="Virtual NIC detail view" width="260"></a> |
 
 | Events |
 | --- |
@@ -78,10 +78,14 @@ This creates both release variants under `artifacts\release`:
 hvtop-<version>-win-x64.zip
   hvtop.exe
   hvtop-rdc.exe
+  hvtop-rdc.conf.SAMPLE
+  SHA256SUMS.txt
 
 hvtop-<version>-win-x64-portable.zip
   hvtop.exe
   hvtop-rdc.exe
+  hvtop-rdc.conf.SAMPLE
+  SHA256SUMS.txt
 ```
 
 The non-portable `win-x64` package is framework-dependent and requires the .NET
@@ -92,6 +96,7 @@ Useful options:
 ```powershell
 dotnet run -- --refresh 1 --history 15
 dotnet run -- --rdc-host HV01 --rdc-user DOMAIN\AdminUser --rdc-password "secret"
+dotnet run -- --rdc-config .\hvtop-rdc.conf --rdc-timeout 5 --rdc-copy-timeout 60
 dotnet run -- --rdc-host HV01 --rdc-token "shared-secret"
 dotnet run -- --rdc-disable
 dotnet run -- --ldc-disable --rdc-host HV01
@@ -108,12 +113,16 @@ dotnet run -- --smoke
 --history <minutes>        History window for max/min values. Default: 15
 --rdc-port <n>             Remote Data Collector TCP port. Default: 54321
 --rdc-refresh <seconds>    Remote Data Collector interval. Default: 1
+--rdc-timeout <seconds>    RDC connect/deploy/poll timeout. Default: 5
+--rdc-copy-timeout <sec>   RDC ADMIN$ copy timeout. Default: 60
 --rdc-host <host>          Deploy/poll hvtop-rdc on an explicit remote host.
+--rdc-config <path>        RDC target config file. Default: hvtop-rdc.conf beside hvtop.exe.
 --rdc-user <user>          Username for remote ADMIN$/CIM access.
 --rdc-password <password>  Password for remote ADMIN$/CIM access.
 --rdc-token <value>        Token passed to hvtop-rdc. Default: generated per run.
+--rdc-skip-deploy          Poll existing hvtop-rdc agents; requires --rdc-token or config token.
 --rdc-disable              Disable remote data collection.
---ldc-disable              Disable local data collection; requires --rdc-host.
+--ldc-disable              Disable local data collection; requires --rdc-host or RDC config.
 --local-disable            Deprecated alias for --ldc-disable; removed at 1.0.
 --debug-log                Write hvtop.log; also enables remote hvtop-rdc.log.
 --smoke                    Print one sample and exit.
@@ -249,6 +258,73 @@ When `--rdc-host` is used, hvtop deploys `hvtop-rdc.exe` to that host through
 `ADMIN$`, starts it through CIM or a legacy WMI/DCOM fallback, and merges the
 remote telemetry with the local host view once data arrives. If `--rdc-user` and
 `--rdc-password` are omitted, hvtop uses the current Windows logon context.
+If `--rdc-user` is specified, `--rdc-password` is required.
+
+Multiple remote targets can be listed in an RDC config file. By default hvtop
+looks for `hvtop-rdc.conf` beside `hvtop.exe`; use `--rdc-config <path>` to
+point at another file. If no RDC config file is found and no explicit
+`--rdc-host` is specified, hvtop starts as before.
+
+```text
+# hvtop-rdc.conf
+# RDC defaults; per-host fields can override these
+PORT:54321
+REFRESH:5
+TIMEOUT:10
+COPY-TIMEOUT:60
+TOKEN:shared-secret
+SKIP-DEPLOY
+
+# host-only rows use the current Windows logon context
+HV01
+HV02:DOMAIN\AdminUser:secret
+HV03:admin@domain.tld:secret
+HV04:DOMAIN\AdminUser:secret:54321:host-specific-token:false
+HV05:::54322:manual-agent-token:SKIP-DEPLOY
+```
+
+The first non-comment line may change the delimiter. This is useful when
+passwords contain `:`.
+
+```text
+DELIMITER:;
+HV04;DOMAIN\AdminUser;p@ss:word
+```
+
+Blank lines and lines starting with `#`, `//`, or `;` are ignored. The first
+non-comment line may be a `DELIMITER` declaration; otherwise `:` is used.
+Settings use `:` or `=` regardless of the active row delimiter. Fields may be
+quoted, and `\`, `"`, or the active delimiter can be escaped with a backslash.
+A row is either `host`, `host<delimiter>username<delimiter>password`, or the
+full form `host<delimiter>username<delimiter>password<delimiter>port<delimiter>token<delimiter>skip-deploy`.
+Use empty username/password fields for current credentials with per-host port or
+token values, for example `HV05:::54322:manual-agent-token:SKIP-DEPLOY` with
+the default delimiter. A username without a password is rejected and logged. Config
+files with credentials are clear text, so hvtop logs a warning when one is
+loaded.
+
+Passwords in `hvtop-rdc.conf` are read directly by hvtop, so shell-sensitive
+characters such as `%`, `^`, `&`, and `-` do not need command-line escaping when
+the file is edited normally. If a config file is generated from a batch script,
+escape percent signs there (`%%`) before the file is written.
+
+The RDC config file may also set `PORT`, `REFRESH`, `TIMEOUT`,
+`COPY-TIMEOUT`, `TOKEN`, and `SKIP-DEPLOY`. Values are seconds except for
+`PORT`; `SKIP-DEPLOY` accepts a bare `SKIP-DEPLOY` line, `true/false`,
+`yes/no`, `on/off`, or `1/0`. Per-host `skip-deploy` fields also accept
+`SKIP-DEPLOY` as the true value. These become RDC defaults for that run. Per-host
+`port`, `token`, and `skip-deploy` fields override those defaults for that
+target. Explicit command line options such as `--rdc-port`, `--rdc-refresh`,
+`--rdc-timeout`, `--rdc-copy-timeout`, `--rdc-token`, and `--rdc-skip-deploy`
+set the process defaults used by explicit RDC hosts, cluster targets, and config
+rows that do not specify their own value.
+
+`--rdc-timeout <seconds>` controls remote connect, process start/stop, and poll
+timeouts. The default is 5 seconds. `--rdc-copy-timeout <seconds>` controls the
+ADMIN$ copy timeout separately and defaults to 60 seconds, because copying the
+agent over VPN links can legitimately take longer than a normal liveness probe.
+Unreachable hosts and invalid credentials are logged and skipped instead of
+being retried every refresh forever.
 
 By default hvtop generates a per-run RDC token and passes it to `hvtop-rdc.exe`.
 Use `--rdc-token` to set a known token manually, for example when checking the
@@ -259,13 +335,19 @@ hvtop.exe --rdc-host HV01 --rdc-token "shared-secret"
 curl "http://HV01:54321/snapshot?token=shared-secret"
 ```
 
+When `--rdc-skip-deploy` or `SKIP-DEPLOY:true` is used, hvtop does not copy,
+start, stop, or delete `hvtop-rdc.exe`; it only polls an already running remote
+collector. In that mode a known token is required through `--rdc-token`,
+`TOKEN` in the config file, or a per-host token field.
+
 LDC (Local Data Collection) remains enabled by default even when `--rdc-host` is
 specified, so the local host still has useful data if the remote target is
 unavailable. Use `--ldc-disable` for remote-only workstation mode. In that mode
-`--rdc-host` is required. The older `--local-disable` spelling is accepted as a
-deprecated alias until hvtop 1.0. If the remote collector cannot be deployed or
-polled, hvtop keeps the TUI open, shows the terminal RDC error in the bottom
-status line, and leaves the Events pane available for the detailed failure trail.
+`--rdc-host` or an RDC config target is required. The older `--local-disable`
+spelling is accepted as a deprecated alias until hvtop 1.0. If the remote
+collector cannot be deployed or polled, hvtop keeps the TUI open, shows the
+terminal RDC error in the bottom status line, and leaves the Events pane
+available for the detailed failure trail.
 
 ## Physical Disk Discovery
 

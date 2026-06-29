@@ -197,6 +197,22 @@ internal sealed class RollingHistory
 
     public HostRow Apply(string key, HostRow row)
     {
+        row = row with
+        {
+            Cpu = PreserveLastGoodCurrent(key, nameof(row.Cpu), row.Cpu),
+            Mem = PreserveLastGoodCurrent(key, nameof(row.Mem), row.Mem),
+            Ram = row.Ram with
+            {
+                InUse = PreserveLastGoodCurrent(key, nameof(row.Ram) + nameof(row.Ram.InUse), row.Ram.InUse),
+                Processes = PreserveLastGoodCurrent(key, nameof(row.Ram) + nameof(row.Ram.Processes), row.Ram.Processes),
+                Kernel = PreserveLastGoodCurrent(key, nameof(row.Ram) + nameof(row.Ram.Kernel), row.Ram.Kernel),
+                Modified = PreserveLastGoodCurrent(key, nameof(row.Ram) + nameof(row.Ram.Modified), row.Ram.Modified),
+                StandbyCache = PreserveLastGoodCurrent(key, nameof(row.Ram) + nameof(row.Ram.StandbyCache), row.Ram.StandbyCache),
+                Free = PreserveLastGoodCurrent(key, nameof(row.Ram) + nameof(row.Ram.Free), row.Ram.Free)
+            },
+            Io = PreserveLastGoodCurrent(key, nameof(row.Io), row.Io),
+            Net = PreserveLastGoodCurrent(key, nameof(row.Net), row.Net)
+        };
         var values = Add(key, row.Metrics);
         return row with
         {
@@ -347,6 +363,31 @@ internal sealed class RollingHistory
 
         var latest = queue.LastOrDefault();
         return latest?.Values.TryGetValue(metricName, out var value) == true ? value : fallback;
+    }
+
+    private Metric PreserveLastGoodCurrent(string key, string metricName, Metric metric)
+    {
+        if (!double.IsNaN(metric.Current) && !double.IsInfinity(metric.Current))
+            return metric;
+
+        var fallback = LastFiniteValue(key, metricName);
+        return double.IsNaN(fallback) ? metric : metric with { Current = fallback };
+    }
+
+    private double LastFiniteValue(string key, string metricName)
+    {
+        if (!points.TryGetValue(key, out var queue) || queue.Count == 0)
+            return double.NaN;
+
+        foreach (var point in queue.Reverse())
+        {
+            if (point.Values.TryGetValue(metricName, out var value)
+                && !double.IsNaN(value)
+                && !double.IsInfinity(value))
+                return value;
+        }
+
+        return double.NaN;
     }
 
     private Dictionary<string, double> Add(string key, IReadOnlyDictionary<string, double> values)

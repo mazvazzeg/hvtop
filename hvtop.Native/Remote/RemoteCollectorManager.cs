@@ -11,25 +11,38 @@ internal sealed class RemoteCollectorManager : IDisposable
     private readonly object gate = new();
     private readonly Dictionary<string, RemoteNodeSession> sessions = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentQueue<EventRow> events = new();
-    private readonly HttpClient http = new(new SocketsHttpHandler
-    {
-        UseProxy = false,
-        ConnectTimeout = TimeSpan.FromSeconds(3)
-    })
-    {
-        Timeout = TimeSpan.FromSeconds(10)
-    };
+    private readonly HttpClient http;
+    private readonly RdcTarget[] configTargets;
     private readonly string token;
     private bool clusterDetectedLogged;
     private bool explicitTargetLogged;
+    private bool configTargetLogged;
     private string lastTargetSummary = string.Empty;
 
     public RemoteCollectorManager(Options options)
     {
         this.options = options;
+        http = new HttpClient(new SocketsHttpHandler
+        {
+            UseProxy = false,
+            ConnectTimeout = options.RdcTimeout
+        })
+        {
+            Timeout = options.RdcTimeout
+        };
         token = string.IsNullOrWhiteSpace(options.RdcToken)
             ? Guid.NewGuid().ToString("N")
             : options.RdcToken;
+        var config = RdcConfigLoader.Load(options.RdcConfig);
+        configTargets = config.Targets
+            .Select(t => t with
+            {
+                Token = string.IsNullOrWhiteSpace(t.Token) ? options.RdcToken : t.Token,
+                SkipDeploy = t.SkipDeploy ?? options.RdcSkipDeploy
+            })
+            .ToArray();
+        foreach (var evt in config.Events)
+            Enqueue(evt.Severity, evt.Message);
     }
 
     public void UpdateTargets(ClusterNodeRow[] nodes, string localHost)
@@ -43,24 +56,31 @@ internal sealed class RemoteCollectorManager : IDisposable
             .Where(name => !string.IsNullOrWhiteSpace(name)
                            && !name.Equals(localHost, StringComparison.OrdinalIgnoreCase)
                            && !name.Equals(Environment.MachineName, StringComparison.OrdinalIgnoreCase))
+            .Select(name => new RdcTarget(name, options.RdcUser, options.RdcPassword, "cluster", null, options.RdcPort, options.RdcToken, options.RdcSkipDeploy))
             .ToArray();
 
         var explicitWanted = string.IsNullOrWhiteSpace(options.RdcHost)
-            ? []
-            : new[] { options.RdcHost.Trim() };
+            ? Array.Empty<RdcTarget>()
+            : new[] { new RdcTarget(options.RdcHost.Trim(), options.RdcUser, options.RdcPassword, "explicit", null, options.RdcPort, options.RdcToken, options.RdcSkipDeploy) };
         var wanted = explicitWanted
+            .Concat(configTargets)
             .Concat(clusterWanted)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Where(t => !string.IsNullOrWhiteSpace(t.Host))
+            .GroupBy(t => t.Host, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.First())
             .ToArray();
 
         if (explicitWanted.Length > 0 && !explicitTargetLogged)
         {
             explicitTargetLogged = true;
-            Enqueue("INFO", $"Explicit RDC host configured, deploying hvtop remote data collection agent to {explicitWanted[0]} on TCP/{options.RdcPort}");
-            if (!string.IsNullOrWhiteSpace(options.RdcUser))
-                Enqueue("INFO", $"RDC {explicitWanted[0]}: using supplied credentials for ADMIN$ and CIM access");
-            else
-                Enqueue("INFO", $"RDC {explicitWanted[0]}: using current Windows credentials for ADMIN$ and CIM access");
+            Enqueue("INFO", $"Explicit RDC host configured, deploying hvtop remote data collection agent to {explicitWanted[0].Host} on TCP/{PortFor(explicitWanted[0])}");
+            Enqueue("INFO", $"RDC {explicitWanted[0].Host}: using {explicitWanted[0].CredentialMode} for ADMIN$ and CIM access");
+        }
+
+        if (configTargets.Length > 0 && !configTargetLogged)
+        {
+            configTargetLogged = true;
+            Enqueue("INFO", $"RDC config target(s) configured: {string.Join(", ", configTargets.Select(t => t.Host))}");
         }
 
         if (nodes.Length > 1 && !clusterDetectedLogged)
@@ -69,7 +89,7 @@ internal sealed class RemoteCollectorManager : IDisposable
             Enqueue("INFO", $"Cluster detected, deploying hvtop remote data collection agent to peer node(s) on TCP/{options.RdcPort}");
         }
 
-        var targetSummary = wanted.Length == 0 ? "(none)" : string.Join(", ", wanted);
+        var targetSummary = wanted.Length == 0 ? "(none)" : string.Join(", ", wanted.Select(t => t.Host));
         if (!targetSummary.Equals(lastTargetSummary, StringComparison.OrdinalIgnoreCase))
         {
             lastTargetSummary = targetSummary;
@@ -78,18 +98,21 @@ internal sealed class RemoteCollectorManager : IDisposable
 
         lock (gate)
         {
-            foreach (var node in wanted)
+            foreach (var target in wanted)
             {
-                if (sessions.ContainsKey(node))
+                if (sessions.ContainsKey(target.Host))
                     continue;
 
-                var session = new RemoteNodeSession(node);
-                sessions[node] = session;
-                Enqueue("INFO", $"RDC {node}: scheduling remote collector deployment");
+                var session = new RemoteNodeSession(target);
+                sessions[target.Host] = session;
+                Enqueue("INFO", $"RDC {target.Host}: scheduling remote collector deployment");
+                if (SkipDeployFor(target))
+                    Enqueue("INFO", $"RDC {target.Host}: skip deploy enabled; polling manually deployed hvtop-rdc");
                 session.Worker = Task.Run(() => RunNodeAsync(session));
             }
 
-            foreach (var node in sessions.Keys.Except(wanted, StringComparer.OrdinalIgnoreCase).ToArray())
+            var wantedNames = wanted.Select(t => t.Host).ToArray();
+            foreach (var node in sessions.Keys.Except(wantedNames, StringComparer.OrdinalIgnoreCase).ToArray())
             {
                 Enqueue("INFO", $"RDC {node}: node no longer targeted, stopping remote collector");
                 sessions[node].Cancel();
@@ -181,11 +204,39 @@ internal sealed class RemoteCollectorManager : IDisposable
                        ?? item.Snapshot.Hosts.FirstOrDefault(h => !double.IsNaN(h.Cpu.Current))
                        ?? item.Snapshot.Hosts.FirstOrDefault();
             if (host is not null)
-                rows[host.Name] = host;
+                rows[host.Name] = rows.TryGetValue(host.Name, out var previous)
+                    ? PreserveFiniteHostCurrents(previous, host)
+                    : host;
         }
 
         return rows.Values.OrderBy(h => h.Name, StringComparer.OrdinalIgnoreCase).ToArray();
     }
+
+    private static HostRow PreserveFiniteHostCurrents(HostRow previous, HostRow next)
+        => next with
+        {
+            Cpu = PreserveFiniteCurrent(previous.Cpu, next.Cpu),
+            Mem = PreserveFiniteCurrent(previous.Mem, next.Mem),
+            Ram = next.Ram with
+            {
+                InUse = PreserveFiniteCurrent(previous.Ram.InUse, next.Ram.InUse),
+                Processes = PreserveFiniteCurrent(previous.Ram.Processes, next.Ram.Processes),
+                Kernel = PreserveFiniteCurrent(previous.Ram.Kernel, next.Ram.Kernel),
+                Modified = PreserveFiniteCurrent(previous.Ram.Modified, next.Ram.Modified),
+                StandbyCache = PreserveFiniteCurrent(previous.Ram.StandbyCache, next.Ram.StandbyCache),
+                Free = PreserveFiniteCurrent(previous.Ram.Free, next.Ram.Free)
+            },
+            Io = PreserveFiniteCurrent(previous.Io, next.Io),
+            Net = PreserveFiniteCurrent(previous.Net, next.Net)
+        };
+
+    private static Metric PreserveFiniteCurrent(Metric previous, Metric next)
+        => IsFinite(next.Current) || !IsFinite(previous.Current)
+            ? next
+            : next with { Current = previous.Current };
+
+    private static bool IsFinite(double value)
+        => !double.IsNaN(value) && !double.IsInfinity(value);
 
     public static VmRow[] MergeVms(VmRow[] local, RemoteSnapshot[] remote)
     {
@@ -266,15 +317,26 @@ internal sealed class RemoteCollectorManager : IDisposable
             {
                 if (!session.Deployed)
                 {
-                    SetState(session, "deploying");
-                    DeployAndStart(session);
+                    if (SkipDeployFor(session.Target))
+                    {
+                        if (string.IsNullOrWhiteSpace(session.Target.Token) && string.IsNullOrWhiteSpace(options.RdcToken))
+                            throw new InvalidOperationException("skip deploy requires --rdc-token, TOKEN in RDC config, or per-host config token");
+                        SetState(session, "skip-deploy");
+                    }
+                    else
+                    {
+                        SetState(session, "deploying");
+                        DeployAndStart(session);
+                    }
                     session.Deployed = true;
                     session.DeployedAt = DateTime.UtcNow;
                     session.RedeployRequested = false;
-                    SetState(session, "started");
+                    if (!SkipDeployFor(session.Target))
+                        SetState(session, "started");
                 }
 
                 var snapshot = await PollAsync(session).ConfigureAwait(false);
+                CheckRemoteVersion(session, snapshot);
                 lock (gate)
                     session.Latest = snapshot;
                 session.PollFailures = 0;
@@ -286,7 +348,7 @@ internal sealed class RemoteCollectorManager : IDisposable
             {
                 session.PollFailures++;
                 session.PollEndpoint = null;
-                var tcpProbe = await TcpProbeAsync(session.PollHost ?? session.NodeName, options.RdcPort, session.Cts.Token).ConfigureAwait(false);
+                var tcpProbe = await TcpProbeAsync(session.PollHost ?? session.NodeName, PortFor(session), options.RdcTimeout, session.Cts.Token).ConfigureAwait(false);
                 SetState(session, "poll-error", $"HTTP poll failed ({session.PollFailures}): {Trim(ex.Message, 100)}; TCP probe {tcpProbe}");
                 MaybeScheduleRedeploy(session);
             }
@@ -294,7 +356,7 @@ internal sealed class RemoteCollectorManager : IDisposable
             {
                 session.PollFailures++;
                 session.PollEndpoint = null;
-                var tcpProbe = await TcpProbeAsync(session.PollHost ?? session.NodeName, options.RdcPort, session.Cts.Token).ConfigureAwait(false);
+                var tcpProbe = await TcpProbeAsync(session.PollHost ?? session.NodeName, PortFor(session), options.RdcTimeout, session.Cts.Token).ConfigureAwait(false);
                 SetState(session, "poll-error", $"HTTP poll timed out ({session.PollFailures}): {Trim(ex.Message, 100)}; TCP probe {tcpProbe}");
                 MaybeScheduleRedeploy(session);
             }
@@ -329,7 +391,7 @@ internal sealed class RemoteCollectorManager : IDisposable
 
     private void MaybeScheduleRedeploy(RemoteNodeSession session)
     {
-        if (session.FirstDataAt is not null || session.RedeployRequested)
+        if (SkipDeployFor(session.Target) || session.FirstDataAt is not null || session.RedeployRequested)
             return;
 
         var age = DateTime.UtcNow - session.DeployedAt;
@@ -351,32 +413,32 @@ internal sealed class RemoteCollectorManager : IDisposable
 
         var remoteShareDir = $@"\\{session.NodeName}\ADMIN$\{RemoteInstallRelative}";
         SetState(session, "checking");
-        StopRemoteProcess(session.NodeName);
+        StopRemoteProcess(session);
 
         SetState(session, "copying");
-        if (string.IsNullOrWhiteSpace(options.RdcUser))
+        if (!session.Target.HasCredentials)
             Directory.CreateDirectory(remoteShareDir);
-        CopyRemoteCollector(localExe, Path.Combine(remoteShareDir, "hvtop-rdc.exe"), session.NodeName);
+        CopyRemoteCollector(localExe, Path.Combine(remoteShareDir, "hvtop-rdc.exe"), session);
 
         var refresh = options.RemoteRefresh.TotalSeconds.ToString("0.###", CultureInfo.InvariantCulture);
         var history = options.History.TotalMinutes.ToString("0.###", CultureInfo.InvariantCulture);
         var logging = options.DebugLog ? " --debug-log" : string.Empty;
         var counterDebug = options.DebugCounters ? " --debug-counters" : string.Empty;
-        var commandLine = $"\"{RemoteExePath}\" --port {options.RdcPort} --refresh {refresh} --history {history} --token {WinArg(token)}{logging}{counterDebug}";
+        var commandLine = $"\"{RemoteExePath}\" --port {PortFor(session)} --refresh {refresh} --history {history} --token {WinArg(TokenFor(session))}{logging}{counterDebug}";
         var cimScript =
             "$ErrorActionPreference='Stop'; " +
             $"$node={PsSingle(session.NodeName)}; $cmd={PsSingle(commandLine)}; " +
-            CimSessionScript() +
+            CimSessionScript(session.Target) +
             "try { " +
             "Invoke-CimMethod -CimSession $hvtopCimSession -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=$cmd} | Out-Null; " +
             "} finally { if ($hvtopCimSession) { Remove-CimSession -CimSession $hvtopCimSession -ErrorAction SilentlyContinue } }";
 
         SetState(session, "starting");
-        if (!PowerShellRunner.TryRun(cimScript, 10000, out _, out var error, out var exitCode, out var timedOut))
+        if (!PowerShellRunner.TryRun(cimScript, TimeoutMs, out _, out var error, out var exitCode, out var timedOut))
         {
             var cimError = timedOut
-                ? $"remote CIM process start timed out using {CredentialMode()}"
-                : $"remote CIM process start failed using {CredentialMode()} exit={exitCode}: {Trim(error, 160)}";
+                ? $"remote CIM process start timed out after {TimeoutSecondsText} using {CredentialMode(session.Target)}"
+                : $"remote CIM process start failed using {CredentialMode(session.Target)} exit={exitCode}: {Trim(error, 160)}";
             if (!IsWinRmFailure(error))
                 throw new InvalidOperationException(cimError);
 
@@ -384,78 +446,78 @@ internal sealed class RemoteCollectorManager : IDisposable
             var wmiScript =
                 "$ErrorActionPreference='Stop'; " +
                 $"$node={PsSingle(session.NodeName)}; $cmd={PsSingle(commandLine)}; " +
-                WmiArgsScript() +
+                WmiArgsScript(session.Target) +
                 "Invoke-WmiMethod @hvtopWmi -Class Win32_Process -Name Create -ArgumentList $cmd | Out-Null";
 
-            if (!PowerShellRunner.TryRun(wmiScript, 10000, out _, out error, out exitCode, out timedOut))
+            if (!PowerShellRunner.TryRun(wmiScript, TimeoutMs, out _, out error, out exitCode, out timedOut))
                 throw new InvalidOperationException(timedOut
-                    ? $"remote WMI/DCOM process start timed out using {CredentialMode()} after CIM/WinRM failed"
-                    : $"remote WMI/DCOM process start failed using {CredentialMode()} after CIM/WinRM failed exit={exitCode}: {Trim(error, 160)}");
+                    ? $"remote WMI/DCOM process start timed out after {TimeoutSecondsText} using {CredentialMode(session.Target)} after CIM/WinRM failed"
+                    : $"remote WMI/DCOM process start failed using {CredentialMode(session.Target)} after CIM/WinRM failed exit={exitCode}: {Trim(error, 160)}");
 
-            Enqueue("INFO", $"RDC {session.NodeName}: remote WMI/DCOM process start requested using {CredentialMode()}");
+            Enqueue("INFO", $"RDC {session.NodeName}: remote WMI/DCOM process start requested using {CredentialMode(session.Target)}");
             return;
         }
 
-        Enqueue("INFO", $"RDC {session.NodeName}: remote CIM process start requested using {CredentialMode()}");
+        Enqueue("INFO", $"RDC {session.NodeName}: remote CIM process start requested using {CredentialMode(session.Target)}");
     }
 
-    private void StopRemoteProcess(string nodeName)
+    private void StopRemoteProcess(RemoteNodeSession session)
     {
         var cimScript =
             "$ErrorActionPreference='Stop'; " +
-            $"$node={PsSingle(nodeName)}; " +
-            CimSessionScript() +
+            $"$node={PsSingle(session.NodeName)}; " +
+            CimSessionScript(session.Target) +
             "try { " +
             "$procs=Get-CimInstance -CimSession $hvtopCimSession -ClassName Win32_Process -Filter \"Name='hvtop-rdc.exe'\"; " +
             "if ($procs) { $procs | Invoke-CimMethod -MethodName Terminate | Out-Null }; " +
             "} finally { if ($hvtopCimSession) { Remove-CimSession -CimSession $hvtopCimSession -ErrorAction SilentlyContinue } }";
-        if (!PowerShellRunner.TryRun(cimScript, 7000, out _, out var error, out var exitCode, out var timedOut))
+        if (!PowerShellRunner.TryRun(cimScript, TimeoutMs, out _, out var error, out var exitCode, out var timedOut))
         {
             var cimError = timedOut
-                ? $"remote CIM process stop timed out using {CredentialMode()}"
-                : $"remote CIM process stop failed using {CredentialMode()} exit={exitCode}: {Trim(error, 160)}";
+                ? $"remote CIM process stop timed out after {TimeoutSecondsText} using {CredentialMode(session.Target)}"
+                : $"remote CIM process stop failed using {CredentialMode(session.Target)} exit={exitCode}: {Trim(error, 160)}";
             if (!IsWinRmFailure(error))
                 throw new InvalidOperationException(cimError);
 
-            Enqueue("WARN", $"RDC {nodeName}: CIM/WinRM stop failed; trying legacy WMI/DCOM fallback");
+            Enqueue("WARN", $"RDC {session.NodeName}: CIM/WinRM stop failed; trying legacy WMI/DCOM fallback");
             var wmiScript =
                 "$ErrorActionPreference='Stop'; " +
-                $"$node={PsSingle(nodeName)}; " +
-                WmiArgsScript() +
+                $"$node={PsSingle(session.NodeName)}; " +
+                WmiArgsScript(session.Target) +
                 "$procs=Get-WmiObject @hvtopWmi -Class Win32_Process -Filter \"Name='hvtop-rdc.exe'\"; " +
                 "foreach ($proc in @($procs)) { $null=$proc.Terminate() }";
 
-            if (!PowerShellRunner.TryRun(wmiScript, 7000, out _, out error, out exitCode, out timedOut))
+            if (!PowerShellRunner.TryRun(wmiScript, TimeoutMs, out _, out error, out exitCode, out timedOut))
                 throw new InvalidOperationException(timedOut
-                    ? $"remote WMI/DCOM process stop timed out using {CredentialMode()} after CIM/WinRM failed"
-                    : $"remote WMI/DCOM process stop failed using {CredentialMode()} after CIM/WinRM failed exit={exitCode}: {Trim(error, 160)}");
+                    ? $"remote WMI/DCOM process stop timed out after {TimeoutSecondsText} using {CredentialMode(session.Target)} after CIM/WinRM failed"
+                    : $"remote WMI/DCOM process stop failed using {CredentialMode(session.Target)} after CIM/WinRM failed exit={exitCode}: {Trim(error, 160)}");
         }
         Thread.Sleep(500);
     }
 
-    private void CopyRemoteCollector(string source, string destination, string nodeName)
+    private void CopyRemoteCollector(string source, string destination, RemoteNodeSession session)
     {
-        if (!string.IsNullOrWhiteSpace(options.RdcUser))
+        if (session.Target.HasCredentials)
         {
-            CopyRemoteCollectorWithCredential(source, nodeName);
+            CopyRemoteCollectorWithCredential(source, session);
             return;
         }
 
         try
         {
             File.Copy(source, destination, overwrite: true);
-            Enqueue("INFO", $"RDC {nodeName}: ADMIN$ copy succeeded using {CredentialMode()}");
+            Enqueue("INFO", $"RDC {session.NodeName}: ADMIN$ copy succeeded using {CredentialMode(session.Target)}");
             return;
         }
         catch (IOException ex)
         {
-            Enqueue("WARN", $"RDC {nodeName}: remote collector exe was locked, stopping old agent and retrying copy");
-            StopRemoteProcess(nodeName);
+            Enqueue("WARN", $"RDC {session.NodeName}: remote collector exe was locked, stopping old agent and retrying copy");
+            StopRemoteProcess(session);
             Thread.Sleep(1000);
             try
             {
                 File.Copy(source, destination, overwrite: true);
-                Enqueue("INFO", $"RDC {nodeName}: ADMIN$ copy succeeded after retry using {CredentialMode()}");
+                Enqueue("INFO", $"RDC {session.NodeName}: ADMIN$ copy succeeded after retry using {CredentialMode(session.Target)}");
                 return;
             }
             catch (IOException)
@@ -465,12 +527,12 @@ internal sealed class RemoteCollectorManager : IDisposable
         }
     }
 
-    private void CopyRemoteCollectorWithCredential(string source, string nodeName)
+    private void CopyRemoteCollectorWithCredential(string source, RemoteNodeSession session)
     {
         var script =
             "$ErrorActionPreference='Stop'; " +
-            $"$node={PsSingle(nodeName)}; $source={PsSingle(source)}; " +
-            CredentialScript() +
+            $"$node={PsSingle(session.NodeName)}; $source={PsSingle(source)}; " +
+            CredentialScript(session.Target) +
             "$drive='HVTOPRDC' + [guid]::NewGuid().ToString('N').Substring(0,8); " +
             "try { " +
             "New-PSDrive -Name $drive -PSProvider FileSystem -Root \"\\\\$node\\ADMIN$\" -Credential $hvtopCred -ErrorAction Stop | Out-Null; " +
@@ -479,12 +541,12 @@ internal sealed class RemoteCollectorManager : IDisposable
             "Copy-Item -LiteralPath $source -Destination (Join-Path $target 'hvtop-rdc.exe') -Force; " +
             "} finally { Remove-PSDrive -Name $drive -Force -ErrorAction SilentlyContinue }";
 
-        if (!PowerShellRunner.TryRun(script, 15000, out _, out var error, out var exitCode, out var timedOut))
+        if (!PowerShellRunner.TryRun(script, CopyTimeoutMs, out _, out var error, out var exitCode, out var timedOut))
             throw new InvalidOperationException(timedOut
-                ? $"remote ADMIN$ copy timed out using {CredentialMode()}"
-                : $"remote ADMIN$ copy failed using {CredentialMode()} exit={exitCode}: {Trim(error, 140)}");
+                ? $"remote ADMIN$ copy timed out after {CopyTimeoutSecondsText} using {CredentialMode(session.Target)}"
+                : $"remote ADMIN$ copy failed using {CredentialMode(session.Target)} exit={exitCode}: {Trim(error, 140)}");
 
-        Enqueue("INFO", $"RDC {nodeName}: ADMIN$ copy succeeded using {CredentialMode()}");
+        Enqueue("INFO", $"RDC {session.NodeName}: ADMIN$ copy succeeded using {CredentialMode(session.Target)}");
     }
 
     private async Task<Snapshot> PollAsync(RemoteNodeSession session)
@@ -497,12 +559,46 @@ internal sealed class RemoteCollectorManager : IDisposable
         }
 
         using var request = new HttpRequestMessage(HttpMethod.Get, uri);
-        request.Headers.TryAddWithoutValidation("X-Hvtop-Token", token);
+        request.Headers.TryAddWithoutValidation("X-Hvtop-Token", TokenFor(session));
         using var response = await http.SendAsync(request, session.Cts.Token).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
         await using var stream = await response.Content.ReadAsStreamAsync(session.Cts.Token).ConfigureAwait(false);
         return await JsonSerializer.DeserializeAsync(stream, HvtopJsonContext.Default.Snapshot, session.Cts.Token).ConfigureAwait(false)
                ?? throw new InvalidOperationException("remote snapshot was empty");
+    }
+
+    private void CheckRemoteVersion(RemoteNodeSession session, Snapshot snapshot)
+    {
+        if (session.VersionWarningLogged)
+            return;
+
+        session.VersionWarningLogged = true;
+        var local = VersionBase(Program.DisplayVersion);
+        var remoteRaw = snapshot.RdcCollectorVersion;
+        if (string.IsNullOrWhiteSpace(remoteRaw))
+        {
+            Enqueue("WARN", $"RDC {session.NodeName}: remote version not reported. Local: v{local}. Remote: unknown; collector may be older than local.");
+            return;
+        }
+
+        var remote = VersionBase(remoteRaw);
+        if (!string.Equals(local, remote, StringComparison.OrdinalIgnoreCase))
+            Enqueue("WARN", $"RDC {session.NodeName}: RDC version mismatch detected. Local: v{local}. Remote: v{remote}");
+    }
+
+    private static string VersionBase(string version)
+    {
+        var text = (version ?? string.Empty).Trim();
+        var space = text.LastIndexOf(' ');
+        if (space >= 0)
+            text = text[(space + 1)..].Trim();
+
+        var plus = text.IndexOf('+');
+        if (plus >= 0)
+            text = text[..plus];
+
+        text = text.Replace("-rdc", string.Empty, StringComparison.OrdinalIgnoreCase).Trim();
+        return string.IsNullOrWhiteSpace(text) ? "unknown" : text;
     }
 
     private async Task<string> ResolvePollEndpointAsync(RemoteNodeSession session)
@@ -531,19 +627,20 @@ internal sealed class RemoteCollectorManager : IDisposable
         {
             var probeHost = address.ToString();
             var uriHost = FormatUriHost(address);
-            var probe = await TcpProbeAsync(probeHost, options.RdcPort, session.Cts.Token).ConfigureAwait(false);
-            Enqueue("INFO", $"RDC {session.NodeName}: TCP probe {uriHost}:{options.RdcPort} {probe}");
+            var port = PortFor(session);
+            var probe = await TcpProbeAsync(probeHost, port, options.RdcTimeout, session.Cts.Token).ConfigureAwait(false);
+            Enqueue("INFO", $"RDC {session.NodeName}: TCP probe {uriHost}:{port} {probe}");
             if (!probe.Equals("connect OK", StringComparison.OrdinalIgnoreCase))
                 continue;
 
             session.PollHost = probeHost;
-            session.PollEndpoint = $"http://{uriHost}:{options.RdcPort}/snapshot";
+            session.PollEndpoint = $"http://{uriHost}:{port}/snapshot";
             session.PollingLogged = false;
             return session.PollEndpoint;
         }
 
         session.PollHost = session.NodeName;
-        session.PollEndpoint = $"http://{session.NodeName}:{options.RdcPort}/snapshot";
+        session.PollEndpoint = $"http://{session.NodeName}:{PortFor(session)}/snapshot";
         session.PollingLogged = false;
         return session.PollEndpoint;
     }
@@ -551,10 +648,10 @@ internal sealed class RemoteCollectorManager : IDisposable
     private static string FormatUriHost(IPAddress address)
         => address.AddressFamily == AddressFamily.InterNetworkV6 ? $"[{address}]" : address.ToString();
 
-    private static async Task<string> TcpProbeAsync(string host, int port, CancellationToken token)
+    private static async Task<string> TcpProbeAsync(string host, int port, TimeSpan timeoutValue, CancellationToken token)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
-        timeout.CancelAfter(TimeSpan.FromSeconds(2));
+        timeout.CancelAfter(timeoutValue);
         try
         {
             using var client = new TcpClient();
@@ -563,7 +660,7 @@ internal sealed class RemoteCollectorManager : IDisposable
         }
         catch (OperationCanceledException) when (!token.IsCancellationRequested)
         {
-            return "connect timeout";
+            return $"connect timeout after {timeoutValue.TotalSeconds:N0}s";
         }
         catch (Exception ex)
         {
@@ -583,18 +680,29 @@ internal sealed class RemoteCollectorManager : IDisposable
         var message = state switch
         {
             "deploying" => $"RDC {session.NodeName}: deploying hvtop-rdc",
-            "checking" => $"RDC {session.NodeName}: checking CIM access and stopping old hvtop-rdc process if present using {CredentialMode()}",
-            "copying" => $"RDC {session.NodeName}: testing ADMIN$ access and copying hvtop-rdc.exe using {CredentialMode()}",
-            "starting" => $"RDC {session.NodeName}: starting remote collector through CIM using {CredentialMode()}",
-            "started" => $"RDC {session.NodeName}: deployed hvtop-rdc on TCP/{options.RdcPort}",
+            "skip-deploy" => $"RDC {session.NodeName}: skip deploy enabled, polling existing hvtop-rdc on TCP/{PortFor(session)}",
+            "checking" => $"RDC {session.NodeName}: checking CIM access and stopping old hvtop-rdc process if present using {CredentialMode(session.Target)}",
+            "copying" => $"RDC {session.NodeName}: testing ADMIN$ access and copying hvtop-rdc.exe using {CredentialMode(session.Target)}",
+            "starting" => $"RDC {session.NodeName}: starting remote collector through CIM using {CredentialMode(session.Target)}",
+            "started" => $"RDC {session.NodeName}: deployed hvtop-rdc on TCP/{PortFor(session)}",
             "connected" => $"RDC {session.NodeName}: connected, polling every {options.RemoteRefresh.TotalSeconds:N0}s",
             "poll-error" => $"RDC {session.NodeName}: {detail}; keeping remote collector running",
-            "auth-error" => $"RDC {session.NodeName}: remote access rejected ({detail}); not retrying until hvtop is restarted",
-            "remote-error" => $"RDC {session.NodeName}: remote setup failed ({detail}); not retrying until hvtop is restarted",
+            "auth-error" => AuthFailureMessage(session),
+            "remote-error" => RemoteFailureMessage(session, detail),
             _ => $"RDC {session.NodeName}: {detail}"
         };
         Enqueue(severity, message);
     }
+
+    private string AuthFailureMessage(RemoteNodeSession session)
+        => session.Target.Source.Equals("config", StringComparison.OrdinalIgnoreCase) && session.Target.LineNumber is { } line
+            ? $"RDC config line {line} skipped: Invalid credentials."
+            : $"RDC {session.NodeName}: invalid credentials; target skipped.";
+
+    private string RemoteFailureMessage(RemoteNodeSession session, string detail)
+        => detail.Contains("timed out", StringComparison.OrdinalIgnoreCase)
+            ? $"RDC {session.NodeName}: timed out after {TimeoutSecondsText}; target skipped."
+            : $"RDC {session.NodeName}: remote setup failed ({detail}); target skipped.";
 
     private void Enqueue(string severity, string message)
     {
@@ -607,27 +715,54 @@ internal sealed class RemoteCollectorManager : IDisposable
     private static string WinArg(string value)
         => "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
 
-    private string CredentialScript()
+    private string TokenFor(RemoteNodeSession session)
+        => string.IsNullOrWhiteSpace(session.Target.Token) ? token : session.Target.Token;
+
+    private int PortFor(RemoteNodeSession session)
+        => PortFor(session.Target);
+
+    private int PortFor(RdcTarget target)
+        => target.Port ?? options.RdcPort;
+
+    private static bool SkipDeployFor(RdcTarget target)
+        => target.SkipDeploy == true;
+
+    private string CredentialScript(RdcTarget target)
     {
-        if (string.IsNullOrWhiteSpace(options.RdcUser))
+        if (!target.HasCredentials)
             return "$hvtopCred=$null; ";
 
-        var password = options.RdcPassword ?? string.Empty;
+        var password = target.Password ?? string.Empty;
         return "$hvtopPassword=ConvertTo-SecureString " + PsSingle(password) + " -AsPlainText -Force; " +
-               "$hvtopCred=[pscredential]::new(" + PsSingle(options.RdcUser) + ", $hvtopPassword); ";
+               "$hvtopCred=[pscredential]::new(" + PsSingle(target.User!) + ", $hvtopPassword); ";
     }
 
-    private string CimSessionScript()
-        => CredentialScript() +
-           (string.IsNullOrWhiteSpace(options.RdcUser)
+    private string CimSessionScript(RdcTarget target)
+        => CredentialScript(target) +
+           (!target.HasCredentials
                ? "$hvtopCimSession=New-CimSession -ComputerName $node; "
                : "$hvtopCimSession=New-CimSession -ComputerName $node -Credential $hvtopCred; ");
 
-    private string WmiArgsScript()
-        => CredentialScript() + "$hvtopWmi=@{ComputerName=$node}; if ($hvtopCred) { $hvtopWmi['Credential']=$hvtopCred }; ";
+    private string WmiArgsScript(RdcTarget target)
+        => CredentialScript(target) + "$hvtopWmi=@{ComputerName=$node}; if ($hvtopCred) { $hvtopWmi['Credential']=$hvtopCred }; ";
 
-    private string CredentialMode()
-        => string.IsNullOrWhiteSpace(options.RdcUser) ? "current credentials" : $"supplied credentials ({options.RdcUser})";
+    private static string CredentialMode(RdcTarget target)
+        => target.CredentialMode;
+
+    private int TimeoutMs
+        => Math.Max(1000, (int)Math.Ceiling(options.RdcTimeout.TotalMilliseconds));
+
+    private string TimeoutSecondsText
+        => $"{options.RdcTimeout.TotalSeconds:N0}s";
+
+    private int CopyTimeoutMs
+        => Math.Max(1000, (int)Math.Ceiling(options.RdcCopyTimeout.TotalMilliseconds));
+
+    private string CopyTimeoutSecondsText
+        => $"{options.RdcCopyTimeout.TotalSeconds:N0}s";
+
+    private static TimeSpan ShutdownStopTimeout
+        => TimeSpan.FromSeconds(2);
 
     private static string Trim(string value, int max)
     {
@@ -687,57 +822,72 @@ internal sealed class RemoteCollectorManager : IDisposable
         lock (gate)
             copy = sessions.Values.ToArray();
 
-        foreach (var session in copy)
+        var stopTasks = copy
+            .Select(session => Task.Run(() => StopRemoteCollectorOnShutdown(session)))
+            .ToArray();
+        try
         {
-            session.Cancel();
-            try
-            {
-                var stopHost = session.PollHost ?? session.NodeName;
-                using var stop = new HttpRequestMessage(HttpMethod.Get, $"http://{stopHost}:{options.RdcPort}/stop");
-                stop.Headers.TryAddWithoutValidation("X-Hvtop-Token", token);
-                http.Send(stop);
-                Enqueue("INFO", $"RDC {session.NodeName}: stop requested, preserving remote log at \\\\{session.NodeName}\\ADMIN$\\{RemoteInstallRelative}\\hvtop-rdc.log");
-            }
-            catch
-            {
-                Enqueue("WARN", $"RDC {session.NodeName}: stop request failed, preserving remote log at \\\\{session.NodeName}\\ADMIN$\\{RemoteInstallRelative}\\hvtop-rdc.log");
-            }
-
-            try
-            {
-                DeleteRemoteCollector(session.NodeName);
-            }
-            catch
-            {
-            }
+            Task.WaitAll(stopTasks);
+        }
+        catch
+        {
         }
 
         http.Dispose();
     }
 
-    private void DeleteRemoteCollector(string nodeName)
+    private void StopRemoteCollectorOnShutdown(RemoteNodeSession session)
     {
-        if (string.IsNullOrWhiteSpace(options.RdcUser))
+        session.Cancel();
+        if (SkipDeployFor(session.Target))
         {
-            File.Delete($@"\\{nodeName}\ADMIN$\{RemoteInstallRelative}\hvtop-rdc.exe");
+            Enqueue("INFO", $"RDC {session.NodeName}: skip deploy target left running");
+            return;
+        }
+
+        try
+        {
+            var stopHost = session.PollHost ?? session.NodeName;
+            using var stop = new HttpRequestMessage(HttpMethod.Get, $"http://{stopHost}:{PortFor(session)}/stop");
+            stop.Headers.TryAddWithoutValidation("X-Hvtop-Token", TokenFor(session));
+            using var timeout = new CancellationTokenSource(ShutdownStopTimeout);
+            http.Send(stop, timeout.Token);
+            Enqueue("INFO", $"RDC {session.NodeName}: stop requested, preserving remote log at \\\\{session.NodeName}\\ADMIN$\\{RemoteInstallRelative}\\hvtop-rdc.log");
+        }
+        catch
+        {
+            Enqueue("WARN", $"RDC {session.NodeName}: stop request failed, preserving remote log at \\\\{session.NodeName}\\ADMIN$\\{RemoteInstallRelative}\\hvtop-rdc.log");
+        }
+    }
+
+    private void DeleteRemoteCollector(RemoteNodeSession session)
+    {
+        if (!session.Target.HasCredentials)
+        {
+            File.Delete($@"\\{session.NodeName}\ADMIN$\{RemoteInstallRelative}\hvtop-rdc.exe");
             return;
         }
 
         var script =
             "$ErrorActionPreference='SilentlyContinue'; " +
-            $"$node={PsSingle(nodeName)}; " +
-            CredentialScript() +
+            $"$node={PsSingle(session.NodeName)}; " +
+            CredentialScript(session.Target) +
             "$drive='HVTOPRDC' + [guid]::NewGuid().ToString('N').Substring(0,8); " +
             "try { " +
             "New-PSDrive -Name $drive -PSProvider FileSystem -Root \"\\\\$node\\ADMIN$\" -Credential $hvtopCred -ErrorAction Stop | Out-Null; " +
             "Remove-Item -LiteralPath \"$drive`:\\Temp\\hvtop-rdc\\hvtop-rdc.exe\" -Force -ErrorAction SilentlyContinue; " +
             "} finally { Remove-PSDrive -Name $drive -Force -ErrorAction SilentlyContinue }";
-        PowerShellRunner.TryRun(script, 7000, out _);
+        PowerShellRunner.TryRun(script, TimeoutMs, out _);
     }
 
     private sealed class RemoteNodeSession
     {
-        public RemoteNodeSession(string nodeName) => NodeName = nodeName;
+        public RemoteNodeSession(RdcTarget target)
+        {
+            Target = target;
+            NodeName = target.Host;
+        }
+        public RdcTarget Target { get; }
         public string NodeName { get; }
         public CancellationTokenSource Cts { get; } = new();
         public Task? Worker { get; set; }
@@ -748,6 +898,7 @@ internal sealed class RemoteCollectorManager : IDisposable
         public DateTime? LastDataAt { get; set; }
         public bool PollingLogged { get; set; }
         public bool RedeployRequested { get; set; }
+        public bool VersionWarningLogged { get; set; }
         public int PollFailures { get; set; }
         public string? PollHost { get; set; }
         public string? PollEndpoint { get; set; }

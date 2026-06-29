@@ -90,7 +90,7 @@ internal sealed record RdcOptions(TimeSpan Refresh, TimeSpan History, int Port, 
     }
 }
 
-internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, bool LocalCollectors, bool RemoteCollectors, int RdcPort, TimeSpan RemoteRefresh, string? RdcHost, string? RdcUser, string? RdcPassword, string? RdcToken, bool DebugLog, bool DebugCounters, bool ShowHelp, bool ShowVersion, string? ParseError)
+internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, bool LocalCollectors, bool RemoteCollectors, int RdcPort, TimeSpan RemoteRefresh, TimeSpan RdcTimeout, TimeSpan RdcCopyTimeout, string? RdcHost, string? RdcUser, string? RdcPassword, string? RdcToken, string? RdcConfig, bool RdcSkipDeploy, bool DebugLog, bool DebugCounters, bool ShowHelp, bool ShowVersion, string? ParseError)
 {
     public static string HelpText =>
         """
@@ -104,12 +104,16 @@ internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, b
           --history <minutes>        History window for max/min values. Default: 15
           --rdc-port <n>             Remote Data Collector TCP port. Default: 54321
           --rdc-refresh <seconds>    Remote Data Collector interval. Default: 1
+          --rdc-timeout <seconds>    RDC connect/deploy/poll timeout. Default: 5
+          --rdc-copy-timeout <sec>   RDC ADMIN$ copy timeout. Default: 60
           --rdc-host <host>          Deploy/poll hvtop-rdc on an explicit remote host.
+          --rdc-config <path>        RDC target config file. Default: hvtop-rdc.conf beside hvtop.exe.
           --rdc-user <user>          Username for remote ADMIN$/CIM access.
           --rdc-password <password>  Password for remote ADMIN$/CIM access.
           --rdc-token <value>        Token passed to hvtop-rdc. Default: generated per run.
+          --rdc-skip-deploy          Poll existing hvtop-rdc agents; requires --rdc-token or config token.
           --rdc-disable              Disable remote data collection.
-          --ldc-disable              Disable local data collection; requires --rdc-host.
+          --ldc-disable              Disable local data collection; requires --rdc-host or RDC config.
           --local-disable            Deprecated alias for --ldc-disable; removed at 1.0.
           --debug-log                Write hvtop.log; also enables remote hvtop-rdc.log.
           --smoke                    Print one sample and exit.
@@ -126,10 +130,21 @@ internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, b
         var remoteCollectors = true;
         var rdcPort = 54321;
         var remoteRefresh = TimeSpan.FromSeconds(1);
+        var rdcTimeout = TimeSpan.FromSeconds(5);
+        var rdcCopyTimeout = TimeSpan.FromSeconds(60);
+        var rdcPortSpecified = false;
+        var remoteRefreshSpecified = false;
+        var rdcTimeoutSpecified = false;
+        var rdcCopyTimeoutSpecified = false;
+        var rdcTokenSpecified = false;
+        var rdcSkipDeploySpecified = false;
         string? rdcHost = null;
         string? rdcUser = null;
         string? rdcPassword = null;
         string? rdcToken = null;
+        string? rdcConfig = null;
+        var rdcSkipDeploy = false;
+        var configHasTargetToken = false;
         var debugLog = false;
         var debugCounters = false;
         var showHelp = false;
@@ -170,16 +185,35 @@ internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, b
             {
                 if (!ArgumentHelper.TryReadInt(args, ref i, arg, out var value, out error)) break;
                 rdcPort = Math.Clamp(value, 1, 65535);
+                rdcPortSpecified = true;
             }
             else if (arg.Equals("--rdc-refresh", StringComparison.OrdinalIgnoreCase))
             {
                 if (!ArgumentHelper.TryReadDouble(args, ref i, arg, out var value, out error)) break;
                 remoteRefresh = TimeSpan.FromSeconds(Math.Max(1, value));
+                remoteRefreshSpecified = true;
+            }
+            else if (arg.Equals("--rdc-timeout", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!ArgumentHelper.TryReadInt(args, ref i, arg, out var value, out error)) break;
+                rdcTimeout = TimeSpan.FromSeconds(Math.Max(1, value));
+                rdcTimeoutSpecified = true;
+            }
+            else if (arg.Equals("--rdc-copy-timeout", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!ArgumentHelper.TryReadInt(args, ref i, arg, out var value, out error)) break;
+                rdcCopyTimeout = TimeSpan.FromSeconds(Math.Max(1, value));
+                rdcCopyTimeoutSpecified = true;
             }
             else if (arg.Equals("--rdc-host", StringComparison.OrdinalIgnoreCase))
             {
                 if (!ArgumentHelper.TryReadString(args, ref i, arg, out var value, out error)) break;
                 rdcHost = value;
+            }
+            else if (arg.Equals("--rdc-config", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!ArgumentHelper.TryReadString(args, ref i, arg, out var value, out error)) break;
+                rdcConfig = value;
             }
             else if (arg.Equals("--rdc-user", StringComparison.OrdinalIgnoreCase))
             {
@@ -195,6 +229,12 @@ internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, b
             {
                 if (!ArgumentHelper.TryReadString(args, ref i, arg, out var value, out error)) break;
                 rdcToken = value;
+                rdcTokenSpecified = true;
+            }
+            else if (arg.Equals("--rdc-skip-deploy", StringComparison.OrdinalIgnoreCase))
+            {
+                rdcSkipDeploy = true;
+                rdcSkipDeploySpecified = true;
             }
             else if (arg.Equals("--debug-log", StringComparison.OrdinalIgnoreCase))
                 debugLog = true;
@@ -210,16 +250,39 @@ internal sealed record Options(TimeSpan Refresh, TimeSpan History, bool Smoke, b
         if (smoke)
             remoteCollectors = false;
 
-        if (error is null && !localCollectors && string.IsNullOrWhiteSpace(rdcHost))
-            error = "--ldc-disable requires --rdc-host";
+        if (error is null)
+        {
+            var config = RdcConfigLoader.Load(rdcConfig);
+            configHasTargetToken = config.Targets.Any(t => !string.IsNullOrWhiteSpace(t.Token));
+            if (!rdcPortSpecified && config.Settings.Port is { } configPort)
+                rdcPort = configPort;
+            if (!remoteRefreshSpecified && config.Settings.RefreshSeconds is { } configRefresh)
+                remoteRefresh = TimeSpan.FromSeconds(Math.Max(1, configRefresh));
+            if (!rdcTimeoutSpecified && config.Settings.TimeoutSeconds is { } configTimeout)
+                rdcTimeout = TimeSpan.FromSeconds(Math.Max(1, configTimeout));
+            if (!rdcCopyTimeoutSpecified && config.Settings.CopyTimeoutSeconds is { } configCopyTimeout)
+                rdcCopyTimeout = TimeSpan.FromSeconds(Math.Max(1, configCopyTimeout));
+            if (!rdcTokenSpecified && !string.IsNullOrWhiteSpace(config.Settings.Token))
+                rdcToken = config.Settings.Token;
+            if (!rdcSkipDeploySpecified && config.Settings.SkipDeploy is { } configSkipDeploy)
+                rdcSkipDeploy = configSkipDeploy;
+        }
+
+        var defaultRdcConfigExists = File.Exists(Path.Combine(AppContext.BaseDirectory, "hvtop-rdc.conf"));
+        if (error is null && !localCollectors && string.IsNullOrWhiteSpace(rdcHost) && string.IsNullOrWhiteSpace(rdcConfig) && !defaultRdcConfigExists)
+            error = "--ldc-disable requires --rdc-host or RDC config";
         if (error is null && !localCollectors && !remoteCollectors)
             error = "--ldc-disable cannot be combined with --rdc-disable";
         if (error is null && !string.IsNullOrWhiteSpace(rdcPassword) && string.IsNullOrWhiteSpace(rdcUser))
             error = "--rdc-password requires --rdc-user";
+        if (error is null && !string.IsNullOrWhiteSpace(rdcUser) && string.IsNullOrWhiteSpace(rdcPassword))
+            error = "--rdc-user requires --rdc-password";
         if (error is null && !string.IsNullOrWhiteSpace(rdcHost) && !remoteCollectors)
             error = "--rdc-host cannot be combined with --rdc-disable";
+        if (error is null && rdcSkipDeploy && string.IsNullOrWhiteSpace(rdcToken) && !configHasTargetToken)
+            error = "--rdc-skip-deploy requires --rdc-token, TOKEN in RDC config, or per-host config token";
 
-        return new Options(refresh, history, smoke, localCollectors, remoteCollectors, rdcPort, remoteRefresh, rdcHost, rdcUser, rdcPassword, rdcToken, debugLog, debugCounters, showHelp, showVersion, error);
+        return new Options(refresh, history, smoke, localCollectors, remoteCollectors, rdcPort, remoteRefresh, rdcTimeout, rdcCopyTimeout, rdcHost, rdcUser, rdcPassword, rdcToken, rdcConfig, rdcSkipDeploy, debugLog, debugCounters, showHelp, showVersion, error);
     }
 }
 

@@ -56,6 +56,39 @@ internal static class RdcLog
     }
 }
 
+internal static class DebugCounterLog
+{
+    private static readonly object Gate = new();
+    private static string path = System.IO.Path.Combine(AppContext.BaseDirectory, "hvtop-debug.log");
+    private static bool enabled;
+
+    public static void Configure(bool debugCounters, string fileName)
+    {
+        lock (Gate)
+        {
+            enabled = debugCounters;
+            path = System.IO.Path.Combine(AppContext.BaseDirectory, fileName);
+        }
+    }
+
+    public static void Info(string message)
+    {
+        if (!enabled)
+            return;
+
+        try
+        {
+            lock (Gate)
+            {
+                File.AppendAllText(path, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {message}{Environment.NewLine}");
+            }
+        }
+        catch
+        {
+        }
+    }
+}
+
 internal sealed class RdcFirewallRule : IDisposable
 {
     private readonly string ruleName;

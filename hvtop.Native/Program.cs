@@ -15,7 +15,7 @@ namespace hvtop.Native;
 internal static class Program
 {
 #if RDC
-    public const string DisplayVersion = "0.8.5-rdc+20260624.0189";
+    public const string DisplayVersion = "0.9.0-rdc+20260629.0202";
     public const string AppName = "hvtop-rdc";
 
     public static async Task<int> Main(string[] args)
@@ -35,13 +35,14 @@ internal static class Program
             return options.ParseError is null ? 0 : 2;
         }
         RdcLog.Configure(options.DebugLog, "hvtop-rdc.log");
+        DebugCounterLog.Configure(options.DebugCounters, "hvtop-debug.log");
         RdcLog.Info($"{AppName} {DisplayVersion} starting base='{AppContext.BaseDirectory}' process='{Environment.ProcessPath}' args='{RdcLog.SafeArgs(args)}'");
         try
         {
             RdcLog.Info($"parsed options listen='{options.ListenPrefix}' port={options.Port} refresh={options.Refresh.TotalSeconds:N1}s history={options.History.TotalMinutes:N0}m token={(string.IsNullOrWhiteSpace(options.Token) ? "none" : "set")}");
             using var cts = new CancellationTokenSource();
             using var firewallRule = RdcFirewallRule.Ensure(options.Port);
-            using var collector = new Collector(new Options(options.Refresh, options.History, false, true, false, options.Port, options.Refresh, null, null, null, null, options.DebugLog, options.DebugCounters, false, false, null));
+            using var collector = new Collector(new Options(options.Refresh, options.History, false, true, false, options.Port, options.Refresh, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(60), null, null, null, null, null, false, options.DebugLog, options.DebugCounters, false, false, null));
             var current = Snapshot.Empty;
             var firstSample = true;
             var sampler = Task.Run(async () =>
@@ -141,7 +142,7 @@ internal static class Program
 
             if (path.Equals("/snapshot", StringComparison.OrdinalIgnoreCase) || path.Equals("/", StringComparison.OrdinalIgnoreCase))
             {
-                var snapshot = readSnapshot();
+                var snapshot = readSnapshot() with { RdcCollectorVersion = DisplayVersion };
                 RdcLog.Info($"snapshot requested loading={snapshot.Loading} at={snapshot.At:HH:mm:ss} hosts={snapshot.Hosts.Length} vms={snapshot.Vms.Length} events={snapshot.Events.Length}");
                 await WriteJson(context.Response, snapshot).ConfigureAwait(false);
                 return;
@@ -189,7 +190,7 @@ internal static class Program
     }
 
 #else
-    public const string DisplayVersion = "0.8.5+20260624.0189";
+    public const string DisplayVersion = "0.9.0+20260629.0202";
     public const string AppName = "hvtop";
 
     public static async Task<int> Main(string[] args)
@@ -209,6 +210,7 @@ internal static class Program
             return options.ParseError is null ? 0 : 2;
         }
         RdcLog.Configure(options.DebugLog, "hvtop.log");
+        DebugCounterLog.Configure(options.DebugCounters, "hvtop-debug.log");
         RdcLog.Info($"{AppName} {DisplayVersion} starting base='{AppContext.BaseDirectory}' process='{Environment.ProcessPath}' args='{RdcLog.SafeArgs(args)}'");
         using var cts = new CancellationTokenSource();
         using var collector = new Collector(options);
