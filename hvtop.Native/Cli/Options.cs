@@ -1,6 +1,6 @@
 namespace hvtop.Native;
 
-internal sealed record RdcOptions(TimeSpan Refresh, TimeSpan History, int Port, string ListenPrefix, string Token, bool DebugLog, bool DebugCounters, bool ShowHelp, bool ShowVersion, string? ParseError)
+internal sealed record RdcOptions(TimeSpan Refresh, TimeSpan History, int Port, string ListenPrefix, string Token, bool DebugLog, bool DebugCounters, bool InstallService, bool UninstallService, bool RunService, bool ShowHelp, bool ShowVersion, string? ParseError)
 {
     public static string HelpText =>
         """
@@ -16,6 +16,8 @@ internal sealed record RdcOptions(TimeSpan Refresh, TimeSpan History, int Port, 
           --history <minutes>   History window. Default: 15
           --token <value>       Required token for incoming requests.
           --debug-log           Write hvtop-rdc.log beside the executable.
+          --install-service     Install hvtop-rdc as a Windows service.
+          --uninstall-service   Remove the hvtop-rdc Windows service.
           --help                Show this help.
           --version             Show version and exit.
         """;
@@ -29,6 +31,9 @@ internal sealed record RdcOptions(TimeSpan Refresh, TimeSpan History, int Port, 
         var token = string.Empty;
         var debugLog = false;
         var debugCounters = false;
+        var installService = false;
+        var uninstallService = false;
+        var runService = false;
         var showHelp = false;
         var showVersion = false;
         string? error = null;
@@ -75,6 +80,12 @@ internal sealed record RdcOptions(TimeSpan Refresh, TimeSpan History, int Port, 
                 debugLog = true;
             else if (arg.Equals("--debug-counters", StringComparison.OrdinalIgnoreCase))
                 debugCounters = true;
+            else if (arg.Equals("--install-service", StringComparison.OrdinalIgnoreCase))
+                installService = true;
+            else if (arg.Equals("--uninstall-service", StringComparison.OrdinalIgnoreCase))
+                uninstallService = true;
+            else if (arg.Equals("--service", StringComparison.OrdinalIgnoreCase))
+                runService = true;
             else
             {
                 error = $"Unknown option: {arg}";
@@ -85,8 +96,10 @@ internal sealed record RdcOptions(TimeSpan Refresh, TimeSpan History, int Port, 
         listen ??= $"http://+:{port}/";
         if (!listen.EndsWith("/", StringComparison.Ordinal))
             listen += "/";
+        if (installService && uninstallService)
+            error = "--install-service cannot be combined with --uninstall-service";
 
-        return new RdcOptions(refresh, history, port, listen, token, debugLog, debugCounters, showHelp, showVersion, error);
+        return new RdcOptions(refresh, history, port, listen, token, debugLog, debugCounters, installService, uninstallService, runService, showHelp, showVersion, error);
     }
 }
 

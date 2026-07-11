@@ -1,4 +1,4 @@
 namespace hvtop.Native;
 
-internal sealed record RemoteSnapshot(string NodeName, Snapshot Snapshot);
+internal sealed record RemoteSnapshot(string NodeName, Snapshot Snapshot, bool SignalLost);
 

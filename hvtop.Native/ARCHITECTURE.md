@@ -17,7 +17,7 @@ This keeps slow collection from freezing keyboard input.
 ## Current Native Collectors
 
 - Host CPU: PDH `\Processor(_Total)\% Processor Time`
-- Host memory: PDH `\Memory\% Committed Bytes In Use`
+- Host memory: physical RAM in use from `GlobalMemoryStatusEx` total memory and PDH `\Memory\Available Bytes`
 - Host storage throughput: PDH `\PhysicalDisk(_Total)\Disk Bytes/sec`
 - Host IOPS: PDH `\PhysicalDisk(_Total)\Disk Transfers/sec`
 - Host queue depth: PDH `\PhysicalDisk(_Total)\Current Disk Queue Length`

@@ -76,13 +76,14 @@ internal sealed class Collector : IDisposable
         var stepStarted = Stopwatch.GetTimestamp();
         pdh.Collect();
         var hostCpu = cpu.Read();
-        var hostMem = memory.Read();
+        var committedMemPercent = memory.Read();
         var totalMemBytes = Native.GetPhysicalMemoryBytes();
         var availableMemBytes = memoryAvailableBytes.Read();
         var modifiedMemBytes = memoryModifiedBytes.Read();
         var standbyMemBytes = memoryStandbyNormalBytes.Read() + memoryStandbyReserveBytes.Read() + memoryStandbyCoreBytes.Read();
         var kernelMemBytes = memoryPoolPagedBytes.Read() + memoryPoolNonpagedBytes.Read();
         var inUseMemBytes = totalMemBytes - availableMemBytes;
+        var hostMem = ComputePhysicalMemoryPercent(totalMemBytes, inUseMemBytes, committedMemPercent);
         var processMemBytes = inUseMemBytes - kernelMemBytes - modifiedMemBytes;
         var freeMemBytes = availableMemBytes - standbyMemBytes;
         var hostRam = new HostMemoryBreakdown(
@@ -491,6 +492,14 @@ internal sealed class Collector : IDisposable
 
     private static double ClampMemoryBytes(double value)
         => double.IsNaN(value) || double.IsInfinity(value) ? double.NaN : Math.Max(0, value);
+
+    private static double ComputePhysicalMemoryPercent(ulong totalMemBytes, double inUseMemBytes, double fallbackPercent)
+    {
+        if (totalMemBytes == 0 || double.IsNaN(inUseMemBytes) || double.IsInfinity(inUseMemBytes))
+            return fallbackPercent;
+
+        return Math.Clamp(100.0 * ClampMemoryBytes(inUseMemBytes) / totalMemBytes, 0, 100);
+    }
 
     private Snapshot CollectRemoteOnly()
     {

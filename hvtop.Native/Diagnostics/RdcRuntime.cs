@@ -103,6 +103,9 @@ internal sealed class RdcFirewallRule : IDisposable
 
     public string Status { get; }
 
+    public static RdcFirewallRule Preserve(int port)
+        => new($"hvtop-rdc TCP {port}", "permanent-rule", false);
+
     public static RdcFirewallRule Ensure(int port)
     {
         var ruleName = $"hvtop-rdc TCP {port}";
@@ -125,6 +128,42 @@ internal sealed class RdcFirewallRule : IDisposable
         {
             RdcLog.Info($"firewall rule setup failed: {ex}");
             return new RdcFirewallRule(ruleName, "allow-rule-failed", false);
+        }
+    }
+
+    public static void EnsurePermanent(int port)
+    {
+        var ruleName = $"hvtop-rdc TCP {port}";
+        try
+        {
+            RdcLog.Info($"firewall permanent rule check rule='{ruleName}' port={port}");
+            if (!FirewallEnabled())
+            {
+                RdcLog.Info("firewall disabled, permanent rule not needed");
+                return;
+            }
+
+            RunNetsh($"advfirewall firewall delete rule name=\"{ruleName}\"");
+            var ok = RunNetsh($"advfirewall firewall add rule name=\"{ruleName}\" dir=in action=allow protocol=TCP localport={port} enable=yes profile=any");
+            RdcLog.Info($"firewall permanent add rule result={(ok ? "ok" : "failed")}");
+        }
+        catch (Exception ex)
+        {
+            RdcLog.Info($"firewall permanent rule setup failed: {ex}");
+        }
+    }
+
+    public static void RemovePermanent(int port)
+    {
+        var ruleName = $"hvtop-rdc TCP {port}";
+        try
+        {
+            RdcLog.Info($"firewall permanent rule removal rule='{ruleName}' port={port}");
+            RunNetsh($"advfirewall firewall delete rule name=\"{ruleName}\"");
+        }
+        catch (Exception ex)
+        {
+            RdcLog.Info($"firewall permanent rule removal failed: {ex.Message}");
         }
     }
 

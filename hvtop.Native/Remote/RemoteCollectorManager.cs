@@ -127,7 +127,7 @@ internal sealed class RemoteCollectorManager : IDisposable
         {
             return sessions.Values
                 .Where(s => s.Latest is not null)
-                .Select(s => new RemoteSnapshot(s.NodeName, s.Latest!))
+                .Select(s => new RemoteSnapshot(s.NodeName, s.Latest!, IsSignalLost(s)))
                 .ToArray();
         }
     }
@@ -177,9 +177,14 @@ internal sealed class RemoteCollectorManager : IDisposable
                     return "idle";
 
                 var total = sessions.Count;
-                var connected = sessions.Values.Count(s => s.Latest is not null && !s.Cts.IsCancellationRequested);
+                var los = sessions.Values.Count(IsSignalLost);
+                var connected = sessions.Values.Count(s => s.Latest is not null && !s.Cts.IsCancellationRequested && !IsSignalLost(s));
                 var failed = sessions.Values.Count(s => s.Cts.IsCancellationRequested && s.Latest is null);
                 var polling = sessions.Values.Count(s => s.PollFailures > 0 && !s.Cts.IsCancellationRequested);
+                if (los == total)
+                    return total == 1 ? "LOS" : $"LOS {los}/{total}";
+                if (los > 0)
+                    return $"LOS {los}/{total}";
                 if (connected == total)
                     return total == 1 ? "connected" : $"connected {connected}/{total}";
                 if (connected > 0)
@@ -204,9 +209,12 @@ internal sealed class RemoteCollectorManager : IDisposable
                        ?? item.Snapshot.Hosts.FirstOrDefault(h => !double.IsNaN(h.Cpu.Current))
                        ?? item.Snapshot.Hosts.FirstOrDefault();
             if (host is not null)
-                rows[host.Name] = rows.TryGetValue(host.Name, out var previous)
+            {
+                var merged = rows.TryGetValue(host.Name, out var previous)
                     ? PreserveFiniteHostCurrents(previous, host)
                     : host;
+                rows[host.Name] = item.SignalLost ? merged with { Status = "LOS" } : merged;
+            }
         }
 
         return rows.Values.OrderBy(h => h.Name, StringComparer.OrdinalIgnoreCase).ToArray();
@@ -241,7 +249,7 @@ internal sealed class RemoteCollectorManager : IDisposable
     public static VmRow[] MergeVms(VmRow[] local, RemoteSnapshot[] remote)
     {
         return local
-            .Concat(remote.SelectMany(r => r.Snapshot.Vms))
+            .Concat(remote.SelectMany(r => r.Snapshot.Vms.Select(vm => RemoteVmRow(r, vm))))
             .Where(vm => !string.IsNullOrWhiteSpace(vm.Name))
             .GroupBy(vm => $"{vm.HostName}\0{vm.Name}", StringComparer.OrdinalIgnoreCase)
             .Select(g => g.Last())
@@ -252,7 +260,7 @@ internal sealed class RemoteCollectorManager : IDisposable
     public static DiskRow[] MergeDisks(DiskRow[] local, RemoteSnapshot[] remote)
     {
         return local
-            .Concat(remote.SelectMany(r => r.Snapshot.Disks.Select(d => string.IsNullOrWhiteSpace(d.HostName) ? d with { HostName = r.NodeName } : d)))
+            .Concat(remote.SelectMany(r => r.Snapshot.Disks.Select(d => RemoteDiskRow(r, d))))
             .Where(disk => !string.IsNullOrWhiteSpace(disk.Name))
             .GroupBy(disk => $"{disk.HostName}\0{disk.Name}", StringComparer.OrdinalIgnoreCase)
             .Select(g => g.Last())
@@ -264,7 +272,7 @@ internal sealed class RemoteCollectorManager : IDisposable
     public static PhysicalDiskRow[] MergePhysicalDisks(PhysicalDiskRow[] local, RemoteSnapshot[] remote)
     {
         return local
-            .Concat(remote.SelectMany(r => r.Snapshot.PhysicalDisks.Select(d => string.IsNullOrWhiteSpace(d.HostName) ? d with { HostName = r.NodeName } : d)))
+            .Concat(remote.SelectMany(r => r.Snapshot.PhysicalDisks.Select(d => RemotePhysicalDiskRow(r, d))))
             .Where(disk => !string.IsNullOrWhiteSpace(disk.Name))
             .GroupBy(disk => $"{disk.HostName}\0{disk.Name}", StringComparer.OrdinalIgnoreCase)
             .Select(g => g.Last())
@@ -276,7 +284,7 @@ internal sealed class RemoteCollectorManager : IDisposable
     public static NetworkSwitchRow[] MergeNetworkSwitches(NetworkSwitchRow[] local, RemoteSnapshot[] remote)
     {
         return local
-            .Concat(remote.SelectMany(r => r.Snapshot.NetworkSwitches.Select(n => string.IsNullOrWhiteSpace(n.HostName) ? n with { HostName = r.NodeName } : n)))
+            .Concat(remote.SelectMany(r => r.Snapshot.NetworkSwitches.Select(n => RemoteNetworkSwitchRow(r, n))))
             .Where(network => !string.IsNullOrWhiteSpace(network.Name))
             .GroupBy(network => $"{network.HostName}\0{network.Name}", StringComparer.OrdinalIgnoreCase)
             .Select(g => g.Last())
@@ -288,13 +296,43 @@ internal sealed class RemoteCollectorManager : IDisposable
     public static NetworkRow[] MergeNetworks(NetworkRow[] local, RemoteSnapshot[] remote)
     {
         return local
-            .Concat(remote.SelectMany(r => r.Snapshot.Networks.Select(n => string.IsNullOrWhiteSpace(n.HostName) ? n with { HostName = r.NodeName } : n)))
+            .Concat(remote.SelectMany(r => r.Snapshot.Networks.Select(n => RemoteNetworkRow(r, n))))
             .Where(network => !string.IsNullOrWhiteSpace(network.Name))
             .GroupBy(network => $"{network.HostName}\0{network.Name}", StringComparer.OrdinalIgnoreCase)
             .Select(g => g.Last())
             .OrderBy(network => network.HostName, StringComparer.OrdinalIgnoreCase)
             .ThenBy(network => network.Name, StringComparer.OrdinalIgnoreCase)
             .ToArray();
+    }
+
+    private static VmRow RemoteVmRow(RemoteSnapshot remote, VmRow vm)
+    {
+        var row = string.IsNullOrWhiteSpace(vm.HostName) ? vm with { HostName = remote.NodeName } : vm;
+        return remote.SignalLost ? row with { Status = "LOS" } : row;
+    }
+
+    private static DiskRow RemoteDiskRow(RemoteSnapshot remote, DiskRow disk)
+    {
+        var row = string.IsNullOrWhiteSpace(disk.HostName) ? disk with { HostName = remote.NodeName } : disk;
+        return remote.SignalLost ? row with { Status = "LOS" } : row;
+    }
+
+    private static PhysicalDiskRow RemotePhysicalDiskRow(RemoteSnapshot remote, PhysicalDiskRow disk)
+    {
+        var row = string.IsNullOrWhiteSpace(disk.HostName) ? disk with { HostName = remote.NodeName } : disk;
+        return remote.SignalLost ? row with { Status = "LOS" } : row;
+    }
+
+    private static NetworkSwitchRow RemoteNetworkSwitchRow(RemoteSnapshot remote, NetworkSwitchRow network)
+    {
+        var row = string.IsNullOrWhiteSpace(network.HostName) ? network with { HostName = remote.NodeName } : network;
+        return remote.SignalLost ? row with { Status = "LOS" } : row;
+    }
+
+    private static NetworkRow RemoteNetworkRow(RemoteSnapshot remote, NetworkRow network)
+    {
+        var row = string.IsNullOrWhiteSpace(network.HostName) ? network with { HostName = remote.NodeName } : network;
+        return remote.SignalLost ? row with { Status = "LOS" } : row;
     }
 
     public static VmTopologyRow[] MergeTopology(VmTopologyRow[] local, RemoteSnapshot[] remote)
@@ -317,6 +355,7 @@ internal sealed class RemoteCollectorManager : IDisposable
             {
                 if (!session.Deployed)
                 {
+                    var deployedNow = false;
                     if (SkipDeployFor(session.Target))
                     {
                         if (string.IsNullOrWhiteSpace(session.Target.Token) && string.IsNullOrWhiteSpace(options.RdcToken))
@@ -325,13 +364,33 @@ internal sealed class RemoteCollectorManager : IDisposable
                     }
                     else
                     {
-                        SetState(session, "deploying");
-                        DeployAndStart(session);
+                        var existing = await TryPollExistingAsync(session).ConfigureAwait(false);
+                        if (existing is not null)
+                        {
+                            session.ManagedDeployment = false;
+                            session.Deployed = true;
+                            session.DeployedAt = DateTime.UtcNow;
+                            session.RedeployRequested = false;
+                            CheckRemoteVersion(session, existing);
+                            lock (gate)
+                                session.Latest = existing;
+                            session.PollFailures = 0;
+                            session.FirstDataAt ??= DateTime.UtcNow;
+                            session.LastDataAt = DateTime.UtcNow;
+                            SetState(session, "existing");
+                        }
+                        else
+                        {
+                            SetState(session, "deploying");
+                            DeployAndStart(session);
+                            session.ManagedDeployment = true;
+                            deployedNow = true;
+                        }
                     }
                     session.Deployed = true;
                     session.DeployedAt = DateTime.UtcNow;
                     session.RedeployRequested = false;
-                    if (!SkipDeployFor(session.Target))
+                    if (deployedNow)
                         SetState(session, "started");
                 }
 
@@ -340,6 +399,7 @@ internal sealed class RemoteCollectorManager : IDisposable
                 lock (gate)
                     session.Latest = snapshot;
                 session.PollFailures = 0;
+                session.SignalLostLogged = false;
                 session.FirstDataAt ??= DateTime.UtcNow;
                 session.LastDataAt = DateTime.UtcNow;
                 SetState(session, "connected");
@@ -350,6 +410,7 @@ internal sealed class RemoteCollectorManager : IDisposable
                 session.PollEndpoint = null;
                 var tcpProbe = await TcpProbeAsync(session.PollHost ?? session.NodeName, PortFor(session), options.RdcTimeout, session.Cts.Token).ConfigureAwait(false);
                 SetState(session, "poll-error", $"HTTP poll failed ({session.PollFailures}): {Trim(ex.Message, 100)}; TCP probe {tcpProbe}");
+                MaybeLogSignalLost(session);
                 MaybeScheduleRedeploy(session);
             }
             catch (TaskCanceledException ex) when (!session.Cts.IsCancellationRequested)
@@ -358,6 +419,7 @@ internal sealed class RemoteCollectorManager : IDisposable
                 session.PollEndpoint = null;
                 var tcpProbe = await TcpProbeAsync(session.PollHost ?? session.NodeName, PortFor(session), options.RdcTimeout, session.Cts.Token).ConfigureAwait(false);
                 SetState(session, "poll-error", $"HTTP poll timed out ({session.PollFailures}): {Trim(ex.Message, 100)}; TCP probe {tcpProbe}");
+                MaybeLogSignalLost(session);
                 MaybeScheduleRedeploy(session);
             }
             catch (Exception ex) when (IsCredentialFailure(ex))
@@ -403,6 +465,33 @@ internal sealed class RemoteCollectorManager : IDisposable
         session.PollingLogged = false;
         session.PollFailures = 0;
         Enqueue("WARN", $"RDC {session.NodeName}: deployed but no data received for {NoDataRedeployAfter.TotalMinutes:N0} minutes; redeploying remote collector");
+    }
+
+    private void MaybeLogSignalLost(RemoteNodeSession session)
+    {
+        if (session.SignalLostLogged || session.Latest is null || !IsSignalLost(session))
+            return;
+
+        session.SignalLostLogged = true;
+        var age = session.LastDataAt is null
+            ? "unknown"
+            : $"{Math.Max(0, (int)Math.Round((DateTime.UtcNow - session.LastDataAt.Value).TotalSeconds, MidpointRounding.AwayFromZero))}s";
+        Enqueue("WARN", $"RDC {session.NodeName}: LOS, keeping last snapshot visible; last successful sample age {age}");
+    }
+
+    private bool IsSignalLost(RemoteNodeSession session)
+    {
+        if (session.Latest is null)
+            return false;
+        if (session.Cts.IsCancellationRequested)
+            return true;
+        if (session.PollFailures >= 3)
+            return true;
+        if (session.LastDataAt is null)
+            return false;
+
+        var staleAfterSeconds = Math.Max(10, (options.RemoteRefresh.TotalSeconds * 3) + options.RdcTimeout.TotalSeconds);
+        return DateTime.UtcNow - session.LastDataAt.Value > TimeSpan.FromSeconds(staleAfterSeconds);
     }
 
     private void DeployAndStart(RemoteNodeSession session)
@@ -459,6 +548,25 @@ internal sealed class RemoteCollectorManager : IDisposable
         }
 
         Enqueue("INFO", $"RDC {session.NodeName}: remote CIM process start requested using {CredentialMode(session.Target)}");
+    }
+
+    private async Task<Snapshot?> TryPollExistingAsync(RemoteNodeSession session)
+    {
+        try
+        {
+            SetState(session, "preflight");
+            var snapshot = await PollAsync(session).ConfigureAwait(false);
+            Enqueue("INFO", $"RDC {session.NodeName}: existing hvtop-rdc answered on TCP/{PortFor(session)}; deploy skipped");
+            return snapshot;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or OperationCanceledException or InvalidOperationException)
+        {
+            session.PollEndpoint = null;
+            session.PollHost = null;
+            session.PollingLogged = false;
+            Enqueue("INFO", $"RDC {session.NodeName}: no reusable hvtop-rdc found on TCP/{PortFor(session)} ({Trim(ex.Message, 100)}); deploying");
+            return null;
+        }
     }
 
     private void StopRemoteProcess(RemoteNodeSession session)
@@ -680,12 +788,14 @@ internal sealed class RemoteCollectorManager : IDisposable
         var message = state switch
         {
             "deploying" => $"RDC {session.NodeName}: deploying hvtop-rdc",
+            "preflight" => $"RDC {session.NodeName}: checking for existing hvtop-rdc on TCP/{PortFor(session)}",
+            "existing" => $"RDC {session.NodeName}: using existing hvtop-rdc on TCP/{PortFor(session)}",
             "skip-deploy" => $"RDC {session.NodeName}: skip deploy enabled, polling existing hvtop-rdc on TCP/{PortFor(session)}",
             "checking" => $"RDC {session.NodeName}: checking CIM access and stopping old hvtop-rdc process if present using {CredentialMode(session.Target)}",
             "copying" => $"RDC {session.NodeName}: testing ADMIN$ access and copying hvtop-rdc.exe using {CredentialMode(session.Target)}",
             "starting" => $"RDC {session.NodeName}: starting remote collector through CIM using {CredentialMode(session.Target)}",
             "started" => $"RDC {session.NodeName}: deployed hvtop-rdc on TCP/{PortFor(session)}",
-            "connected" => $"RDC {session.NodeName}: connected, polling every {options.RemoteRefresh.TotalSeconds:N0}s",
+            "connected" => $"RDC {session.NodeName}: connected version {RemoteVersionForLog(session)}, polling every {options.RemoteRefresh.TotalSeconds:N0}s",
             "poll-error" => $"RDC {session.NodeName}: {detail}; keeping remote collector running",
             "auth-error" => AuthFailureMessage(session),
             "remote-error" => RemoteFailureMessage(session, detail),
@@ -698,6 +808,11 @@ internal sealed class RemoteCollectorManager : IDisposable
         => session.Target.Source.Equals("config", StringComparison.OrdinalIgnoreCase) && session.Target.LineNumber is { } line
             ? $"RDC config line {line} skipped: Invalid credentials."
             : $"RDC {session.NodeName}: invalid credentials; target skipped.";
+
+    private static string RemoteVersionForLog(RemoteNodeSession session)
+        => string.IsNullOrWhiteSpace(session.Latest?.RdcCollectorVersion)
+            ? "unknown"
+            : session.Latest.RdcCollectorVersion;
 
     private string RemoteFailureMessage(RemoteNodeSession session, string detail)
         => detail.Contains("timed out", StringComparison.OrdinalIgnoreCase)
@@ -844,6 +959,11 @@ internal sealed class RemoteCollectorManager : IDisposable
             Enqueue("INFO", $"RDC {session.NodeName}: skip deploy target left running");
             return;
         }
+        if (!session.ManagedDeployment)
+        {
+            Enqueue("INFO", $"RDC {session.NodeName}: existing collector left running");
+            return;
+        }
 
         try
         {
@@ -893,12 +1013,14 @@ internal sealed class RemoteCollectorManager : IDisposable
         public Task? Worker { get; set; }
         public Snapshot? Latest { get; set; }
         public bool Deployed { get; set; }
+        public bool ManagedDeployment { get; set; }
         public DateTime DeployedAt { get; set; } = DateTime.UtcNow;
         public DateTime? FirstDataAt { get; set; }
         public DateTime? LastDataAt { get; set; }
         public bool PollingLogged { get; set; }
         public bool RedeployRequested { get; set; }
         public bool VersionWarningLogged { get; set; }
+        public bool SignalLostLogged { get; set; }
         public int PollFailures { get; set; }
         public string? PollHost { get; set; }
         public string? PollEndpoint { get; set; }

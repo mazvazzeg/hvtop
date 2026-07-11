@@ -15,7 +15,7 @@ namespace hvtop.Native;
 internal static class Program
 {
 #if RDC
-    public const string DisplayVersion = "0.9.0-rdc+20260629.0202";
+    public const string DisplayVersion = "0.9.1-rdc+20260712.0210";
     public const string AppName = "hvtop-rdc";
 
     public static async Task<int> Main(string[] args)
@@ -36,12 +36,34 @@ internal static class Program
         }
         RdcLog.Configure(options.DebugLog, "hvtop-rdc.log");
         DebugCounterLog.Configure(options.DebugCounters, "hvtop-debug.log");
+        if (options.InstallService)
+            return RdcServiceInstaller.Install(options, args);
+        if (options.UninstallService)
+            return RdcServiceInstaller.Uninstall(options);
+        if (options.RunService)
+        {
+            System.ServiceProcess.ServiceBase.Run(new RdcWindowsService(args));
+            return 0;
+        }
+
         RdcLog.Info($"{AppName} {DisplayVersion} starting base='{AppContext.BaseDirectory}' process='{Environment.ProcessPath}' args='{RdcLog.SafeArgs(args)}'");
+        return await RunRdcAsync(options, CancellationToken.None, writeConsole: true, manageFirewallRule: true).ConfigureAwait(false);
+    }
+
+    internal static async Task<int> RunRdcAsync(RdcOptions options, CancellationToken stopToken, bool writeConsole, bool manageFirewallRule)
+    {
         try
         {
             RdcLog.Info($"parsed options listen='{options.ListenPrefix}' port={options.Port} refresh={options.Refresh.TotalSeconds:N1}s history={options.History.TotalMinutes:N0}m token={(string.IsNullOrWhiteSpace(options.Token) ? "none" : "set")}");
             using var cts = new CancellationTokenSource();
-            using var firewallRule = RdcFirewallRule.Ensure(options.Port);
+            using var externalStop = stopToken.Register(() =>
+            {
+                RdcLog.Info("external stop requested");
+                try { cts.Cancel(); } catch { }
+            });
+            using var firewallRule = manageFirewallRule
+                ? RdcFirewallRule.Ensure(options.Port)
+                : RdcFirewallRule.Preserve(options.Port);
             using var collector = new Collector(new Options(options.Refresh, options.History, false, true, false, options.Port, options.Refresh, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(60), null, null, null, null, null, false, options.DebugLog, options.DebugCounters, false, false, null));
             var current = Snapshot.Empty;
             var firstSample = true;
@@ -82,7 +104,8 @@ internal static class Program
                 try { listener.Stop(); } catch (Exception ex) { RdcLog.Info($"listener stop failed: {ex.Message}"); }
             });
             RdcLog.Info("listener started");
-            Console.WriteLine($"{AppName} {DisplayVersion} listening on {options.ListenPrefix} firewall={firewallRule.Status}");
+            if (writeConsole)
+                Console.WriteLine($"{AppName} {DisplayVersion} listening on {options.ListenPrefix} firewall={firewallRule.Status}");
 
             while (!cts.IsCancellationRequested)
             {
@@ -190,7 +213,7 @@ internal static class Program
     }
 
 #else
-    public const string DisplayVersion = "0.9.0+20260629.0202";
+    public const string DisplayVersion = "0.9.1+20260712.0210";
     public const string AppName = "hvtop";
 
     public static async Task<int> Main(string[] args)

@@ -98,6 +98,7 @@ dotnet run -- --refresh 1 --history 15
 dotnet run -- --rdc-host HV01 --rdc-user DOMAIN\AdminUser --rdc-password "secret"
 dotnet run -- --rdc-config .\hvtop-rdc.conf --rdc-timeout 5 --rdc-copy-timeout 60
 dotnet run -- --rdc-host HV01 --rdc-token "shared-secret"
+.\hvtop-rdc.exe --install-service --port 54321 --token "shared-secret"
 dotnet run -- --rdc-disable
 dotnet run -- --ldc-disable --rdc-host HV01
 dotnet run -- --debug-log
@@ -139,6 +140,8 @@ dotnet run -- --smoke
 --history <minutes>        History window. Default: 15
 --token <value>            Required token for incoming requests.
 --debug-log                Write hvtop-rdc.log beside the executable.
+--install-service          Install hvtop-rdc as a Windows service.
+--uninstall-service        Remove the hvtop-rdc Windows service.
 --help                     Show help.
 --version                  Show version and exit.
 ```
@@ -254,11 +257,15 @@ Outside a cluster, an admin workstation can target one remote host explicitly:
 hvtop.exe --rdc-host HV01 --rdc-user DOMAIN\AdminUser --rdc-password "secret"
 ```
 
-When `--rdc-host` is used, hvtop deploys `hvtop-rdc.exe` to that host through
-`ADMIN$`, starts it through CIM or a legacy WMI/DCOM fallback, and merges the
-remote telemetry with the local host view once data arrives. If `--rdc-user` and
-`--rdc-password` are omitted, hvtop uses the current Windows logon context.
-If `--rdc-user` is specified, `--rdc-password` is required.
+When `--rdc-host` is used, hvtop first checks whether the configured TCP port
+already has a reachable `hvtop-rdc` collector that accepts the configured token.
+If that check succeeds, hvtop reuses the existing collector and leaves it
+running when hvtop exits. If nothing reusable is found, hvtop deploys
+`hvtop-rdc.exe` to that host through `ADMIN$`, starts it through CIM or a legacy
+WMI/DCOM fallback, and merges the remote telemetry with the local host view once
+data arrives. If `--rdc-user` and `--rdc-password` are omitted, hvtop uses the
+current Windows logon context. If `--rdc-user` is specified, `--rdc-password` is
+required.
 
 Multiple remote targets can be listed in an RDC config file. By default hvtop
 looks for `hvtop-rdc.conf` beside `hvtop.exe`; use `--rdc-config <path>` to
@@ -340,6 +347,32 @@ start, stop, or delete `hvtop-rdc.exe`; it only polls an already running remote
 collector. In that mode a known token is required through `--rdc-token`,
 `TOKEN` in the config file, or a per-host token field.
 
+`hvtop-rdc.exe` can also be preinstalled as a Windows service on hosts where
+administrators prefer to manage the collector outside hvtop, or where `ADMIN$`
+copy/start is intentionally disabled:
+
+```powershell
+hvtop-rdc.exe --install-service --port 54321 --token "shared-secret"
+hvtop.exe --rdc-host HV01 --rdc-token "shared-secret"
+```
+
+`--install-service` registers the current `hvtop-rdc.exe` path as the
+`hvtop-rdc` service, stores the selected collector arguments in the service
+command line, sets the service to automatic start, starts it immediately, and
+creates a Windows Firewall inbound rule for the selected TCP port when the
+firewall is enabled. Run `hvtop-rdc.exe --uninstall-service --port 54321` to
+stop and remove the service and the matching firewall rule. Additional service
+start parameters can still be passed by the Windows Service Control Manager;
+later arguments override earlier ones in the normal hvtop parser order.
+
+When hvtop reuses an already running RDC collector, the Events pane logs the
+remote collector version, for example `connected version
+0.9.1-rdc+20260712.0210, polling every 1s`. If a remote collector stops
+responding after data was previously received, hvtop keeps the last snapshot
+visible but marks that host and its remote rows as `LOS` (loss of signal), and
+adds `[!]` to the affected hostname in host-aware panels. This makes stale RDC
+data visible without immediately throwing away the last useful sample.
+
 LDC (Local Data Collection) remains enabled by default even when `--rdc-host` is
 specified, so the local host still has useful data if the remote target is
 unavailable. Use `--ldc-disable` for remote-only workstation mode. In that mode
@@ -348,6 +381,12 @@ spelling is accepted as a deprecated alias until hvtop 1.0. If the remote
 collector cannot be deployed or polled, hvtop keeps the TUI open, shows the
 terminal RDC error in the bottom status line, and leaves the Events pane
 available for the detailed failure trail.
+
+Host memory percentage is based on physical memory pressure: total physical RAM
+from Windows and currently unavailable physical memory from the native memory
+sample. The detailed host pane also breaks RAM down into in-use memory,
+processes, kernel, modified pages, standby cache, and free memory so the top-line
+percentage has visible context.
 
 ## Physical Disk Discovery
 

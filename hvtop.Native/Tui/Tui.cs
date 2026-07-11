@@ -731,6 +731,7 @@ internal sealed class Tui
 
     private static int StatusRank(string status) => status.ToUpperInvariant() switch
     {
+        "LOS" => 5,
         "HOT" => 4,
         "BUSY" => 3,
         "OK" => 2,
@@ -973,6 +974,7 @@ internal sealed class Tui
             text += $"  ERROR: {DisplayName(fatalError, Math.Max(20, frameWidth / 3))}";
 
         var activeRdcStatus = snapshot.RdcStatus.Equals("stopping", StringComparison.OrdinalIgnoreCase)
+                              || snapshot.RdcStatus.StartsWith("LOS", StringComparison.OrdinalIgnoreCase)
                               || snapshot.RdcStatus.Equals("checking", StringComparison.OrdinalIgnoreCase)
                               || snapshot.RdcStatus.StartsWith("deploy", StringComparison.OrdinalIgnoreCase)
                               || snapshot.RdcStatus.StartsWith("poll", StringComparison.OrdinalIgnoreCase);
@@ -1001,10 +1003,14 @@ internal sealed class Tui
                 if (drillView == DrillView.HostVms)
                 {
                     var nameWidth = DashboardNameWidth;
+                    var rows = CurrentRows().Cast<VmRow>().ToArray();
+                    var hostName = rows.Any(r => r.Status.Equals("LOS", StringComparison.OrdinalIgnoreCase))
+                        ? $"{selectedHostName} [!]"
+                        : selectedHostName;
                     RenderRows(
-                        Row(Header(DisplayName($"HOST {selectedHostName} -> VMS", nameWidth), nameWidth), Header("VER", VmVersionWidth), HeaderRight("UP", UptimeWidth), DashboardCapacityMetricGroupHeader("CPU"), DashboardCapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
+                        Row(Header(DisplayName($"HOST {hostName} -> VMS", nameWidth), nameWidth), Header("VER", VmVersionWidth), HeaderRight("UP", UptimeWidth), DashboardCapacityMetricGroupHeader("CPU"), DashboardCapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
                         Row(Header(string.Empty, nameWidth), Header(string.Empty, VmVersionWidth), Header(string.Empty, UptimeWidth), DashboardCapacityMetricSubHeader(), DashboardCapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
-                        CurrentRows().Cast<VmRow>().ToArray(),
+                        rows,
                         r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, VmVersionWidth), Cell(r.IsRunning ? UptimeFormatter.FormatShort(r.Uptime) : "OFF", UptimeWidth, true), FmtDashboardWithCapacity(r.Cpu, r.CpuCapacity), FmtDashboardWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
                 }
                 else
@@ -1014,7 +1020,7 @@ internal sealed class Tui
                         Row(Header("HOSTNAME", nameWidth), Header("VER", HostDashboardVersionWidth), HeaderRight("UP", UptimeWidth), DashboardCapacityMetricGroupHeader("CPU"), DashboardCapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
                         Row(Header(string.Empty, nameWidth), Header(string.Empty, HostDashboardVersionWidth), Header(string.Empty, UptimeWidth), DashboardCapacityMetricSubHeader(), DashboardCapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
                         CurrentRows().Cast<HostRow>().ToArray(),
-                        r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(ShortHostVersion(r.Version), HostDashboardVersionWidth), Cell(UptimeFormatter.FormatShort(r.Uptime), UptimeWidth, true), FmtDashboardWithCapacity(r.Cpu, r.CpuCapacity), FmtDashboardWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
+                        r => Row(Cell(DisplayName(HostDisplayName(r), nameWidth), nameWidth), Cell(ShortHostVersion(r.Version), HostDashboardVersionWidth), Cell(UptimeFormatter.FormatShort(r.Uptime), UptimeWidth, true), FmtDashboardWithCapacity(r.Cpu, r.CpuCapacity), FmtDashboardWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
                 }
                 break;
             case Panel.Vms:
@@ -1024,7 +1030,7 @@ internal sealed class Tui
                         Row(Header("HOST", HostColumnWidth), Header("NAME", nameWidth), Header("VER", VmVersionWidth), HeaderRight("UP", UptimeWidth), DashboardCapacityMetricGroupHeader("CPU"), DashboardCapacityMetricGroupHeader("MEM"), GroupHeader("I/O", MetricWidth), GroupHeader("NET", MetricWidth), Header("STA", StatusWidth)),
                         Row(Header(string.Empty, HostColumnWidth), Header(string.Empty, nameWidth), Header(string.Empty, VmVersionWidth), Header(string.Empty, UptimeWidth), DashboardCapacityMetricSubHeader(), DashboardCapacityMetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
                         CurrentRows().Cast<VmRow>().ToArray(),
-                        r => Row(Cell(DisplayName(r.HostName, HostColumnWidth), HostColumnWidth), Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, VmVersionWidth), Cell(r.IsRunning ? UptimeFormatter.FormatShort(r.Uptime) : "OFF", UptimeWidth, true), FmtDashboardWithCapacity(r.Cpu, r.CpuCapacity), FmtDashboardWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
+                        r => Row(Cell(DisplayName(HostDisplayName(r.HostName, r.Status), HostColumnWidth), HostColumnWidth), Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Version, VmVersionWidth), Cell(r.IsRunning ? UptimeFormatter.FormatShort(r.Uptime) : "OFF", UptimeWidth, true), FmtDashboardWithCapacity(r.Cpu, r.CpuCapacity), FmtDashboardWithCapacity(r.Mem, r.MemCapacity), Fmt(r.Io), Fmt(r.Net), Cell(r.Status, StatusWidth)));
                 }
                 break;
             case Panel.Disks:
@@ -1034,7 +1040,7 @@ internal sealed class Tui
                         Row(Header("HOST", HostColumnWidth), Header("NAME", nameWidth), HeaderRight("SIZE", SizeWidth), GroupHeader("FREE", ShortMetricWidth), GroupHeader("I/O", MetricWidth), GroupHeader("IOPS", ShortMetricWidth), GroupHeader("QD", ShortMetricWidth), GroupHeader("LAT", ShortMetricWidth), Header("STA", StatusWidth)),
                         Row(Header(string.Empty, HostColumnWidth), Header(string.Empty, nameWidth), Header(string.Empty, SizeWidth), FreeShortMetricSubHeader(), MetricSubHeader(), ShortMetricSubHeader(), ShortMetricSubHeader(), ShortMetricSubHeader(), Header(string.Empty, StatusWidth)),
                         CurrentRows().Cast<DiskRow>().ToArray(),
-                        r => Row(Cell(DisplayName(r.HostName, HostColumnWidth), HostColumnWidth), Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(PhysicalDiskSizeSummary(r.Size), SizeWidth, true), FmtShort(r.Free), Fmt(r.Io), FmtShort(r.Iops), FmtShort(r.QueueDepth), FmtShort(r.Latency), Cell(r.Status, StatusWidth)));
+                        r => Row(Cell(DisplayName(HostDisplayName(r.HostName, r.Status), HostColumnWidth), HostColumnWidth), Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(PhysicalDiskSizeSummary(r.Size), SizeWidth, true), FmtShort(r.Free), Fmt(r.Io), FmtShort(r.Iops), FmtShort(r.QueueDepth), FmtShort(r.Latency), Cell(r.Status, StatusWidth)));
                 }
                 break;
             case Panel.PhysicalDisks:
@@ -1043,7 +1049,7 @@ internal sealed class Tui
                         Row(Header("HOST", HostColumnWidth), Header("PDID", PdidWidth), Header("TYPE", TypeWidth), HeaderRight("SIZE", SizeWidth), GroupHeader("I/O", MetricWidth), GroupHeader("IOPS", ShortMetricWidth), GroupHeader("QD", ShortMetricWidth), GroupHeader("LAT", ShortMetricWidth), Header("STA", StatusWidth)),
                         Row(Header(string.Empty, HostColumnWidth), Header(string.Empty, PdidWidth), Header(string.Empty, TypeWidth), Header(string.Empty, SizeWidth), MetricSubHeader(), ShortMetricSubHeader(), ShortMetricSubHeader(), ShortMetricSubHeader(), Header(string.Empty, StatusWidth)),
                         CurrentRows().Cast<PhysicalDiskRow>().ToArray(),
-                        r => Row(Cell(DisplayName(r.HostName, HostColumnWidth), HostColumnWidth), Cell(r.PhysicalDiskId, PdidWidth, true), Cell(DisplayName(r.Type, TypeWidth), TypeWidth), Cell(PhysicalDiskSizeSummary(r.Size), SizeWidth, true), Fmt(r.Io), FmtShort(r.Iops), FmtShort(r.QueueDepth), FmtShort(r.Latency), Cell(r.Status, StatusWidth)));
+                        r => Row(Cell(DisplayName(HostDisplayName(r.HostName, r.Status), HostColumnWidth), HostColumnWidth), Cell(r.PhysicalDiskId, PdidWidth, true), Cell(DisplayName(r.Type, TypeWidth), TypeWidth), Cell(PhysicalDiskSizeSummary(r.Size), SizeWidth, true), Fmt(r.Io), FmtShort(r.Iops), FmtShort(r.QueueDepth), FmtShort(r.Latency), Cell(r.Status, StatusWidth)));
                 }
                 break;
             case Panel.Network:
@@ -1052,10 +1058,14 @@ internal sealed class Tui
                     {
                         var nameWidth = DashboardNameWidth;
                         var switchName = CurrentNetworkSwitchDisplayName();
+                        var rows = CurrentRows().Cast<NetworkRow>().ToArray();
+                        var hostName = rows.Any(r => r.Status.Equals("LOS", StringComparison.OrdinalIgnoreCase))
+                            ? $"{selectedHostName} [!]"
+                            : selectedHostName;
                         RenderRows(
-                            Row(Header(DisplayName($"HOST {selectedHostName} -> VSWITCH {switchName} -> PNICS", nameWidth), nameWidth), Header("LINK", LinkWidth), GroupHeader("THR", MetricWidth), GroupHeader("RX", MetricWidth), GroupHeader("TX", MetricWidth), GroupHeader("DROPS", ShortMetricWidth), Header("STA", StatusWidth)),
+                            Row(Header(DisplayName($"HOST {hostName} -> VSWITCH {switchName} -> PNICS", nameWidth), nameWidth), Header("LINK", LinkWidth), GroupHeader("THR", MetricWidth), GroupHeader("RX", MetricWidth), GroupHeader("TX", MetricWidth), GroupHeader("DROPS", ShortMetricWidth), Header("STA", StatusWidth)),
                             Row(Header(string.Empty, nameWidth), Header(string.Empty, LinkWidth), MetricSubHeader(), MetricSubHeader(), MetricSubHeader(), ShortMetricSubHeader(), Header(string.Empty, StatusWidth)),
-                            CurrentRows().Cast<NetworkRow>().ToArray(),
+                            rows,
                             r => Row(Cell(DisplayName(r.Name, nameWidth), nameWidth), Cell(r.Link, LinkWidth), Fmt(r.Throughput), Fmt(r.Rx), Fmt(r.Tx), FmtShort(r.Drops), Cell(r.Status, StatusWidth)));
                     }
                     else
@@ -1065,7 +1075,7 @@ internal sealed class Tui
                             Row(Header("HOST", HostColumnWidth), Header("VSWITCH", nameWidth), Header("UPL", UplinkWidth), Header("LINK", LinkWidth), GroupHeader("THR", MetricWidth), GroupHeader("RX", MetricWidth), GroupHeader("TX", MetricWidth), Header("STA", StatusWidth)),
                             Row(Header(string.Empty, HostColumnWidth), Header(string.Empty, nameWidth), Header(string.Empty, UplinkWidth), Header(string.Empty, LinkWidth), MetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
                             CurrentRows().Cast<NetworkSwitchRow>().ToArray(),
-                            r => Row(Cell(DisplayName(r.HostName, HostColumnWidth), HostColumnWidth), Cell(DisplayName(NetworkSwitchDisplayName(r), nameWidth), nameWidth), Cell(r.Uplinks.Length.ToString(), UplinkWidth, true), Cell(r.Link, LinkWidth), Fmt(r.Throughput), Fmt(r.Rx), Fmt(r.Tx), Cell(r.Status, StatusWidth)));
+                            r => Row(Cell(DisplayName(HostDisplayName(r.HostName, r.Status), HostColumnWidth), HostColumnWidth), Cell(DisplayName(NetworkSwitchDisplayName(r), nameWidth), nameWidth), Cell(r.Uplinks.Length.ToString(), UplinkWidth, true), Cell(r.Link, LinkWidth), Fmt(r.Throughput), Fmt(r.Rx), Fmt(r.Tx), Cell(r.Status, StatusWidth)));
                     }
                 }
                 break;
@@ -1129,6 +1139,14 @@ internal sealed class Tui
         var paren = size.IndexOf('(');
         return paren > 0 ? size[..paren].TrimEnd() : size;
     }
+
+    private static string HostDisplayName(HostRow host)
+        => HostDisplayName(host.Name, host.Status);
+
+    private static string HostDisplayName(string hostName, string status)
+        => status.Equals("LOS", StringComparison.OrdinalIgnoreCase)
+            ? $"{hostName} [!]"
+            : hostName;
 
     private static string ShortHostVersion(string version)
     {
@@ -1497,7 +1515,7 @@ internal sealed class Tui
                 var hostAdapters = HostDetailExtraAdapters(snapshot, host.Name, hostNetworks);
                 var selectableRows = hostVms.Length + hostDisks.Length + hostPhysicalDisks.Length + hostNetworks.Length + hostAdapters.Length;
                 selected = Math.Min(selected, Math.Max(0, selectableRows - 1));
-                Detail(7, "Name", host.Name);
+                Detail(7, "Name", HostDisplayName(host));
                 Detail(8, "Version", host.Version);
                 Detail(9, "Uptime", UptimeFormatter.FormatExact(host.Uptime));
                 DetailScalar(10, string.Empty, string.Empty);
@@ -1894,6 +1912,7 @@ internal sealed class Tui
             .Select((line, index) => new { line, index })
             .FirstOrDefault(item => item.line.SelectionIndex == selected)?.index ?? 0;
         KeepLineVisible(lines.Count, maxLines, selectedLine);
+        KeepSectionHeaderVisible(lines, maxLines, selectedLine);
         var visible = lines.Skip(tableScrollOffset).Take(maxLines).ToArray();
         for (var i = 0; i < visible.Length; i++)
         {
@@ -1926,6 +1945,22 @@ internal sealed class Tui
             tableScrollOffset = selectedLine;
         else if (selectedLine >= tableScrollOffset + maxLines)
             tableScrollOffset = selectedLine - maxLines + 1;
+    }
+
+    private void KeepSectionHeaderVisible(IReadOnlyList<DetailLine> lines, int maxLines, int selectedLine)
+    {
+        if (selectedLine <= 0 || maxLines <= 1 || selectedLine < tableScrollOffset)
+            return;
+
+        var headerLine = selectedLine;
+        while (headerLine > 0 && lines[headerLine].Kind != DetailLineKind.Header)
+            headerLine--;
+
+        if (lines[headerLine].Kind != DetailLineKind.Header || headerLine >= tableScrollOffset)
+            return;
+
+        if (selectedLine - headerLine < maxLines)
+            tableScrollOffset = headerLine;
     }
 
     private void WriteSelectableDetailLine(int y, int index, string text, object row)
@@ -2258,6 +2293,7 @@ internal sealed class Tui
     {
         return status.Trim().ToUpperInvariant() switch
         {
+            "LOS" => ConsoleColor.Red,
             "HOT" => ConsoleColor.Red,
             "OFF" => ConsoleColor.DarkGray,
             "N/A" => ConsoleColor.DarkGray,

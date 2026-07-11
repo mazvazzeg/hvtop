@@ -5,6 +5,7 @@ DELIMITER::
 #COPY-TIMEOUT:120
 #SKIP-DEPLOY
 #TOKEN:random-user-token
+# Use SKIP-DEPLOY with manually installed hvtop-rdc services.
 #HV01:::::
 #HV02:DOMAIN\MegaAdminUser:secretpassword:12345:another-user-token:SKIP-DEPLOY
 #HV03:LocalAdminUser:secretpassword
