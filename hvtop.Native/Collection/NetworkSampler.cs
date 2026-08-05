@@ -8,16 +8,17 @@ internal sealed class NetworkSampler
     {
         var now = DateTime.UtcNow;
         var pdhRates = NetworkPdhSampler.Read();
+        var hyperVAdapterRates = HyperVNetworkPdhSampler.ReadAdapterRates();
         var rdmaRates = RdmaPdhSampler.Read();
         return ReadInterfaceRows()
             .Where(row => row.Type != Native.IF_TYPE_SOFTWARE_LOOPBACK)
-            .Select(row => TryRead(row, now, pdhRates, rdmaRates, out var rate) ? rate : null)
+            .Select(row => TryRead(row, now, pdhRates, hyperVAdapterRates, rdmaRates, out var rate) ? rate : null)
             .Where(rate => rate is not null)
             .Cast<AdapterRate>()
             .ToArray();
     }
 
-    private bool TryRead(MibIfRow2 row, DateTime now, NetworkPdhRate[] pdhRates, RdmaPdhRate[] rdmaRates, out AdapterRate rate)
+    private bool TryRead(MibIfRow2 row, DateTime now, NetworkPdhRate[] pdhRates, HyperVNetworkPdhRate[] hyperVAdapterRates, RdmaPdhRate[] rdmaRates, out AdapterRate rate)
     {
         if (row.InterfaceGuid == Guid.Empty)
         {
@@ -57,6 +58,20 @@ internal sealed class NetworkSampler
             tx = Math.Max(tx, pdhRate.SentBytesPerSecond);
         }
 
+        var hyperVInstance = string.Empty;
+        var hyperVRx = 0d;
+        var hyperVTx = 0d;
+        if (HyperVNetworkPdhSampler.TryMatchAdapter(hyperVAdapterRates, alias, description, out var hyperVRate))
+        {
+            hyperVInstance = hyperVRate.Instance;
+            // These counters are from the virtual adapter's perspective. For a
+            // physical SET member, virtual receive is transmit on the wire.
+            hyperVRx = hyperVRate.SentBytesPerSecond;
+            hyperVTx = hyperVRate.ReceivedBytesPerSecond;
+            rx = Math.Max(rx, hyperVRx);
+            tx = Math.Max(tx, hyperVTx);
+        }
+
         var rdmaInstance = string.Empty;
         var rdmaRx = 0d;
         var rdmaTx = 0d;
@@ -82,6 +97,9 @@ internal sealed class NetworkSampler
             pdhInstance,
             pdhRx,
             pdhTx,
+            hyperVInstance,
+            hyperVRx,
+            hyperVTx,
             rdmaInstance,
             rdmaRx,
             rdmaTx,
@@ -331,6 +349,48 @@ internal sealed record RdmaPdhRate(string Instance, double ReceivedBytesPerSecon
 
 internal static class HyperVNetworkPdhSampler
 {
+    public static HyperVNetworkPdhRate[] ReadAdapterRates()
+        => ReadFamily(
+                "Hyper-V Virtual Network Adapter",
+                @"\Hyper-V Virtual Network Adapter(*)\Bytes/sec",
+                @"\Hyper-V Virtual Network Adapter(*)\Bytes Received/sec",
+                @"\Hyper-V Virtual Network Adapter(*)\Bytes Sent/sec")
+            .Rates;
+
+    public static bool TryMatchAdapter(HyperVNetworkPdhRate[] rates, string alias, string description, out HyperVNetworkPdhRate rate)
+    {
+        var candidates = new[] { alias, description }
+            .Select(NormalizeForMatch)
+            .Where(value => value.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        foreach (var candidate in candidates)
+        {
+            var exact = rates.FirstOrDefault(item => NormalizeForMatch(item.Instance).Equals(candidate, StringComparison.OrdinalIgnoreCase));
+            if (exact is not null)
+            {
+                rate = exact;
+                return true;
+            }
+        }
+
+        var fuzzy = rates
+            .Select(item => new { Rate = item, Key = NormalizeForMatch(item.Instance) })
+            .Where(item => candidates.Any(candidate => item.Key.Contains(candidate, StringComparison.OrdinalIgnoreCase) || candidate.Contains(item.Key, StringComparison.OrdinalIgnoreCase)))
+            .Select(item => item.Rate)
+            .Distinct()
+            .ToArray();
+        if (fuzzy.Length == 1)
+        {
+            rate = fuzzy[0];
+            return true;
+        }
+
+        rate = default!;
+        return false;
+    }
+
     public static Dictionary<string, HyperVNetworkPdhRate> ReadSwitchRates()
     {
         return ReadFamily(
@@ -393,13 +453,26 @@ internal static class HyperVNetworkPdhSampler
 
     private static string NormalizeInstance(string instance)
         => instance.Trim();
+
+    private static string NormalizeForMatch(string value)
+    {
+        Span<char> buffer = stackalloc char[value.Length];
+        var index = 0;
+        foreach (var ch in value)
+        {
+            if (char.IsLetterOrDigit(ch))
+                buffer[index++] = char.ToLowerInvariant(ch);
+        }
+
+        return new string(buffer[..index]);
+    }
 }
 
 internal sealed record HyperVNetworkPdhFamily(string Name, HyperVNetworkPdhRate[] Rates);
 
 internal sealed record HyperVNetworkPdhRate(string Instance, double TotalBytesPerSecond, double ReceivedBytesPerSecond, double SentBytesPerSecond);
 
-internal sealed record AdapterRate(string Name, string Description, string InterfaceId, long LinkSpeedBitsPerSecond, bool IsUp, bool IsHardwareInterface, bool IsVisibleAdapter, double ReceivedBytesPerSecond, double SentBytesPerSecond, double RawReceivedBytesPerSecond, double RawSentBytesPerSecond, string PdhInstance, double PdhReceivedBytesPerSecond, double PdhSentBytesPerSecond, string RdmaInstance, double RdmaReceivedBytesPerSecond, double RdmaSentBytesPerSecond, double DropsPerSecond)
+internal sealed record AdapterRate(string Name, string Description, string InterfaceId, long LinkSpeedBitsPerSecond, bool IsUp, bool IsHardwareInterface, bool IsVisibleAdapter, double ReceivedBytesPerSecond, double SentBytesPerSecond, double RawReceivedBytesPerSecond, double RawSentBytesPerSecond, string PdhInstance, double PdhReceivedBytesPerSecond, double PdhSentBytesPerSecond, string HyperVInstance, double HyperVReceivedBytesPerSecond, double HyperVSentBytesPerSecond, string RdmaInstance, double RdmaReceivedBytesPerSecond, double RdmaSentBytesPerSecond, double DropsPerSecond)
 {
     public double TotalBytesPerSecond => ReceivedBytesPerSecond + SentBytesPerSecond;
     public double RdmaTotalBytesPerSecond => RdmaReceivedBytesPerSecond + RdmaSentBytesPerSecond;

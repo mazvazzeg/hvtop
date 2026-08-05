@@ -30,11 +30,14 @@ internal static class PowerShellRunner
     {
         using var process = new Process();
         process.StartInfo.FileName = "powershell.exe";
-        var encoded = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(command));
+        const string utf8Preamble = "$hvtopUtf8=New-Object System.Text.UTF8Encoding($false); [Console]::OutputEncoding=$hvtopUtf8; $OutputEncoding=$hvtopUtf8; ";
+        var encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(utf8Preamble + command));
         process.StartInfo.Arguments = $"-NoProfile -NonInteractive -EncodedCommand {encoded}";
         process.StartInfo.UseShellExecute = false;
         process.StartInfo.RedirectStandardOutput = true;
         process.StartInfo.RedirectStandardError = true;
+        process.StartInfo.StandardOutputEncoding = Encoding.UTF8;
+        process.StartInfo.StandardErrorEncoding = Encoding.UTF8;
         process.StartInfo.CreateNoWindow = true;
         process.Start();
 

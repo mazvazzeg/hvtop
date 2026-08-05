@@ -1,8 +1,8 @@
 # hvtop
 
 hvtop is a TUI prototype for monitoring Windows and Hyper-V hosts, VMs when
-Hyper-V is present, failover clusters, CSV/storage, physical disks, network, and
-recent events.
+Hyper-V is present, failover clusters, CSV/storage, physical disks, network,
+SMB servers, and recent events.
 It is shaped like `htop` or `esxtop`, but with fast drill-down views and a small
 rolling history buffer for max/spike visibility.
 
@@ -161,6 +161,7 @@ Windows servers.
 - `V`: VMs
 - `D`: CSV/storage
 - `P`: Physical disks
+- `M`: SMB
 - `N`: Network
 - `E`: Events
 - `Up/Down`: move selection
@@ -187,9 +188,9 @@ CLUSTER -> HOSTS -> select host -> host detail -> select VM -> VM detail
 On non-cluster hosts, the flow starts at `HOSTS`. On standard Windows servers
 without Hyper-V, the VM pane is expected to be empty.
 
-The top-level `VMs`, `CSV/storage`, `Physical disks`, and `Network` panes are
-global views. In cluster/RDC mode they include rows from all reporting hosts and
-show a `HOST` column so the source node is visible.
+The top-level `VMs`, `CSV/storage`, `Physical disks`, `Network`, and `SMB` panes
+are global views. In cluster/RDC mode they include rows from all reporting hosts
+and show a `HOST` column so the source node is visible.
 
 Detail panes resolve the selected row from the latest snapshot on every repaint,
 so values continue updating live while you are drilled in.
@@ -202,8 +203,16 @@ hvtop separates live counters from slower discovery work:
   CPU and memory, logical and physical disk throughput/IOPS/queue depth/latency,
   VM CPU/memory/I/O/network counters, Hyper-V virtual switch counters, physical
   NIC counters, and RDMA activity counters.
+- Host CPU utilization is calculated from the individual logical-processor
+  instances of `Processor Information(*)\% Processor Time`, excluding grouped
+  `_Total` instances. This avoids undercounting or overcounting on systems where
+  the older `Processor(*)` object exposes processor groups instead of every
+  logical CPU. Compatible total and utility counters remain fallbacks.
 - Network adapter identity, link state, link speed, and raw byte counters use
-  the Windows IP Helper API.
+  the Windows IP Helper API. Hyper-V virtual-adapter counters provide a fallback
+  for SET member traffic when the physical adapter counters omit switched
+  traffic; receive/transmit directions are translated to the physical-wire
+  perspective before hvtop aggregates the vSwitch.
 - Hyper-V VM inventory, VM configuration, dynamic memory settings, replication
   status, vDisk/vNIC topology, vSwitch topology, SET/LBFO hints, and checkpoint
   state currently use PowerShell-hosted Hyper-V cmdlets and CIM/WMI queries.
@@ -215,6 +224,15 @@ hvtop separates live counters from slower discovery work:
 - Windows software RAID membership detection uses `diskpart` (`list volume` and
   `detail volume`) during inventory refresh, then joins the detected set
   membership to physical disk rows.
+- SMB discovery uses PowerShell-hosted `Get-SmbServerConfiguration`,
+  `Get-SmbShare`, `Get-SmbSession`, and `Get-SmbOpenFile`. SMB share live
+  counters use PDH/perflib `SMB Server Shares` counters. Per-client receive and
+  transmit rates use native Windows TCP EStats for server-side TCP/445
+  connections and aggregate SMB Multichannel connections by client IP. When
+  several users share one client IP, hvtop leaves their rates as `n/a` instead
+  of duplicating traffic. SMB Direct/RDMA and SMB over QUIC traffic are not part
+  of these TCP/445 client rates. Open-file rows show path and open/user counts;
+  per-file I/O still requires a reliable file attribution source.
 - Remote Data Collector deployment uses `ADMIN$` file copy, CIM/WinRM process
   start/stop, and a legacy WMI/DCOM fallback when CIM/WinRM is unavailable.
 
@@ -231,6 +249,7 @@ performance-sensitive metric loop should remain free of PowerShell polling.
 - CSV/storage: host, name, free space, I/O, IOPS, queue depth, latency, status
 - Physical disks: host, PDID, type, size, I/O, IOPS, queue depth, latency, status
 - Network: host, vSwitch or adapter, link, throughput, receive, transmit, drops, status
+- SMB: host, SMB version, shares, users, open files, I/O, receive, transmit, status
 - Events: timestamped status, spike, and collector events
 
 Each metric shows current and max-in-history values as `current | max`. The history
@@ -241,6 +260,26 @@ outside the number. Examples: `999 KB/s`, `1.00 MB/s`, `1.32 GB/s`, `32.2 GB/s`.
 Throughput values scale on binary boundaries: `1024 KB/s` becomes `1.00 MB/s`,
 `1024 MB/s` becomes `1.00 GB/s`, and the same 1024-based rule is used for
 capacity values such as `MB`, `GB`, and `TB`.
+
+## SMB Monitoring
+
+Press `M` to open the global SMB overview. It shows every locally or remotely
+collected server with its active SMB dialects, share/user/open-file counts,
+server I/O, receive/transmit rates, and status. Selecting a server opens a detail
+view containing:
+
+- server identity, Windows version, uptime, and active SMB dialects;
+- SMB1, SMB2+, signing, encryption, SMB over QUIC, Multichannel, RDMA, and
+  leasing/oplock feature state;
+- shares with user/open-file counts and live PDH IOPS/I/O/RX/TX metrics;
+- the ten busiest clients, with open-file counts and TCP/445 RX/TX rates where
+  one SMB user can be mapped unambiguously to the client IP;
+- the ten most widely opened file paths with their distinct-user counts.
+
+Windows does not expose reliable per-user or per-file I/O attribution through
+the SMB inventory cmdlets. hvtop therefore displays `n/a` rather than assigning
+share totals to individual users or files. TCP EStats client rates exclude SMB
+Direct/RDMA and SMB over QUIC traffic.
 
 ## Remote Data Collector
 

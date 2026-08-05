@@ -26,6 +26,8 @@ internal sealed class Tui
     private const int HostDetailBWidth = 14;
     private const int HostDetailMetricWidth = 10;
     private const int HostDetailQueueWidth = 6;
+    private const int SmbDetailClientWidth = 72;
+    private const int SmbDetailFileWidth = 96;
     private const int CountWidth = 5;
     private const int OwnerWidth = 18;
     private const int QuorumWidth = 14;
@@ -122,6 +124,9 @@ internal sealed class Tui
                 return;
             case ConsoleKey.N:
                 SetPanel(Panel.Network);
+                return;
+            case ConsoleKey.M:
+                SetPanel(Panel.Smb);
                 return;
             case ConsoleKey.E:
                 SetPanel(Panel.Events);
@@ -325,6 +330,10 @@ internal sealed class Tui
             PhysicalDiskRow physicalDiskRow => physicalDiskRow.HostName,
             NetworkSwitchRow switchRow => switchRow.HostName,
             NetworkRow networkRow => networkRow.HostName,
+            SmbHostRow smbHostRow => smbHostRow.HostName,
+            SmbShareRow smbShareRow => smbShareRow.HostName,
+            SmbClientRow smbClientRow => smbClientRow.HostName,
+            SmbOpenFileRow smbOpenFileRow => smbOpenFileRow.HostName,
             _ => selectedHostName
         };
         detailPanel = row is VmRow ? Panel.Vms : panel;
@@ -531,6 +540,8 @@ internal sealed class Tui
         IReadOnlyList<object> rows;
         if (drillView == DrillView.Detail && ResolveDetailTarget() is HostRow host)
             rows = HostDetailRows(s, host.Name);
+        else if (drillView == DrillView.Detail && ResolveDetailTarget() is SmbHostRow smb)
+            rows = SmbDetailRows(s, smb.HostName);
         else if (drillView == DrillView.Detail && ResolveDetailTarget() is VmRow vm)
             rows = GetVmDisks(vm, s).Cast<object>().Concat(GetVmNetworkAdapters(vm, s)).ToArray();
         else if (drillView == DrillView.Detail && ResolveDetailTarget() is VDiskDetailRow or VmNetworkDetailRow)
@@ -547,6 +558,7 @@ internal sealed class Tui
                 Panel.Disks => s.Disks,
                 Panel.PhysicalDisks => s.PhysicalDisks,
                 Panel.Network => s.NetworkSwitches,
+                Panel.Smb => s.SmbHosts,
                 Panel.Events => s.Events,
                 _ => []
             };
@@ -615,6 +627,7 @@ internal sealed class Tui
             Panel.Disks => [new("HOST", "host"), new("NAME", "name"), new("SIZE", "size"), new("FREE", "free"), new("IO", "i/o"), new("IOPS", "iops"), new("QD", "queue"), new("LAT", "latency"), new("STA", "status")],
             Panel.PhysicalDisks => [new("HOST", "host"), new("PDID", "pdid"), new("TYPE", "type"), new("SIZE", "size"), new("IO", "i/o"), new("IOPS", "iops"), new("QD", "queue"), new("LAT", "latency"), new("STA", "status")],
             Panel.Network => [new("HOST", "host"), new("NAME", "name"), new("UPL", "uplinks"), new("LINK", "link"), new("THR", "throughput"), new("RX", "rx"), new("TX", "tx"), new("STA", "status")],
+            Panel.Smb => [new("HOST", "host"), new("VER", "version"), new("SHR", "shares"), new("USR", "users"), new("OPEN", "open"), new("IO", "i/o"), new("RX", "rx"), new("TX", "tx"), new("STA", "status")],
             Panel.Events => [new("DATE", "date")],
             _ => []
         };
@@ -715,6 +728,53 @@ internal sealed class Tui
             "DROPS" => net.Drops.Current,
             "STA" => StatusRank(net.Status),
             _ => net.Name
+        },
+        SmbHostRow smb => column switch
+        {
+            "HOST" => smb.HostName,
+            "VER" => smb.SmbVersion,
+            "SHR" => smb.ShareCount,
+            "USR" => smb.UserCount,
+            "OPEN" => smb.OpenFileCount,
+            "IO" => smb.Io.Current,
+            "RX" => smb.Rx.Current,
+            "TX" => smb.Tx.Current,
+            "STA" => StatusRank(smb.Status),
+            _ => smb.HostName
+        },
+        SmbShareRow smb => column switch
+        {
+            "NAME" => smb.Name,
+            "USR" => smb.UserCount,
+            "OPEN" => smb.OpenFileCount,
+            "IOPS" => smb.Iops.Current,
+            "IO" => smb.Io.Current,
+            "RX" => smb.Rx.Current,
+            "TX" => smb.Tx.Current,
+            "STA" => StatusRank(smb.Status),
+            _ => smb.Name
+        },
+        SmbClientRow smb => column switch
+        {
+            "NAME" => smb.ClientUser,
+            "OPEN" => smb.OpenFileCount,
+            "IOPS" => smb.Iops.Current,
+            "IO" => smb.Io.Current,
+            "RX" => smb.Rx.Current,
+            "TX" => smb.Tx.Current,
+            "STA" => StatusRank(smb.Status),
+            _ => smb.ClientUser
+        },
+        SmbOpenFileRow smb => column switch
+        {
+            "NAME" => smb.Path,
+            "USR" => smb.UserCount,
+            "IOPS" => smb.Iops.Current,
+            "IO" => smb.Io.Current,
+            "RX" => smb.Rx.Current,
+            "TX" => smb.Tx.Current,
+            "STA" => StatusRank(smb.Status),
+            _ => smb.Path
         },
         EventRow evt => column switch
         {
@@ -926,6 +986,7 @@ internal sealed class Tui
             panel == Panel.Disks ? "[D] CSV / STORAGE" : " D  CSV / STORAGE",
             panel == Panel.PhysicalDisks ? "[P] PHYSICAL" : " P  PHYSICAL",
             panel == Panel.Network ? "[N] NETWORK" : " N  NETWORK",
+            panel == Panel.Smb ? "[M] SMB" : " M  SMB",
             panel == Panel.Events ? "[E] EVENTS" : " E  EVENTS"
         });
     }
@@ -1077,6 +1138,15 @@ internal sealed class Tui
                             CurrentRows().Cast<NetworkSwitchRow>().ToArray(),
                             r => Row(Cell(DisplayName(HostDisplayName(r.HostName, r.Status), HostColumnWidth), HostColumnWidth), Cell(DisplayName(NetworkSwitchDisplayName(r), nameWidth), nameWidth), Cell(r.Uplinks.Length.ToString(), UplinkWidth, true), Cell(r.Link, LinkWidth), Fmt(r.Throughput), Fmt(r.Rx), Fmt(r.Tx), Cell(r.Status, StatusWidth)));
                     }
+                }
+                break;
+            case Panel.Smb:
+            {
+                RenderRows(
+                    Row(Header("HOST", HostColumnWidth), Header("SMB", 10), HeaderRight("SHR", CountWidth), HeaderRight("USR", CountWidth), HeaderRight("OPEN", CountWidth), GroupHeader("IO", MetricWidth), GroupHeader("RX", MetricWidth), GroupHeader("TX", MetricWidth), Header("STA", StatusWidth)),
+                    Row(Header(string.Empty, HostColumnWidth), Header(string.Empty, 10), Header(string.Empty, CountWidth), Header(string.Empty, CountWidth), Header(string.Empty, CountWidth), MetricSubHeader(), MetricSubHeader(), MetricSubHeader(), Header(string.Empty, StatusWidth)),
+                    CurrentRows().Cast<SmbHostRow>().ToArray(),
+                        r => Row(Cell(DisplayName(HostDisplayName(r.HostName, r.Status), HostColumnWidth), HostColumnWidth), Cell(DisplayName(r.SmbVersion, 10), 10), Cell(r.ShareCount.ToString(), CountWidth, true), Cell(r.UserCount.ToString(), CountWidth, true), Cell(r.OpenFileCount.ToString(), CountWidth, true), Fmt(r.Io), Fmt(r.Rx), Fmt(r.Tx), Cell(r.Status, StatusWidth)));
                 }
                 break;
             case Panel.Events:
@@ -1324,6 +1394,68 @@ internal sealed class Tui
             Cell(network.Status, 6)
         });
 
+    private static string SmbShareHeaderRow()
+        => "  " + string.Join("  ", new[]
+        {
+            Cell("Shares", HostDetailNameWidth),
+            Cell("Users", HostDetailAWidth, true),
+            Cell("Open", HostDetailBWidth, true),
+            Cell("IOPS", HostDetailMetricWidth, true),
+            Cell("IO", HostDetailMetricWidth, true),
+            Cell("RX", HostDetailMetricWidth, true),
+            Cell("TX", HostDetailMetricWidth, true),
+            Cell("STA", 6)
+        });
+
+    private static string SmbShareDataRow(SmbShareRow share)
+        => "  " + string.Join("  ", new[]
+        {
+            Cell(DisplayName(share.Name, HostDetailNameWidth), HostDetailNameWidth),
+            Cell(share.UserCount.ToString(), HostDetailAWidth, true),
+            Cell(share.OpenFileCount.ToString(), HostDetailBWidth, true),
+            Cell(FmtValue(share.Iops.Current, share.Iops.Unit), HostDetailMetricWidth, true),
+            Cell(FmtValue(share.Io.Current, share.Io.Unit), HostDetailMetricWidth, true),
+            Cell(FmtValue(share.Rx.Current, share.Rx.Unit), HostDetailMetricWidth, true),
+            Cell(FmtValue(share.Tx.Current, share.Tx.Unit), HostDetailMetricWidth, true),
+            Cell(share.Status, 6)
+        });
+
+    private static string SmbClientHeaderRow()
+        => "  " + string.Join("  ", new[]
+        {
+            Cell("Users / Clients", SmbDetailClientWidth),
+            Cell("Open", HostDetailAWidth, true),
+            Cell("RX", HostDetailMetricWidth, true),
+            Cell("TX", HostDetailMetricWidth, true),
+            Cell("STA", 6)
+        });
+
+    private static string SmbClientDataRow(SmbClientRow client)
+        => "  " + string.Join("  ", new[]
+        {
+            Cell(DisplayName(client.ClientUser, SmbDetailClientWidth), SmbDetailClientWidth),
+            Cell(client.OpenFileCount.ToString(), HostDetailAWidth, true),
+            Cell(FmtValue(client.Rx.Current, client.Rx.Unit), HostDetailMetricWidth, true),
+            Cell(FmtValue(client.Tx.Current, client.Tx.Unit), HostDetailMetricWidth, true),
+            Cell(client.Status, 6)
+        });
+
+    private static string SmbOpenFileHeaderRow()
+        => "  " + string.Join("  ", new[]
+        {
+            Cell("Open Files", SmbDetailFileWidth),
+            Cell("Users", HostDetailAWidth, true),
+            Cell("STA", 6)
+        });
+
+    private static string SmbOpenFileDataRow(SmbOpenFileRow file)
+        => "  " + string.Join("  ", new[]
+        {
+            Cell(DisplayName(file.Path, SmbDetailFileWidth), SmbDetailFileWidth),
+            Cell(file.UserCount.ToString(), HostDetailAWidth, true),
+            Cell(file.Status, 6)
+        });
+
     private static string NetworkAdapterDisplayName(NetworkRow network)
         => string.IsNullOrWhiteSpace(network.Name) ? network.Description : $"{network.Name} (Adapter)";
 
@@ -1562,6 +1694,64 @@ internal sealed class Tui
                     hostDetailLines.Add(DetailLine.Selectable(HostNetworkDataRow(adapterRow), adapterRow, absolute++));
                 RenderDetailLines(28, hostDetailLines);
                 break;
+            case SmbHostRow smb:
+                var smbShares = snapshot.SmbShares
+                    .Where(r => r.HostName.Equals(smb.HostName, StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(r => r.Name, StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+                var smbClients = snapshot.SmbClients
+                    .Where(r => r.HostName.Equals(smb.HostName, StringComparison.OrdinalIgnoreCase))
+                    .OrderByDescending(r => double.IsFinite(r.Io.Current) ? r.Io.Current : -1)
+                    .ThenByDescending(r => r.OpenFileCount)
+                    .ThenBy(r => r.ClientUser, StringComparer.OrdinalIgnoreCase)
+                    .Take(10)
+                    .ToArray();
+                var smbOpenFiles = snapshot.SmbOpenFiles
+                    .Where(r => r.HostName.Equals(smb.HostName, StringComparison.OrdinalIgnoreCase))
+                    .OrderByDescending(r => r.UserCount)
+                    .ThenBy(r => r.Path, StringComparer.OrdinalIgnoreCase)
+                    .Take(10)
+                    .ToArray();
+                selected = Math.Min(selected, Math.Max(0, smbShares.Length + smbClients.Length + smbOpenFiles.Length - 1));
+
+                Detail(7, "Server name", HostDisplayName(smb.HostName, smb.Status));
+                Detail(8, "Server version", smb.ServerVersion);
+                Detail(9, "Server uptime", UptimeFormatter.FormatExact(smb.Uptime));
+                Detail(10, "SMB dialects", DisplaySmbDialects(smb.SmbVersion));
+                var featureBottom = RenderSmbFeatures(11, smb.Features);
+                var metricsTop = featureBottom + 2;
+                DetailMetricHeader(metricsTop, string.Empty, "cur", "max");
+                DetailMetric(metricsTop + 1, "SMB I/O", smb.Io);
+                DetailMetric(metricsTop + 2, Branch(false, "Receive"), smb.Rx);
+                DetailMetric(metricsTop + 3, Branch(true, "Transmit"), smb.Tx);
+                Detail(metricsTop + 5, "Status", smb.Status, StatusColor(smb.Status));
+
+                var smbAbsolute = 0;
+                var smbLines = new List<DetailLine>
+                {
+                    DetailLine.Header(SmbShareHeaderRow())
+                };
+                foreach (var share in smbShares)
+                    smbLines.Add(DetailLine.Selectable(SmbShareDataRow(share), share, smbAbsolute++));
+                if (smbShares.Length == 0)
+                    smbLines.Add(DetailLine.Info("  No SMB shares detected"));
+
+                smbLines.Add(DetailLine.Blank());
+                smbLines.Add(DetailLine.Header(SmbClientHeaderRow()));
+                foreach (var client in smbClients)
+                    smbLines.Add(DetailLine.Selectable(SmbClientDataRow(client), client, smbAbsolute++));
+                if (smbClients.Length == 0)
+                    smbLines.Add(DetailLine.Info("  No SMB clients detected"));
+
+                smbLines.Add(DetailLine.Blank());
+                smbLines.Add(DetailLine.Header(SmbOpenFileHeaderRow()));
+                foreach (var file in smbOpenFiles)
+                    smbLines.Add(DetailLine.Selectable(SmbOpenFileDataRow(file), file, smbAbsolute++));
+                if (smbOpenFiles.Length == 0)
+                    smbLines.Add(DetailLine.Info("  No SMB open files detected"));
+
+                RenderDetailLines(metricsTop + 8, smbLines);
+                break;
             case VDiskDetailRow vdisk:
                 var virtualDisk = vdisk.Disk;
                 Detail(7, "Name", virtualDisk.Name);
@@ -1720,6 +1910,149 @@ internal sealed class Tui
         var maxChange = checkpoints.Sum(c => DetailMax(c.ChangeMbMax, c.ChangeMb));
         CheckpointDetailScalar(y++, "Checkpoint changes", DetailCheckpointChangeValue(currentChange, maxChange));
         return y - 1;
+    }
+
+    private int RenderSmbFeatures(int y, string features)
+    {
+        var rows = SmbFeatureRows(features).ToArray();
+        if (rows.Length == 0)
+        {
+            Detail(y, "Features", "n/a", ConsoleColor.DarkGray);
+            return y;
+        }
+
+        DetailScalar(y++, "Features", string.Empty);
+        for (var i = 0; i < rows.Length; i++)
+        {
+            var row = rows[i];
+            DetailScalar(y++, Branch(i == rows.Length - 1, row.Label), row.Value, SmbFeatureColor(row));
+        }
+
+        return y - 1;
+    }
+
+    private static IEnumerable<SmbFeatureDisplayRow> SmbFeatureRows(string features)
+    {
+        var values = ParseSmbFeatures(features);
+        if (values.Count == 0)
+            yield break;
+
+        yield return new SmbFeatureDisplayRow("SMB1", BoolFeatureValue(values, "EnableSMB1Protocol"));
+        yield return new SmbFeatureDisplayRow("SMB2+", BoolFeatureValue(values, "EnableSMB2Protocol"));
+        yield return new SmbFeatureDisplayRow("SMB signing", SmbSigningValue(values));
+        yield return new SmbFeatureDisplayRow("Encryption", BoolFeatureValue(values, "EncryptData"));
+        yield return new SmbFeatureDisplayRow("SMB over QUIC", BoolFeatureValue(values, "EnableSMBQUIC"));
+        yield return new SmbFeatureDisplayRow("Multichannel", BoolFeatureValue(values, "EnableMultiChannel"));
+        yield return new SmbFeatureDisplayRow("RDMA", SmbRdmaValue(values));
+        yield return new SmbFeatureDisplayRow("Leasing/oplocks", LeasingOplocksValue(values));
+    }
+
+    private static string DisplaySmbDialects(string value)
+        => string.Join(", ", value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+
+    private static Dictionary<string, string> ParseSmbFeatures(string features)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(features) || features.Equals("n/a", StringComparison.OrdinalIgnoreCase))
+            return result;
+
+        foreach (var part in features.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var equals = part.IndexOf('=');
+            if (equals <= 0)
+                continue;
+
+            result[part[..equals].Trim()] = part[(equals + 1)..].Trim();
+        }
+
+        return result;
+    }
+
+    private static string SmbSigningValue(Dictionary<string, string> values)
+    {
+        var required = BoolFeature(values, "RequireSecuritySignature");
+        if (required == true)
+            return "required";
+
+        var enabled = BoolFeature(values, "EnableSecuritySignature");
+        if (enabled == true)
+            return "enabled";
+        if (enabled == false)
+            return "disabled";
+        if (required == false)
+            return "not required";
+        return "n/a";
+    }
+
+    private static string LeasingOplocksValue(Dictionary<string, string> values)
+    {
+        var leasing = BoolFeature(values, "EnableLeasing");
+        var oplocks = BoolFeature(values, "EnableOplocks");
+        if (leasing is null && oplocks is null)
+            return "n/a";
+        if (leasing == true && oplocks == true)
+            return "enabled";
+        if (leasing == false && oplocks == false)
+            return "disabled";
+        return "partial";
+    }
+
+    private static string SmbRdmaValue(Dictionary<string, string> values)
+    {
+        var serverDirect = BoolFeature(values, "EnableSMBDirect");
+        var rdmaInterface = BoolFeature(values, "RdmaInterface");
+        if (serverDirect == true || rdmaInterface == true)
+            return "enabled";
+        if (serverDirect == false || rdmaInterface == false)
+            return "disabled";
+        return "n/a";
+    }
+
+    private static string BoolFeatureValue(Dictionary<string, string> values, string key)
+    {
+        return BoolFeature(values, key) switch
+        {
+            true => "enabled",
+            false => "disabled",
+            _ => "n/a"
+        };
+    }
+
+    private static bool? BoolFeature(Dictionary<string, string> values, string key)
+    {
+        if (!values.TryGetValue(key, out var value))
+            return null;
+        if (bool.TryParse(value, out var parsed))
+            return parsed;
+        if (value.Equals("1", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("yes", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("enabled", StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (value.Equals("0", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("no", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("disabled", StringComparison.OrdinalIgnoreCase))
+            return false;
+        return null;
+    }
+
+    private static ConsoleColor SmbFeatureColor(SmbFeatureDisplayRow row)
+    {
+        if (row.Value.Equals("n/a", StringComparison.OrdinalIgnoreCase))
+            return ConsoleColor.DarkGray;
+        if (row.Label.Equals("SMB1", StringComparison.OrdinalIgnoreCase))
+            return row.Value.Equals("disabled", StringComparison.OrdinalIgnoreCase)
+                ? ConsoleColor.Green
+                : ConsoleColor.Yellow;
+        if (row.Label.Equals("SMB2+", StringComparison.OrdinalIgnoreCase))
+            return row.Value.Equals("enabled", StringComparison.OrdinalIgnoreCase)
+                ? ConsoleColor.Green
+                : ConsoleColor.Red;
+        if (row.Value.Equals("disabled", StringComparison.OrdinalIgnoreCase))
+            return ConsoleColor.Yellow;
+        if (row.Value.Equals("partial", StringComparison.OrdinalIgnoreCase)
+            || row.Value.Equals("not required", StringComparison.OrdinalIgnoreCase))
+            return ConsoleColor.Yellow;
+        return ConsoleColor.Green;
     }
 
     private static (string Name, int Depth)[] OrderCheckpointDisplayRows(VmCheckpointRow[] checkpoints)
@@ -1993,6 +2326,25 @@ internal sealed class Tui
             .ToArray();
     }
 
+    private static object[] SmbDetailRows(Snapshot snapshot, string hostName)
+    {
+        return snapshot.SmbShares
+            .Where(r => r.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(r => r.Name, StringComparer.OrdinalIgnoreCase)
+            .Cast<object>()
+            .Concat(snapshot.SmbClients
+                .Where(r => r.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(r => r.OpenFileCount)
+                .ThenBy(r => r.ClientUser, StringComparer.OrdinalIgnoreCase)
+                .Take(10))
+            .Concat(snapshot.SmbOpenFiles
+                .Where(r => r.HostName.Equals(hostName, StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(r => r.UserCount)
+                .ThenBy(r => r.Path, StringComparer.OrdinalIgnoreCase)
+                .Take(10))
+            .ToArray();
+    }
+
     private static NetworkRow[] HostDetailExtraAdapters(Snapshot snapshot, string hostName, NetworkSwitchRow[] switches)
     {
         var represented = switches
@@ -2066,6 +2418,7 @@ internal sealed class Tui
             Panel.Disks => s.Disks.FirstOrDefault(r => r.Name == selectedItemName && (string.IsNullOrEmpty(selectedHostName) || r.HostName == selectedHostName)),
             Panel.PhysicalDisks => s.PhysicalDisks.FirstOrDefault(r => r.Name == selectedItemName && (string.IsNullOrEmpty(selectedHostName) || r.HostName == selectedHostName)),
             Panel.Network => s.Networks.FirstOrDefault(r => r.Name == selectedItemName && (string.IsNullOrEmpty(selectedHostName) || r.HostName == selectedHostName)),
+            Panel.Smb => s.SmbHosts.FirstOrDefault(r => r.HostName == selectedItemName),
             _ => null
         };
     }
@@ -2086,6 +2439,8 @@ internal sealed class Tui
             return $"HOST {disk.HostName} -> storage {disk.Name}";
         if (row is PhysicalDiskRow physicalDisk)
             return $"HOST {physicalDisk.HostName} -> physical disk {physicalDisk.Name}";
+        if (row is SmbHostRow smb)
+            return $"HOST {smb.HostName} -> SMB";
         return $"{detailPanel} detail: {GetRowName(row)}";
     }
 
@@ -2098,6 +2453,10 @@ internal sealed class Tui
         PhysicalDiskRow disk => disk.Name,
         NetworkSwitchRow networkSwitch => networkSwitch.Name,
         NetworkRow net => net.Name,
+        SmbHostRow smb => smb.HostName,
+        SmbShareRow smb => smb.Name,
+        SmbClientRow smb => smb.ClientUser,
+        SmbOpenFileRow smb => smb.Path,
         VDiskRow disk => disk.Name,
         VmNetworkPathRow adapter => adapter.Name,
         VDiskDetailRow disk => disk.Disk.Name,
@@ -2314,6 +2673,10 @@ internal sealed class Tui
         PhysicalDiskRow disk => StatusColor(disk.Status),
         NetworkSwitchRow networkSwitch => StatusColor(networkSwitch.Status),
         NetworkRow net => StatusColor(net.Status),
+        SmbHostRow smb => StatusColor(smb.Status),
+        SmbShareRow smb => StatusColor(smb.Status),
+        SmbClientRow smb => StatusColor(smb.Status),
+        SmbOpenFileRow smb => StatusColor(smb.Status),
         EventRow evt => evt.Severity switch
         {
             "ERR" => ConsoleColor.Red,
@@ -2329,6 +2692,7 @@ internal sealed class Tui
            && snapshot.Disks.Length == 0
            && snapshot.PhysicalDisks.Length == 0
            && snapshot.Networks.Length == 0
+           && snapshot.SmbHosts.Length == 0
            && snapshot.Events.Length == 0;
 
     private int TableNameWidth(TableKind kind)
@@ -2533,7 +2897,7 @@ internal sealed class Tui
     }
 }
 
-internal enum Panel { Cluster, Hosts, Vms, Disks, PhysicalDisks, Network, Events }
+internal enum Panel { Cluster, Hosts, Vms, Disks, PhysicalDisks, Network, Smb, Events }
 
 internal enum DrillView { Overview, HostVms, NetworkAdapters, Detail }
 
@@ -2542,6 +2906,8 @@ internal enum TableKind { ClusterLike, HostLike, VmLike, DiskLike, PhysicalDiskL
 internal enum DetailLineKind { Header, Selectable, Blank, Info }
 
 internal sealed record CheckpointDisplayRow(string Name, string ParentName, DateTime Created);
+
+internal sealed record SmbFeatureDisplayRow(string Label, string Value);
 
 internal sealed record DetailLine(string Text, object? Row, int SelectionIndex, DetailLineKind Kind)
 {

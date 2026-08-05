@@ -17,6 +17,12 @@ internal sealed class PdhQuery : IDisposable
         return new Counter(counter, path);
     }
 
+    public Counter? TryAdd(string path)
+    {
+        var status = Native.PdhAddEnglishCounter(query, path, 0, out var counter);
+        return status == 0 ? new Counter(counter, path) : null;
+    }
+
     public void Collect()
     {
         var status = Native.PdhCollectQueryData(query);

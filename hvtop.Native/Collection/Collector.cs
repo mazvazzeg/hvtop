@@ -6,12 +6,12 @@ internal sealed class Collector : IDisposable
     private readonly RollingHistory history;
     private readonly PdhQuery pdh = new();
     private readonly NetworkSampler network = new();
+    private readonly HostCpuSampler hostCpuSampler = new();
     private readonly HyperVVmSampler hyperV = new();
     private readonly HyperVInventory inventory = new();
     private readonly HyperVTopology topology = new();
     private readonly ClusterInventory clusterInventory = new();
     private readonly RemoteCollectorManager remote;
-    private readonly Counter cpu;
     private readonly Counter memory;
     private readonly Counter memoryAvailableBytes;
     private readonly Counter memoryModifiedBytes;
@@ -41,7 +41,6 @@ internal sealed class Collector : IDisposable
         this.options = options;
         history = new RollingHistory(options.History);
         remote = new RemoteCollectorManager(options);
-        cpu = pdh.Add(@"\Processor(_Total)\% Processor Time");
         memory = pdh.Add(@"\Memory\% Committed Bytes In Use");
         memoryAvailableBytes = pdh.Add(@"\Memory\Available Bytes");
         memoryModifiedBytes = pdh.Add(@"\Memory\Modified Page List Bytes");
@@ -75,7 +74,9 @@ internal sealed class Collector : IDisposable
 
         var stepStarted = Stopwatch.GetTimestamp();
         pdh.Collect();
-        var hostCpu = cpu.Read();
+        var hostCpu = hostCpuSampler.Read();
+        if (options.DebugCounters)
+            AddDebugCounterEvent("COUNTER HOSTCPU " + hostCpuSampler.LastDiagnostic);
         var committedMemPercent = memory.Read();
         var totalMemBytes = Native.GetPhysicalMemoryBytes();
         var availableMemBytes = memoryAvailableBytes.Read();
@@ -225,7 +226,10 @@ internal sealed class Collector : IDisposable
                     a.PdhSentBytesPerSecond,
                     a.RdmaInstance,
                     a.RdmaReceivedBytesPerSecond,
-                    a.RdmaSentBytesPerSecond);
+                    a.RdmaSentBytesPerSecond,
+                    a.HyperVInstance,
+                    a.HyperVReceivedBytesPerSecond,
+                    a.HyperVSentBytesPerSecond);
                 return row;
             })
             .ToArray();
@@ -241,6 +245,10 @@ internal sealed class Collector : IDisposable
         }
 
         stepStarted = Stopwatch.GetTimestamp();
+        var smb = SmbSampler.Read(host.Name, host.Version, host.Uptime);
+        Mark("smb", stepStarted);
+
+        stepStarted = Stopwatch.GetTimestamp();
         var vmTopologyResult = topology.TryRead(disks, adapters);
         if (topologyRefreshRequested)
             topology.RequestRefresh();
@@ -253,6 +261,12 @@ internal sealed class Collector : IDisposable
         var networkSwitches = topology.IsRefreshing && vmTopologyResult.Switches.Length == 0
             ? []
             : BuildNetworkSwitches(host.Name, adapters, vmTopologyResult.Switches);
+        if (networkSwitches.Length > 0)
+        {
+            var switchNet = SumFinite(networkSwitches.Select(networkSwitch => networkSwitch.Throughput.Current));
+            host = host with { Net = Metric.Mbps(Math.Max(host.Net.Current, switchNet)) };
+            hosts = BuildHosts(host, clusterResult.Nodes);
+        }
         Mark("switches", stepStarted);
 
         stepStarted = Stopwatch.GetTimestamp();
@@ -283,15 +297,16 @@ internal sealed class Collector : IDisposable
             disks = disks.Select(d => history.Apply("disk:" + d.HostName + ":" + d.Name, d)).ToArray();
             networkSwitches = networkSwitches.Select(n => history.Apply("vswitch:" + n.HostName + ":" + n.Name, n)).ToArray();
             adapters = adapters.Select(n => history.Apply("net:" + n.HostName + ":" + n.Name, n)).ToArray();
+            smb = ApplySmbHistory(smb);
             Mark("history-topology", stepStarted);
 
             stepStarted = Stopwatch.GetTimestamp();
             physicalDisks = physicalDisks.Select(d => history.Apply("pdisk:" + d.HostName + ":" + d.Name, d)).ToArray();
-            MergeRemoteTelemetry(ref hosts, ref vms, ref disks, ref physicalDisks, ref networkSwitches, ref adapters, ref mergedTopology);
+            MergeRemoteTelemetry(ref hosts, ref vms, ref disks, ref physicalDisks, ref networkSwitches, ref adapters, ref smb, ref mergedTopology);
             MaybeAddSpikeEvent(host, disks);
             Mark("remote-events", stepStarted);
             MaybeAddCounterTiming(timings, sampleStarted);
-            return WithDebugCounterMetrics(new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, physicalDisks, networkSwitches, adapters, events, mergedTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery, remote.StatusSummary));
+            return WithDebugCounterMetrics(new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, physicalDisks, networkSwitches, adapters, smb.Hosts, smb.Shares, smb.Clients, smb.OpenFiles, events, mergedTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery, remote.StatusSummary));
         }
 
         stepStarted = Stopwatch.GetTimestamp();
@@ -302,14 +317,15 @@ internal sealed class Collector : IDisposable
         physicalDisks = physicalDisks.Select(d => history.Apply("pdisk:" + d.HostName + ":" + d.Name, d)).ToArray();
         networkSwitches = networkSwitches.Select(n => history.Apply("vswitch:" + n.HostName + ":" + n.Name, n)).ToArray();
         adapters = adapters.Select(n => history.Apply("net:" + n.HostName + ":" + n.Name, n)).ToArray();
+        smb = ApplySmbHistory(smb);
         Mark("history", stepStarted);
 
         stepStarted = Stopwatch.GetTimestamp();
-        MergeRemoteTelemetry(ref hosts, ref vms, ref disks, ref physicalDisks, ref networkSwitches, ref adapters, ref liveTopology);
+        MergeRemoteTelemetry(ref hosts, ref vms, ref disks, ref physicalDisks, ref networkSwitches, ref adapters, ref smb, ref liveTopology);
         MaybeAddSpikeEvent(host, disks);
         Mark("remote-events", stepStarted);
         MaybeAddCounterTiming(timings, sampleStarted);
-        return WithDebugCounterMetrics(new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, physicalDisks, networkSwitches, adapters, events, liveTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery, remote.StatusSummary));
+        return WithDebugCounterMetrics(new Snapshot(DateTime.Now, clusterResult.Clusters, hosts, vms, disks, physicalDisks, networkSwitches, adapters, smb.Hosts, smb.Shares, smb.Clients, smb.OpenFiles, events, liveTopology, !initialDiscoveryComplete, inventory.IsRefreshing, topology.IsRefreshing, discovery, remote.StatusSummary));
     }
 
     private void MaybeAddCounterTiming(List<(string Name, double Ms)>? timings, long sampleStarted)
@@ -369,6 +385,21 @@ internal sealed class Collector : IDisposable
         foreach (var net in snapshot.Networks)
         {
             lines.Add($"METRIC NET {Id(net.HostName)}/{Id(net.Name)} THR {Pair(net.Throughput)} RX {Pair(net.Rx)} TX {Pair(net.Tx)} RDMA {Pair(net.RdmaThroughput)} RDMA_RX {Pair(net.RdmaRx)} RDMA_TX {Pair(net.RdmaTx)} DROPS {Pair(net.Drops)} STA {net.Status}");
+        }
+
+        foreach (var smb in snapshot.SmbHosts)
+        {
+            lines.Add($"METRIC SMB {Id(smb.HostName)} SHARES {smb.ShareCount} USERS {smb.UserCount} OPEN {smb.OpenFileCount} IO {Pair(smb.Io)} RX {Pair(smb.Rx)} TX {Pair(smb.Tx)} STA {smb.Status}");
+        }
+
+        foreach (var share in snapshot.SmbShares)
+        {
+            lines.Add($"METRIC SMB_SHARE {Id(share.HostName)}/{Id(share.Name)} USERS {share.UserCount} OPEN {share.OpenFileCount} IOPS {Pair(share.Iops)} IO {Pair(share.Io)} RX {Pair(share.Rx)} TX {Pair(share.Tx)} STA {share.Status}");
+        }
+
+        foreach (var client in snapshot.SmbClients)
+        {
+            lines.Add($"METRIC SMB_CLIENT {Id(client.HostName)}/{Id(client.ClientUser)} OPEN {client.OpenFileCount} IO {Pair(client.Io)} RX {Pair(client.Rx)} TX {Pair(client.Tx)} STA {client.Status}");
         }
 
         foreach (var vm in snapshot.VmTopology)
@@ -469,7 +500,7 @@ internal sealed class Collector : IDisposable
         return value.ToString("0.00", CultureInfo.CurrentCulture);
     }
 
-    private void MergeRemoteTelemetry(ref HostRow[] hosts, ref VmRow[] vms, ref DiskRow[] disks, ref PhysicalDiskRow[] physicalDisks, ref NetworkSwitchRow[] networkSwitches, ref NetworkRow[] networks, ref VmTopologyRow[] topology)
+    private void MergeRemoteTelemetry(ref HostRow[] hosts, ref VmRow[] vms, ref DiskRow[] disks, ref PhysicalDiskRow[] physicalDisks, ref NetworkSwitchRow[] networkSwitches, ref NetworkRow[] networks, ref SmbSample smb, ref VmTopologyRow[] topology)
     {
         foreach (var evt in remote.DrainEvents())
             AddEvent(evt.Severity, evt.Message);
@@ -484,8 +515,20 @@ internal sealed class Collector : IDisposable
         physicalDisks = RemoteCollectorManager.MergePhysicalDisks(physicalDisks, snapshots);
         networkSwitches = RemoteCollectorManager.MergeNetworkSwitches(networkSwitches, snapshots);
         networks = RemoteCollectorManager.MergeNetworks(networks, snapshots);
+        smb = new SmbSample(
+            RemoteCollectorManager.MergeSmbHosts(smb.Hosts, snapshots),
+            RemoteCollectorManager.MergeSmbShares(smb.Shares, snapshots),
+            RemoteCollectorManager.MergeSmbClients(smb.Clients, snapshots),
+            RemoteCollectorManager.MergeSmbOpenFiles(smb.OpenFiles, snapshots));
         topology = RemoteCollectorManager.MergeTopology(topology, snapshots);
     }
+
+    private SmbSample ApplySmbHistory(SmbSample smb)
+        => new(
+            smb.Hosts.Select(row => history.Apply("smbhost:" + row.HostName, row)).ToArray(),
+            smb.Shares.Select(row => history.Apply("smbshare:" + row.HostName + ":" + row.Name, row)).ToArray(),
+            smb.Clients.Select(row => history.Apply("smbclient:" + row.HostName + ":" + row.ClientUser, row)).ToArray(),
+            smb.OpenFiles.Select(row => history.Apply("smbopen:" + row.HostName + ":" + row.Path, row)).ToArray());
 
     private static double SumFinite(IEnumerable<double> values)
         => values.Where(v => !double.IsNaN(v) && !double.IsInfinity(v)).Sum();
@@ -514,7 +557,7 @@ internal sealed class Collector : IDisposable
                 throw new InvalidOperationException($"RDC failed and LDC is disabled: {remote.TerminalFailureSummary}");
 
             var waiting = new DiscoveryProgress(false, false, false, false, false, 0, 0, 0, 0);
-            return WithDebugCounterMetrics(new Snapshot(DateTime.Now, [], [], [], [], [], [], [], events, [], true, false, false, waiting, remote.StatusSummary));
+            return WithDebugCounterMetrics(new Snapshot(DateTime.Now, [], [], [], [], [], [], [], [], [], [], [], events, [], true, false, false, waiting, remote.StatusSummary));
         }
 
         var hosts = RemoteCollectorManager.MergeHosts([], snapshots);
@@ -523,10 +566,14 @@ internal sealed class Collector : IDisposable
         var physicalDisks = RemoteCollectorManager.MergePhysicalDisks([], snapshots);
         var networkSwitches = RemoteCollectorManager.MergeNetworkSwitches([], snapshots);
         var networks = RemoteCollectorManager.MergeNetworks([], snapshots);
+        var smbHosts = RemoteCollectorManager.MergeSmbHosts([], snapshots);
+        var smbShares = RemoteCollectorManager.MergeSmbShares([], snapshots);
+        var smbClients = RemoteCollectorManager.MergeSmbClients([], snapshots);
+        var smbOpenFiles = RemoteCollectorManager.MergeSmbOpenFiles([], snapshots);
         var topology = RemoteCollectorManager.MergeTopology([], snapshots);
         var discovery = new DiscoveryProgress(hosts.Length > 0, true, disks.Length > 0, true, true, vms.Length, disks.Length, networks.Count(n => n.IsUp), networkSwitches.Length);
         initialDiscoveryComplete = true;
-        return WithDebugCounterMetrics(new Snapshot(DateTime.Now, [], hosts, vms, disks, physicalDisks, networkSwitches, networks, events, topology, false, false, false, discovery, remote.StatusSummary));
+        return WithDebugCounterMetrics(new Snapshot(DateTime.Now, [], hosts, vms, disks, physicalDisks, networkSwitches, networks, smbHosts, smbShares, smbClients, smbOpenFiles, events, topology, false, false, false, discovery, remote.StatusSummary));
     }
 
     private static HostRow[] BuildHosts(HostRow localHost, ClusterNodeRow[] clusterNodes)
@@ -594,7 +641,10 @@ internal sealed class Collector : IDisposable
                 var rdmaThroughput = uplinks.Sum(a => a.RdmaThroughput.Current);
                 var rdmaRx = uplinks.Sum(a => a.RdmaRx.Current);
                 var rdmaTx = uplinks.Sum(a => a.RdmaTx.Current);
-                if (hyperVSwitchRates.TryGetValue(switchRow.Name, out var switchRate))
+                var hasSetMemberCounters = uplinks.Any(a =>
+                    !string.IsNullOrWhiteSpace(a.HyperVInstance)
+                    && (a.HyperVReceivedBytesPerSecond > 0 || a.HyperVSentBytesPerSecond > 0));
+                if (!hasSetMemberCounters && hyperVSwitchRates.TryGetValue(switchRow.Name, out var switchRate))
                 {
                     var switchRx = switchRate.ReceivedBytesPerSecond / 1024d / 1024d;
                     var switchTx = switchRate.SentBytesPerSecond / 1024d / 1024d;
@@ -989,7 +1039,7 @@ internal sealed class Collector : IDisposable
         {
             AddEvent(
                 "INFO",
-                $"NETIF name='{TrimForEvent(adapter.Name, 28)}' desc='{TrimForEvent(adapter.Description, 42)}' guid='{adapter.InterfaceId}' hw={adapter.IsHardwareInterface} visible={adapter.IsVisibleAdapter} up={adapter.IsUp} link={NetworkLinkFormatter.Format(adapter.LinkSpeedBitsPerSecond, adapter.IsUp)} rx={adapter.ReceivedBytesPerSecond / 1024d / 1024d:0.00} tx={adapter.SentBytesPerSecond / 1024d / 1024d:0.00} rawRx={adapter.RawReceivedBytesPerSecond / 1024d / 1024d:0.00} rawTx={adapter.RawSentBytesPerSecond / 1024d / 1024d:0.00} pdh='{TrimForEvent(adapter.PdhInstance, 32)}' pdhRx={adapter.PdhReceivedBytesPerSecond / 1024d / 1024d:0.00} pdhTx={adapter.PdhSentBytesPerSecond / 1024d / 1024d:0.00} rdma='{TrimForEvent(adapter.RdmaInstance, 32)}' rdmaRx={adapter.RdmaReceivedBytesPerSecond / 1024d / 1024d:0.00} rdmaTx={adapter.RdmaSentBytesPerSecond / 1024d / 1024d:0.00} MB/s");
+                $"NETIF name='{TrimForEvent(adapter.Name, 28)}' desc='{TrimForEvent(adapter.Description, 42)}' guid='{adapter.InterfaceId}' hw={adapter.IsHardwareInterface} visible={adapter.IsVisibleAdapter} up={adapter.IsUp} link={NetworkLinkFormatter.Format(adapter.LinkSpeedBitsPerSecond, adapter.IsUp)} rx={adapter.ReceivedBytesPerSecond / 1024d / 1024d:0.00} tx={adapter.SentBytesPerSecond / 1024d / 1024d:0.00} rawRx={adapter.RawReceivedBytesPerSecond / 1024d / 1024d:0.00} rawTx={adapter.RawSentBytesPerSecond / 1024d / 1024d:0.00} pdh='{TrimForEvent(adapter.PdhInstance, 32)}' pdhRx={adapter.PdhReceivedBytesPerSecond / 1024d / 1024d:0.00} pdhTx={adapter.PdhSentBytesPerSecond / 1024d / 1024d:0.00} hv='{TrimForEvent(adapter.HyperVInstance, 32)}' hvRx={adapter.HyperVReceivedBytesPerSecond / 1024d / 1024d:0.00} hvTx={adapter.HyperVSentBytesPerSecond / 1024d / 1024d:0.00} rdma='{TrimForEvent(adapter.RdmaInstance, 32)}' rdmaRx={adapter.RdmaReceivedBytesPerSecond / 1024d / 1024d:0.00} rdmaTx={adapter.RdmaSentBytesPerSecond / 1024d / 1024d:0.00} MB/s");
         }
 
         foreach (var switchRow in switches.Take(4))
@@ -1054,6 +1104,7 @@ internal sealed class Collector : IDisposable
     public void Dispose()
     {
         remote.Dispose();
+        hostCpuSampler.Dispose();
         pdh.Dispose();
     }
 }

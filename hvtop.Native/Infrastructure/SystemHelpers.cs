@@ -312,6 +312,53 @@ internal sealed class RollingHistory
         };
     }
 
+    public SmbHostRow Apply(string key, SmbHostRow row)
+    {
+        var values = Add(key, row.Metrics);
+        return row with
+        {
+            Io = row.Io with { Max = values[nameof(row.Io)] },
+            Rx = row.Rx with { Max = values[nameof(row.Rx)] },
+            Tx = row.Tx with { Max = values[nameof(row.Tx)] }
+        };
+    }
+
+    public SmbShareRow Apply(string key, SmbShareRow row)
+    {
+        var values = Add(key, row.Metrics);
+        return row with
+        {
+            Iops = row.Iops with { Max = values[nameof(row.Iops)] },
+            Io = row.Io with { Max = values[nameof(row.Io)] },
+            Rx = row.Rx with { Max = values[nameof(row.Rx)] },
+            Tx = row.Tx with { Max = values[nameof(row.Tx)] }
+        };
+    }
+
+    public SmbClientRow Apply(string key, SmbClientRow row)
+    {
+        var values = Add(key, row.Metrics);
+        return row with
+        {
+            Iops = row.Iops with { Max = values[nameof(row.Iops)] },
+            Io = row.Io with { Max = values[nameof(row.Io)] },
+            Rx = row.Rx with { Max = values[nameof(row.Rx)] },
+            Tx = row.Tx with { Max = values[nameof(row.Tx)] }
+        };
+    }
+
+    public SmbOpenFileRow Apply(string key, SmbOpenFileRow row)
+    {
+        var values = Add(key, row.Metrics);
+        return row with
+        {
+            Iops = row.Iops with { Max = values[nameof(row.Iops)] },
+            Io = row.Io with { Max = values[nameof(row.Io)] },
+            Rx = row.Rx with { Max = values[nameof(row.Rx)] },
+            Tx = row.Tx with { Max = values[nameof(row.Tx)] }
+        };
+    }
+
     public VmTopologyRow Apply(string key, VmTopologyRow row)
     {
         return row with

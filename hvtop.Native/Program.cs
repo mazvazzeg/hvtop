@@ -15,7 +15,7 @@ namespace hvtop.Native;
 internal static class Program
 {
 #if RDC
-    public const string DisplayVersion = "0.9.1-rdc+20260712.0210";
+    public const string DisplayVersion = "0.9.2-rdc+20260805.0224";
     public const string AppName = "hvtop-rdc";
 
     public static async Task<int> Main(string[] args)
@@ -213,7 +213,7 @@ internal static class Program
     }
 
 #else
-    public const string DisplayVersion = "0.9.1+20260712.0210";
+    public const string DisplayVersion = "0.9.2+20260805.0224";
     public const string AppName = "hvtop";
 
     public static async Task<int> Main(string[] args)
@@ -252,6 +252,8 @@ internal static class Program
                 Console.WriteLine($"PDISK {disk.HostName} PDID {disk.PhysicalDiskId} TYPE {disk.Type} SIZE {disk.Size} MAP {disk.Mapping} FRIENDLY {disk.FriendlyName} MODEL {disk.Model} FW {disk.FirmwareVersion} SN {disk.SerialNumber} NAME {disk.Name} IO {FormatSmoke(disk.Io)} IOPS {FormatSmoke(disk.Iops)} QD {FormatSmoke(disk.QueueDepth)} LAT {FormatSmoke(disk.Latency)} STA {disk.Status}");
             foreach (var net in snapshot.Networks.Take(5))
                 Console.WriteLine($"NET  {net.HostName} {net.Name} THR {FormatSmoke(net.Throughput)} RX {FormatSmoke(net.Rx)} TX {FormatSmoke(net.Tx)} RDMA {FormatSmoke(net.RdmaThroughput)} STA {net.Status}");
+            foreach (var smb in snapshot.SmbHosts.Take(5))
+                Console.WriteLine($"SMB  {smb.HostName} VER {smb.SmbVersion} SHARES {smb.ShareCount} USERS {smb.UserCount} OPEN {smb.OpenFileCount} IO {FormatSmoke(smb.Io)} RX {FormatSmoke(smb.Rx)} TX {FormatSmoke(smb.Tx)} STA {smb.Status}");
             return 0;
         }
 

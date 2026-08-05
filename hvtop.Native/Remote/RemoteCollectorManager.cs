@@ -305,6 +305,55 @@ internal sealed class RemoteCollectorManager : IDisposable
             .ToArray();
     }
 
+    public static SmbHostRow[] MergeSmbHosts(SmbHostRow[] local, RemoteSnapshot[] remote)
+    {
+        return local
+            .Concat(remote.SelectMany(r => r.Snapshot.SmbHosts.Select(n => RemoteSmbHostRow(r, n))))
+            .Where(row => !string.IsNullOrWhiteSpace(row.HostName))
+            .GroupBy(row => row.HostName, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.Last())
+            .OrderBy(row => row.HostName, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    public static SmbShareRow[] MergeSmbShares(SmbShareRow[] local, RemoteSnapshot[] remote)
+    {
+        return local
+            .Concat(remote.SelectMany(r => r.Snapshot.SmbShares.Select(n => RemoteSmbShareRow(r, n))))
+            .Where(row => !string.IsNullOrWhiteSpace(row.Name))
+            .GroupBy(row => $"{row.HostName}\0{row.Name}", StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.Last())
+            .OrderBy(row => row.HostName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    public static SmbClientRow[] MergeSmbClients(SmbClientRow[] local, RemoteSnapshot[] remote)
+    {
+        return local
+            .Concat(remote.SelectMany(r => r.Snapshot.SmbClients.Select(n => RemoteSmbClientRow(r, n))))
+            .Where(row => !string.IsNullOrWhiteSpace(row.ClientUser))
+            .GroupBy(row => $"{row.HostName}\0{row.ClientUser}", StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.Last())
+            .OrderBy(row => row.HostName, StringComparer.OrdinalIgnoreCase)
+            .ThenByDescending(row => row.OpenFileCount)
+            .ThenBy(row => row.ClientUser, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    public static SmbOpenFileRow[] MergeSmbOpenFiles(SmbOpenFileRow[] local, RemoteSnapshot[] remote)
+    {
+        return local
+            .Concat(remote.SelectMany(r => r.Snapshot.SmbOpenFiles.Select(n => RemoteSmbOpenFileRow(r, n))))
+            .Where(row => !string.IsNullOrWhiteSpace(row.Path))
+            .GroupBy(row => $"{row.HostName}\0{row.Path}", StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.Last())
+            .OrderBy(row => row.HostName, StringComparer.OrdinalIgnoreCase)
+            .ThenByDescending(row => row.UserCount)
+            .ThenBy(row => row.Path, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
     private static VmRow RemoteVmRow(RemoteSnapshot remote, VmRow vm)
     {
         var row = string.IsNullOrWhiteSpace(vm.HostName) ? vm with { HostName = remote.NodeName } : vm;
@@ -332,6 +381,30 @@ internal sealed class RemoteCollectorManager : IDisposable
     private static NetworkRow RemoteNetworkRow(RemoteSnapshot remote, NetworkRow network)
     {
         var row = string.IsNullOrWhiteSpace(network.HostName) ? network with { HostName = remote.NodeName } : network;
+        return remote.SignalLost ? row with { Status = "LOS" } : row;
+    }
+
+    private static SmbHostRow RemoteSmbHostRow(RemoteSnapshot remote, SmbHostRow smb)
+    {
+        var row = string.IsNullOrWhiteSpace(smb.HostName) ? smb with { HostName = remote.NodeName } : smb;
+        return remote.SignalLost ? row with { Status = "LOS" } : row;
+    }
+
+    private static SmbShareRow RemoteSmbShareRow(RemoteSnapshot remote, SmbShareRow smb)
+    {
+        var row = string.IsNullOrWhiteSpace(smb.HostName) ? smb with { HostName = remote.NodeName } : smb;
+        return remote.SignalLost ? row with { Status = "LOS" } : row;
+    }
+
+    private static SmbClientRow RemoteSmbClientRow(RemoteSnapshot remote, SmbClientRow smb)
+    {
+        var row = string.IsNullOrWhiteSpace(smb.HostName) ? smb with { HostName = remote.NodeName } : smb;
+        return remote.SignalLost ? row with { Status = "LOS" } : row;
+    }
+
+    private static SmbOpenFileRow RemoteSmbOpenFileRow(RemoteSnapshot remote, SmbOpenFileRow smb)
+    {
+        var row = string.IsNullOrWhiteSpace(smb.HostName) ? smb with { HostName = remote.NodeName } : smb;
         return remote.SignalLost ? row with { Status = "LOS" } : row;
     }
 
@@ -556,6 +629,12 @@ internal sealed class RemoteCollectorManager : IDisposable
         {
             SetState(session, "preflight");
             var snapshot = await PollAsync(session).ConfigureAwait(false);
+            if (!SkipDeployFor(session.Target) && !RemoteVersionMatchesLocal(snapshot))
+            {
+                Enqueue("WARN", $"RDC {session.NodeName}: existing hvtop-rdc version {VersionForLog(snapshot.RdcCollectorVersion)} differs from local {VersionForLog(Program.DisplayVersion)}; redeploying");
+                return null;
+            }
+
             Enqueue("INFO", $"RDC {session.NodeName}: existing hvtop-rdc answered on TCP/{PortFor(session)}; deploy skipped");
             return snapshot;
         }
@@ -681,7 +760,7 @@ internal sealed class RemoteCollectorManager : IDisposable
             return;
 
         session.VersionWarningLogged = true;
-        var local = VersionBase(Program.DisplayVersion);
+        var local = VersionIdentity(Program.DisplayVersion);
         var remoteRaw = snapshot.RdcCollectorVersion;
         if (string.IsNullOrWhiteSpace(remoteRaw))
         {
@@ -689,21 +768,24 @@ internal sealed class RemoteCollectorManager : IDisposable
             return;
         }
 
-        var remote = VersionBase(remoteRaw);
+        var remote = VersionIdentity(remoteRaw);
         if (!string.Equals(local, remote, StringComparison.OrdinalIgnoreCase))
             Enqueue("WARN", $"RDC {session.NodeName}: RDC version mismatch detected. Local: v{local}. Remote: v{remote}");
     }
 
-    private static string VersionBase(string version)
+    private static bool RemoteVersionMatchesLocal(Snapshot snapshot)
+        => !string.IsNullOrWhiteSpace(snapshot.RdcCollectorVersion)
+           && string.Equals(VersionIdentity(Program.DisplayVersion), VersionIdentity(snapshot.RdcCollectorVersion), StringComparison.OrdinalIgnoreCase);
+
+    private static string VersionForLog(string version)
+        => VersionIdentity(version);
+
+    private static string VersionIdentity(string version)
     {
         var text = (version ?? string.Empty).Trim();
         var space = text.LastIndexOf(' ');
         if (space >= 0)
             text = text[(space + 1)..].Trim();
-
-        var plus = text.IndexOf('+');
-        if (plus >= 0)
-            text = text[..plus];
 
         text = text.Replace("-rdc", string.Empty, StringComparison.OrdinalIgnoreCase).Trim();
         return string.IsNullOrWhiteSpace(text) ? "unknown" : text;

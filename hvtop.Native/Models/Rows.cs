@@ -9,6 +9,10 @@ internal sealed record Snapshot(
     PhysicalDiskRow[] PhysicalDisks,
     NetworkSwitchRow[] NetworkSwitches,
     NetworkRow[] Networks,
+    SmbHostRow[] SmbHosts,
+    SmbShareRow[] SmbShares,
+    SmbClientRow[] SmbClients,
+    SmbOpenFileRow[] SmbOpenFiles,
     EventRow[] Events,
     VmTopologyRow[] VmTopology,
     bool Loading,
@@ -18,7 +22,7 @@ internal sealed record Snapshot(
     string RdcStatus,
     string RdcCollectorVersion = "")
 {
-    public static Snapshot Empty { get; } = new(DateTime.Now, [], [], [], [], [], [], [], [], [], true, false, false, DiscoveryProgress.Empty, "idle");
+    public static Snapshot Empty { get; } = new(DateTime.Now, [], [], [], [], [], [], [], [], [], [], [], [], [], true, false, false, DiscoveryProgress.Empty, "idle");
 }
 
 internal sealed record DiscoveryProgress(
@@ -124,7 +128,7 @@ internal sealed record PhysicalDiskRow(string HostName, string PhysicalDiskId, s
     };
 }
 
-internal sealed record NetworkRow(string HostName, string Name, string Description, string Link, bool IsUp, long LinkSpeedBitsPerSecond, Metric Throughput, Metric Rx, Metric Tx, Metric RdmaThroughput, Metric RdmaRx, Metric RdmaTx, Metric Drops, string Status, string PdhInstance = "", double RawReceivedBytesPerSecond = 0, double RawSentBytesPerSecond = 0, double PdhReceivedBytesPerSecond = 0, double PdhSentBytesPerSecond = 0, string RdmaInstance = "", double RdmaReceivedBytesPerSecond = 0, double RdmaSentBytesPerSecond = 0)
+internal sealed record NetworkRow(string HostName, string Name, string Description, string Link, bool IsUp, long LinkSpeedBitsPerSecond, Metric Throughput, Metric Rx, Metric Tx, Metric RdmaThroughput, Metric RdmaRx, Metric RdmaTx, Metric Drops, string Status, string PdhInstance = "", double RawReceivedBytesPerSecond = 0, double RawSentBytesPerSecond = 0, double PdhReceivedBytesPerSecond = 0, double PdhSentBytesPerSecond = 0, string RdmaInstance = "", double RdmaReceivedBytesPerSecond = 0, double RdmaSentBytesPerSecond = 0, string HyperVInstance = "", double HyperVReceivedBytesPerSecond = 0, double HyperVSentBytesPerSecond = 0)
 {
     public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
     {
@@ -151,6 +155,56 @@ internal sealed record NetworkSwitchRow(string HostName, string Name, string Swi
         [nameof(RdmaRx)] = RdmaRx.Current,
         [nameof(RdmaTx)] = RdmaTx.Current,
         [nameof(Drops)] = Drops.Current
+    };
+}
+
+internal sealed record SmbHostRow(string HostName, string ServerVersion, TimeSpan? Uptime, string SmbVersion, int ShareCount, int UserCount, int OpenFileCount, string Features, Metric Io, Metric Rx, Metric Tx, string Status)
+{
+    public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
+    {
+        [nameof(ShareCount)] = ShareCount,
+        [nameof(UserCount)] = UserCount,
+        [nameof(OpenFileCount)] = OpenFileCount,
+        [nameof(Io)] = Io.Current,
+        [nameof(Rx)] = Rx.Current,
+        [nameof(Tx)] = Tx.Current
+    };
+}
+
+internal sealed record SmbShareRow(string HostName, string Name, int UserCount, int OpenFileCount, Metric Iops, Metric Io, Metric Rx, Metric Tx, string Status)
+{
+    public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
+    {
+        [nameof(UserCount)] = UserCount,
+        [nameof(OpenFileCount)] = OpenFileCount,
+        [nameof(Iops)] = Iops.Current,
+        [nameof(Io)] = Io.Current,
+        [nameof(Rx)] = Rx.Current,
+        [nameof(Tx)] = Tx.Current
+    };
+}
+
+internal sealed record SmbClientRow(string HostName, string ClientUser, int OpenFileCount, Metric Iops, Metric Io, Metric Rx, Metric Tx, string Status)
+{
+    public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
+    {
+        [nameof(OpenFileCount)] = OpenFileCount,
+        [nameof(Iops)] = Iops.Current,
+        [nameof(Io)] = Io.Current,
+        [nameof(Rx)] = Rx.Current,
+        [nameof(Tx)] = Tx.Current
+    };
+}
+
+internal sealed record SmbOpenFileRow(string HostName, string Path, int UserCount, Metric Iops, Metric Io, Metric Rx, Metric Tx, string Status)
+{
+    public IReadOnlyDictionary<string, double> Metrics => new Dictionary<string, double>
+    {
+        [nameof(UserCount)] = UserCount,
+        [nameof(Iops)] = Iops.Current,
+        [nameof(Io)] = Io.Current,
+        [nameof(Rx)] = Rx.Current,
+        [nameof(Tx)] = Tx.Current
     };
 }
 
